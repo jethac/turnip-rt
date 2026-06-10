@@ -2267,6 +2267,33 @@ tu_disable_draw_states(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    cmd->state.dirty |= TU_CMD_DIRTY_DRAW_STATE;
 }
 
+/* There is an optimization to skip executing draw states for draws with no
+ * instances. Instead of simply skipping the draw, internally the firmware
+ * sets a bit in PC_DRAWCALL_CNTL that seemingly skips the draw. However
+ * there is a hardware bug where this bit does not always cause the FS
+ * early preamble to be skipped. Because the draw states were skipped,
+ * SP_PS_CNTL_0, SP_PS_BASE and so on are never updated and random preamble(s)
+ * from the last draw are executed. If the last visible draw is from the same
+ * submit and none of the relevant state has changed, it shouldn't be a
+ * problem because we just re-execute the same preambles and preambles don't
+ * have side effects, but if it's from another process or state used by it has
+ * changed then we could execute a garbage preamble leading to hangs and
+ * faults. To make sure this doesn't happen, we reset all SP_XS_CNTL_0 here,
+ * making sure that the EARLYPREAMBLE bit isn't set so any leftover early
+ * preamble doesn't get executed. Other stages don't seem to be affected.
+ */
+static void
+tu_emit_early_preamble_workaround(struct tu_cs *cs)
+{
+   if (cs->device->physical_device->info->props.has_early_preamble) {
+      tu_cs_emit_regs(cs, A6XX_SP_VS_CNTL_0());
+      tu_cs_emit_regs(cs, A6XX_SP_HS_CNTL_0());
+      tu_cs_emit_regs(cs, A6XX_SP_DS_CNTL_0());
+      tu_cs_emit_regs(cs, A6XX_SP_GS_CNTL_0());
+      tu_cs_emit_regs(cs, A6XX_SP_PS_CNTL_0());
+   }
+}
+
 template <chip CHIP>
 static void
 tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
@@ -2446,24 +2473,13 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
       tu_cs_emit_regs(cs, PC_TF_BUFFER_SIZE(CHIP, TU_TESS<CHIP>::FACTOR_SIZE));
    }
 
-   /* There is an optimization to skip executing draw states for draws with no
-    * instances. Instead of simply skipping the draw, internally the firmware
-    * sets a bit in PC_DRAW_INITIATOR that seemingly skips the draw. However
-    * there is a hardware bug where this bit does not always cause the FS
-    * early preamble to be skipped. Because the draw states were skipped,
-    * SP_PS_CNTL_0, SP_PS_BASE and so on are never updated and a
-    * random FS preamble from the last draw is executed. If the last visible
-    * draw is from the same submit, it shouldn't be a problem because we just
-    * re-execute the same preamble and preambles don't have side effects, but
-    * if it's from another process then we could execute a garbage preamble
-    * leading to hangs and faults. To make sure this doesn't happen, we reset
-    * SP_PS_CNTL_0 here, making sure that the EARLYPREAMBLE bit isn't set
-    * so any leftover early preamble doesn't get executed. Other stages don't
-    * seem to be affected.
+   /* Emit the early-preamble workaround to guard against executing early
+    * preambles from other contexts.
+    * TODO: There seems to be an equivalent workaround in newer a750_sqe.fw in
+    * CP_SMMU_TABLE_UPDATE so we might not need this if the firmware is new
+    * enough on some GPUs. And some GPUs might have fixed this altogether.
     */
-   if (phys_dev->info->props.has_early_preamble) {
-      tu_cs_emit_regs(cs, A6XX_SP_PS_CNTL_0());
-   }
+   tu_emit_early_preamble_workaround(cs);
 
    /* Workaround for draw state with constlen not being applied for
     * zero-instance draw calls. See IR3_CONST_ALLOC_DRIVER_PARAMS allocation
@@ -3513,6 +3529,8 @@ tu6_sysmem_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       tu_cs_emit_regs(cs, RB_BIN_FOVEAT(CHIP));
    }
 
+   tu_emit_early_preamble_workaround(cs);
+
    cmd->device->autotune->init_renderpass(rp_ctx, true, 0);
    cmd->device->autotune->begin_renderpass(cmd, cs, rp_ctx);
 
@@ -3783,6 +3801,11 @@ tu6_tile_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
        if (cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)
          tu_cs_set_writeable(cs, false);
 
+      /* Do the early preamble workaround separately for binning, so that it
+       * executes on BV if using concurrent binning.
+       */
+      tu_emit_early_preamble_workaround(cs);
+
       tu6_emit_bin_size<CHIP>(cs, tiling->tile0.width, tiling->tile0.height,
                               {
                                  .render_mode = BINNING_PASS,
@@ -3894,6 +3917,9 @@ tu6_tile_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
        */
       tu7_set_thread_br_patchpoint(cmd, cs, false);
    }
+
+   /* Do the early preamble workaround again, this time on BR. */
+   tu_emit_early_preamble_workaround(cs);
 
    tu_lrz_before_tiles<CHIP>(cmd, cs, use_cb);
 
