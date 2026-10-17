@@ -25,6 +25,7 @@ struct tu_foveate_cfg {
    uint32_t min_w, min_h;
    uint32_t max_area;
    uint32_t max_bin;
+   float sbs_min, sbs_max, eye_min, eye_max;
    uint64_t stale_ns;
    const char *path;
 };
@@ -52,6 +53,10 @@ tu_foveate_init_once(void)
    cfg.min_h = debug_get_num_option("TU_FOVEATE_MIN_H", 768);
    cfg.max_area = debug_get_num_option("TU_FOVEATE_MAX", 4);
    cfg.max_bin = debug_get_num_option("TU_FOVEATE_BIN", 256);
+   cfg.sbs_min = env_f("TU_FOVEATE_SBS_MIN", 1.8f);
+   cfg.sbs_max = env_f("TU_FOVEATE_SBS_MAX", 2.3f);
+   cfg.eye_min = env_f("TU_FOVEATE_EYE_MIN", 0.8f);
+   cfg.eye_max = env_f("TU_FOVEATE_EYE_MAX", 1.25f);
    cfg.stale_ns = (uint64_t) debug_get_num_option("TU_FOVEATE_STALE_MS", 250) * 1000000ull;
    cfg.path = os_get_option("TU_FOVEATE_SHM");
    if (!cfg.path)
@@ -110,6 +115,11 @@ tu_foveate_gaze(unsigned eye, float *gx, float *gy)
    const struct tu_gaze_shm *p = tu_foveate_map();
    if (!p)
       return;
+   float cx = p->center[eye][0], cy = p->center[eye][1];
+   if (cx > 0.f && cx < 1.f && cy > 0.f && cy < 1.f) {
+      *gx = cx;
+      *gy = cy;
+   }
    uint32_t s0 = p->seq;
    __atomic_thread_fence(__ATOMIC_ACQUIRE);
    float x = p->uv[eye][0], y = p->uv[eye][1];
@@ -150,6 +160,10 @@ tu_foveate_fb_eligible(const struct tu_render_pass *pass,
       return false;
    if (fb->width < cfg.min_w || fb->height < cfg.min_h)
       return false;
+   float aspect = (float) fb->width / (float) fb->height;
+   if (!(aspect >= cfg.sbs_min && aspect <= cfg.sbs_max) &&
+       !(aspect >= cfg.eye_min && aspect <= cfg.eye_max))
+      return false;
    for (uint32_t i = 0; i < pass->subpass_count; i++)
       if (pass->subpasses[i].color_count)
          return true;
@@ -172,7 +186,7 @@ tu_foveate_frag_area(struct tu_cmd_buffer *cmd,
    if (x1 >= x2 || y1 >= y2)
       return;
 
-   bool sbs = w * 10 >= h * 16;
+   bool sbs = (float) w >= cfg.sbs_min * (float) h;
    float ew = sbs ? w * 0.5f : (float) w;
    float eh = (float) h;
    unsigned eye;

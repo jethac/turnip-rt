@@ -17,6 +17,7 @@ struct tu_gaze_shm {
    float uv[2][2];
    uint32_t valid;
    uint32_t layout;
+   float center[2][2];
 };
 
 struct tu_frag_area;
