@@ -476,6 +476,7 @@ struct tu_rt_compiler {
    uint32_t used;
    bool has_ahit;
    bool has_isec;
+   bool nohit;
    unsigned max_call_depth;
 };
 
@@ -748,6 +749,8 @@ tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
                          nir_def *handle, mesa_shader_stage want, nir_def *arg,
                          unsigned ray_depth, unsigned call_depth)
 {
+   if (c->nohit && want == MESA_SHADER_CLOSEST_HIT)
+      return;
    for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
       struct tu_rt_group *group = c->pipeline->groups + i;
       nir_shader *stage = tu_rt_group_stage(c, group->recursive_index);
@@ -1465,8 +1468,36 @@ tu_rt_build_shader(struct tu_device *dev,
       if (g->isec_index != VK_SHADER_UNUSED_KHR)
          c.has_isec = true;
    }
+   {
+      uint64_t total = 0;
+      for (uint32_t i = 0; i < pipeline->stage_count; i++)
+         nir_foreach_function_impl (impl, pipeline->stages[i])
+            nir_foreach_block (block, impl)
+               nir_foreach_instr (instr, block)
+                  total++;
+      static const uint64_t budget =
+         debug_get_num_option("TU_RT_HIT_BUDGET", 250000);
+      if (total > budget) {
+         c.nohit = true;
+         c.has_ahit = false;
+         c.has_isec = false;
+         mesa_logw("tu-rt: %" PRIu64 " stage instrs over budget %" PRIu64
+                   ": building without hit shaders (%u stages, %u groups)",
+                   total, budget, pipeline->stage_count, pipeline->group_count);
+      }
+      if (debug_get_bool_option("TU_RT_LOG", false)) {
+         for (uint32_t i = 0; i < create_info->stageCount && i < 4; i++)
+            mesa_logi("tu-rt:   stage %u %s %s", i,
+                      _mesa_shader_stage_to_abbrev(
+                         vk_to_mesa_shader_stage(create_info->pStages[i].stage)),
+                      create_info->pStages[i].pName);
+      }
+   }
    for (uint32_t i = 0; i < pipeline->stage_count; i++)
-      c.used |= tu_rt_scan_used(pipeline->stages[i]);
+      if (!c.nohit || (pipeline->stages[i]->info.stage != MESA_SHADER_CLOSEST_HIT &&
+                       pipeline->stages[i]->info.stage != MESA_SHADER_ANY_HIT &&
+                       pipeline->stages[i]->info.stage != MESA_SHADER_INTERSECTION))
+         c.used |= tu_rt_scan_used(pipeline->stages[i]);
 
    {
       uint32_t ncall = 0;

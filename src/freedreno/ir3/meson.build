@@ -124,6 +124,7 @@ libfreedreno_ir3_files = files(
   'ir3_rpt.c',
   'ir3_sched.c',
   'ir3_shader.c',
+  'ir3_replay_dump.c',
   'ir3_shader.h',
   'ir3_shader_bisect.c',
   'ir3_shared_folding.c',
@@ -173,4 +174,14 @@ test('ir3_delay_test',
     include_directories: [inc_freedreno, inc_include, inc_src],
   ),
   suite: ['freedreno'],
+)
+
+ir3_replay = executable(
+  'ir3_replay',
+  'ir3_replay.c',
+  link_with: [libfreedreno_ir3, libfreedreno_common],
+  link_args: ld_args_build_id,
+  dependencies: [idep_mesautil, idep_nir, idep_libir3decode],
+  include_directories: [inc_freedreno, inc_include, inc_src],
+  build_by_default: true,
 )

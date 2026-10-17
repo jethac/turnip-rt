@@ -19,6 +19,7 @@
 
 #include "ir3/ir3_compiler.h"
 #include "ir3/ir3_nir.h"
+#include "ir3/ir3_replay.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
 #include "tu_lrz.h"
@@ -3749,6 +3750,18 @@ tu_shader_create(struct tu_device *dev,
       .const_allocs = const_allocs,
       .nir_options = nir_options,
    };
+
+   static const char *ir3_dump_dir = os_get_option("TU_IR3_DUMP");
+   if (ir3_dump_dir) {
+      static const uint64_t ir3_dump_min = debug_get_num_option("TU_IR3_DUMP_MIN", 20000);
+      uint64_t n = 0;
+      nir_foreach_function_impl (impl, nir)
+         nir_foreach_block (block, impl)
+            nir_foreach_instr (instr, block)
+               n++;
+      if (n >= ir3_dump_min)
+         ir3_replay_dump(ir3_dump_dir, dev->compiler, nir, &options, ir3_key);
+   }
 
    struct ir3_shader *ir3_shader =
       ir3_shader_from_nir(dev->compiler, nir, &options);
