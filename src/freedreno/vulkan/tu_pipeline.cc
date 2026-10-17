@@ -4481,7 +4481,7 @@ tu_pipeline_builder_parse_rasterization_order(
    ));
 }
 
-static void
+void
 tu_pipeline_finish(struct tu_pipeline *pipeline,
                    struct tu_device *dev,
                    const VkAllocationCallbacks *alloc)
@@ -4508,6 +4508,9 @@ tu_pipeline_finish(struct tu_pipeline *pipeline,
 
       vk_free2(&dev->vk.alloc, alloc, library->state_data);
    }
+
+   if (pipeline->type == TU_PIPELINE_RAY_TRACING)
+      ralloc_free(tu_pipeline_to_ray_tracing(pipeline)->mem_ctx);
 
    for (unsigned i = 0; i < ARRAY_SIZE(pipeline->shaders); i++) {
       if (pipeline->shaders[i])
@@ -5111,6 +5114,45 @@ fail:
    vk_object_free(&dev->vk, pAllocator, pipeline);
 
    return result;
+}
+
+VkResult
+tu_compute_pipeline_init_nir(struct tu_device *dev,
+                             struct tu_compute_pipeline *pipeline,
+                             struct tu_pipeline_layout *layout,
+                             nir_shader *nir,
+                             const struct tu_shader_key *key,
+                             const unsigned char *blake3)
+{
+   struct tu_shader *shader = NULL;
+   struct ir3_shader_key ir3_key = {};
+   struct tu_shader_info info = {};
+
+   tu_lower_nir(dev, nir, key, &ir3_key, &info);
+   VkResult result = tu_shader_create(dev, &shader, nir, key, &info, &ir3_key,
+                                      blake3, BLAKE3_KEY_LEN, layout, false);
+   if (!shader)
+      return result;
+
+   pipeline->base.active_desc_sets = shader->active_desc_sets;
+
+   const struct ir3_shader_variant *v = shader->variant;
+   tu_pipeline_set_linkage(&pipeline->base.program.link[MESA_SHADER_COMPUTE],
+                           &shader->const_state, v);
+
+   pipeline->base.shaders[MESA_SHADER_COMPUTE] = shader;
+
+   result = tu_pipeline_allocate_cs(dev, &pipeline->base, layout, NULL, v);
+   if (result != VK_SUCCESS)
+      return result;
+
+   for (int i = 0; i < 3; i++)
+      pipeline->local_size[i] = v->local_size[i];
+
+   tu_append_executable(&pipeline->base, v, NULL);
+   pipeline->instrlen = v->instrlen;
+
+   return VK_SUCCESS;
 }
 
 template <chip CHIP>

@@ -174,6 +174,7 @@ enum tu_pipeline_type {
    TU_PIPELINE_GRAPHICS,
    TU_PIPELINE_GRAPHICS_LIB,
    TU_PIPELINE_COMPUTE,
+   TU_PIPELINE_RAY_TRACING,
 };
 
 struct tu_pipeline
@@ -273,6 +274,23 @@ struct tu_compute_pipeline {
    uint32_t instrlen;
 };
 
+struct tu_rt_group {
+   uint32_t recursive_index;
+   uint32_t ahit_index;
+   uint32_t isec_index;
+   uint32_t handle;
+};
+
+struct tu_ray_tracing_pipeline {
+   struct tu_compute_pipeline base;
+
+   void *mem_ctx;
+   uint32_t stage_count;
+   uint32_t group_count;
+   nir_shader **stages;
+   struct tu_rt_group *groups;
+};
+
 VK_DEFINE_NONDISP_HANDLE_CASTS(tu_pipeline, base, VkPipeline,
                                VK_OBJECT_TYPE_PIPELINE)
 
@@ -287,6 +305,20 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(tu_pipeline, base, VkPipeline,
 TU_DECL_PIPELINE_DOWNCAST(graphics, TU_PIPELINE_GRAPHICS)
 TU_DECL_PIPELINE_DOWNCAST(graphics_lib, TU_PIPELINE_GRAPHICS_LIB)
 TU_DECL_PIPELINE_DOWNCAST(compute, TU_PIPELINE_COMPUTE)
+TU_DECL_PIPELINE_DOWNCAST(ray_tracing, TU_PIPELINE_RAY_TRACING)
+
+void
+tu_pipeline_finish(struct tu_pipeline *pipeline,
+                   struct tu_device *dev,
+                   const VkAllocationCallbacks *alloc);
+
+VkResult
+tu_compute_pipeline_init_nir(struct tu_device *dev,
+                             struct tu_compute_pipeline *pipeline,
+                             struct tu_pipeline_layout *layout,
+                             nir_shader *nir,
+                             const struct tu_shader_key *key,
+                             const unsigned char *blake3);
 
 VkOffset2D tu_fdm_per_bin_offset(VkExtent2D frag_area, VkRect2D bin,
                                  VkOffset2D common_bin_offset);

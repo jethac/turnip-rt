@@ -4856,7 +4856,9 @@ static void
 tu_dirty_desc_sets(struct tu_cmd_buffer *cmd,
                    VkPipelineBindPoint pipelineBindPoint)
 {
-   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
+      return;
+   } else if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
       cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
    } else {
       assert(pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -5028,6 +5030,11 @@ tu_CmdBindDescriptorSets2KHR(
                                     VK_PIPELINE_BIND_POINT_COMPUTE);
    }
 
+   if (pBindDescriptorSetsInfo->stageFlags & TU_RT_STAGES) {
+      tu_bind_descriptor_sets<CHIP>(cmd, pBindDescriptorSetsInfo,
+                                    VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
+   }
+
    if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
       tu_bind_descriptor_sets<CHIP>(cmd, pBindDescriptorSetsInfo,
                                     VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -5091,6 +5098,11 @@ tu_CmdSetDescriptorBufferOffsets2EXT(
                                        VK_PIPELINE_BIND_POINT_COMPUTE);
    }
 
+   if (pSetDescriptorBufferOffsetsInfo->stageFlags & TU_RT_STAGES) {
+      tu_set_descriptor_buffer_offsets(cmd, pSetDescriptorBufferOffsetsInfo,
+                                       VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
+   }
+
    if (pSetDescriptorBufferOffsetsInfo->stageFlags &
        VK_SHADER_STAGE_ALL_GRAPHICS) {
       tu_set_descriptor_buffer_offsets(cmd, pSetDescriptorBufferOffsetsInfo,
@@ -5134,6 +5146,12 @@ tu_CmdBindDescriptorBufferEmbeddedSamplers2EXT(
       tu_bind_descriptor_buffer_embedded_samplers(
          cmd, pBindDescriptorBufferEmbeddedSamplersInfo,
          VK_PIPELINE_BIND_POINT_COMPUTE);
+   }
+
+   if (pBindDescriptorBufferEmbeddedSamplersInfo->stageFlags & TU_RT_STAGES) {
+      tu_bind_descriptor_buffer_embedded_samplers(
+         cmd, pBindDescriptorBufferEmbeddedSamplersInfo,
+         VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
    }
 
    if (pBindDescriptorBufferEmbeddedSamplersInfo->stageFlags &
@@ -5220,6 +5238,11 @@ tu_CmdPushDescriptorSet2KHR(
    if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
       tu_push_descriptor_set<CHIP>(cmd, pPushDescriptorSetInfo,
                                    VK_PIPELINE_BIND_POINT_COMPUTE);
+   }
+
+   if (pPushDescriptorSetInfo->stageFlags & TU_RT_STAGES) {
+      tu_push_descriptor_set<CHIP>(cmd, pPushDescriptorSetInfo,
+                                   VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
    }
 
    if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
@@ -5615,6 +5638,11 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
+
+   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
+      cmd->state.rt_pipeline = pipeline;
+      return;
+   }
 
    if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
       cmd->state.shaders[MESA_SHADER_COMPUTE] =
@@ -9570,6 +9598,8 @@ struct tu_dispatch_info
     * Indirect compute parameters resource.
     */
    VkDeviceAddress indirect;
+
+   VkDeviceAddress rt_cmd;
 };
 
 static inline struct ir3_driver_params_cs
@@ -9592,6 +9622,8 @@ build_driver_params_cs(const struct ir3_shader_variant *variant,
       .local_group_size_y = 0,
       .local_group_size_z = 0,
       .subgroup_id_shift = subgroup_shift,
+      .rt_cmd_addr_lo = (uint32_t) info->rt_cmd,
+      .rt_cmd_addr_hi = (uint32_t) (info->rt_cmd >> 32),
    };
 }
 
@@ -10086,6 +10118,80 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
    tu_dispatch<CHIP>(cmd_buffer, &info);
 }
 TU_GENX(tu_CmdDispatchIndirect);
+
+template <chip CHIP>
+VKAPI_ATTR void VKAPI_CALL
+tu_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
+                   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+                   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+                   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+                   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+                   uint32_t width,
+                   uint32_t height,
+                   uint32_t depth)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+   struct tu_pipeline *pipeline = cmd->state.rt_pipeline;
+
+   if (!pipeline || !pipeline->shaders[MESA_SHADER_COMPUTE] ||
+       !width || !height || !depth)
+      return;
+
+   VkTraceRaysIndirectCommand2KHR rt_cmd = {
+      .raygenShaderRecordAddress = pRaygenShaderBindingTable->deviceAddress,
+      .raygenShaderRecordSize = pRaygenShaderBindingTable->size,
+      .missShaderBindingTableAddress = pMissShaderBindingTable->deviceAddress,
+      .missShaderBindingTableSize = pMissShaderBindingTable->size,
+      .missShaderBindingTableStride = pMissShaderBindingTable->stride,
+      .hitShaderBindingTableAddress = pHitShaderBindingTable->deviceAddress,
+      .hitShaderBindingTableSize = pHitShaderBindingTable->size,
+      .hitShaderBindingTableStride = pHitShaderBindingTable->stride,
+      .callableShaderBindingTableAddress = pCallableShaderBindingTable->deviceAddress,
+      .callableShaderBindingTableSize = pCallableShaderBindingTable->size,
+      .callableShaderBindingTableStride = pCallableShaderBindingTable->stride,
+      .width = width,
+      .height = height,
+      .depth = depth,
+   };
+
+   struct tu_cs_memory mem;
+   VkResult result = tu_cs_alloc(&cmd->sub_cs,
+                                 DIV_ROUND_UP(sizeof(rt_cmd), 16), 4, &mem);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+   memcpy(mem.map, &rt_cmd, sizeof(rt_cmd));
+
+   struct tu_shader *prev_shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
+   struct tu_shader *rt_shader = pipeline->shaders[MESA_SHADER_COMPUTE];
+
+   cmd->state.shaders[MESA_SHADER_COMPUTE] = rt_shader;
+   tu_cs_emit_state_ib(&cmd->cs, rt_shader->state);
+
+   struct tu_descriptor_state tmp = cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE];
+   cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE] = cmd->descriptors[TU_BIND_POINT_RT];
+   cmd->descriptors[TU_BIND_POINT_RT] = tmp;
+   cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   struct tu_dispatch_info info = {};
+   info.unaligned = true;
+   info.blocks[0] = width;
+   info.blocks[1] = height;
+   info.blocks[2] = depth;
+   info.rt_cmd = mem.iova;
+   tu_dispatch<CHIP>(cmd, &info);
+
+   tmp = cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE];
+   cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE] = cmd->descriptors[TU_BIND_POINT_RT];
+   cmd->descriptors[TU_BIND_POINT_RT] = tmp;
+   cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   cmd->state.shaders[MESA_SHADER_COMPUTE] = prev_shader;
+   if (prev_shader)
+      tu_cs_emit_state_ib(&cmd->cs, prev_shader->state);
+}
+TU_GENX(tu_CmdTraceRaysKHR);
 
 void
 tu_dispatch_unaligned(VkCommandBuffer commandBuffer,

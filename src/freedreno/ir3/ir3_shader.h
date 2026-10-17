@@ -51,6 +51,10 @@ struct ir3_driver_params_cs {
    uint32_t workgroup_id_y;
    uint32_t workgroup_id_z;
    uint32_t __pad;
+   uint32_t rt_cmd_addr_lo;
+   uint32_t rt_cmd_addr_hi;
+   uint32_t __pad1;
+   uint32_t __pad2;
 };
 #define IR3_DP_CS(name) dword_offsetof(struct ir3_driver_params_cs, name)
 

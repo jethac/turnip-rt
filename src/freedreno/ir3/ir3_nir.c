@@ -1774,6 +1774,9 @@ ir3_get_driver_param_info(const nir_shader *shader,
    case nir_intrinsic_load_subgroup_id_shift_ir3:
       param_info->offset = IR3_DP_CS(subgroup_id_shift);
       break;
+   case nir_intrinsic_load_rt_cmd_addr_ir3:
+      param_info->offset = IR3_DP_CS(rt_cmd_addr_lo);
+      break;
    case nir_intrinsic_load_work_dim:
       param_info->offset = IR3_DP_CS(work_dim);
       break;

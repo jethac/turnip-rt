@@ -54,6 +54,7 @@ libtu_files = files(
   'tu_nir_lower_ray_query.cc',
   'tu_pass.cc',
   'tu_pipeline.cc',
+  'tu_ray_tracing_pipeline.cc',
   'tu_sampler.cc',
   'tu_query_pool.cc',
   'tu_queue.cc',

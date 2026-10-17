@@ -3175,6 +3175,10 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
    case nir_intrinsic_load_subgroup_id_shift_ir3:
       dst[0] = create_driver_param(ctx, IR3_DP_CS(subgroup_id_shift));
       break;
+   case nir_intrinsic_load_rt_cmd_addr_ir3:
+      for (int i = 0; i < dest_components; i++)
+         dst[i] = create_driver_param(ctx, IR3_DP_CS(rt_cmd_addr_lo) + i);
+      break;
    case nir_intrinsic_load_work_dim:
       dst[0] = create_driver_param(ctx, IR3_DP_CS(work_dim));
       break;

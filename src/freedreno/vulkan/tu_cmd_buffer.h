@@ -494,6 +494,7 @@ struct tu_cmd_state
    uint32_t dirty;
 
    struct tu_shader *shaders[MESA_SHADER_STAGES];
+   struct tu_pipeline *rt_pipeline;
 
    struct tu_program_state program;
 
@@ -911,6 +912,8 @@ static inline struct tu_descriptor_state *
 tu_get_descriptors_state(struct tu_cmd_buffer *cmd_buffer,
                          VkPipelineBindPoint bind_point)
 {
+   if (bind_point == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
+      return &cmd_buffer->descriptors[TU_BIND_POINT_RT];
    return &cmd_buffer->descriptors[bind_point];
 }
 
