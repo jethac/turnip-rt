@@ -252,6 +252,18 @@ tu_spirv_to_nir(struct tu_device *dev,
       NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysval_options);
    }
 
+   if (key->fast_math) {
+      nir->info.float_controls_execution_mode = 0;
+      nir_foreach_function_impl (impl, nir) {
+         nir_foreach_block (block, impl) {
+            nir_foreach_instr (instr, block) {
+               if (instr->type == nir_instr_type_alu)
+                  nir_instr_as_alu(instr)->fp_math_ctrl = nir_fp_fast_math;
+            }
+         }
+      }
+   }
+
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
    if (nir->info.ray_queries > 0) {

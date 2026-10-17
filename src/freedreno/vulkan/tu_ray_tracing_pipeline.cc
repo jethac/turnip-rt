@@ -11,6 +11,7 @@
 #include "util/hash_table.h"
 #include "util/mesa-blake3.h"
 #include "util/u_atomic.h"
+#include "util/u_debug.h"
 #include "vk_pipeline.h"
 
 #include "tu_device.h"
@@ -1289,6 +1290,7 @@ tu_rt_pipeline_create(struct tu_device *dev,
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &rs,
                                      create_info->pNext, NULL);
    tu_shader_key_robustness(&key, &rs);
+   key.fast_math = debug_get_bool_option("TU_RT_FAST_MATH", false);
 
    {
       uint32_t s = 0;

@@ -141,7 +141,8 @@ struct tu_shader_key {
    bool lower_view_index_to_device_index : 1;
    bool custom_resolve : 1;
    bool emulate_alpha_to_coverage : 1;
-   uint32_t padding : 23;
+   bool fast_math : 1;
+   uint32_t padding : 22;
 
    enum ir3_wavesize_option api_wavesize, real_wavesize;
 
