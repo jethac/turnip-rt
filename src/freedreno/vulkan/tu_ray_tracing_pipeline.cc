@@ -1477,6 +1477,50 @@ tu_rt_build_shader(struct tu_device *dev,
                   total++;
       static const uint64_t budget =
          debug_get_num_option("TU_RT_HIT_BUDGET", 250000);
+      if (total > budget || debug_get_bool_option("TU_RT_LOG", false)) {
+         uint64_t by_stage[32] = {};
+         unsigned n_by_stage[32] = {};
+         unsigned trace_sites = 0, call_sites = 0;
+         for (uint32_t i = 0; i < pipeline->stage_count; i++) {
+            nir_shader *st = pipeline->stages[i];
+            uint64_t n = 0;
+            nir_foreach_function_impl (impl, st)
+               nir_foreach_block (block, impl)
+                  nir_foreach_instr (instr, block) {
+                     n++;
+                     if (instr->type == nir_instr_type_intrinsic) {
+                        nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+                        if (op == nir_intrinsic_trace_ray)
+                           trace_sites++;
+                        else if (op == nir_intrinsic_execute_callable)
+                           call_sites++;
+                     }
+                  }
+            by_stage[st->info.stage] += n;
+            n_by_stage[st->info.stage]++;
+         }
+         unsigned g_tri = 0, g_proc = 0, g_ahit = 0, g_gen = 0;
+         for (uint32_t i = 0; i < pipeline->group_count; i++) {
+            const struct tu_rt_group *g = pipeline->groups + i;
+            if (g->isec_index != VK_SHADER_UNUSED_KHR)
+               g_proc++;
+            else if (g->ahit_index != VK_SHADER_UNUSED_KHR ||
+                     (g->recursive_index != VK_SHADER_UNUSED_KHR &&
+                      pipeline->stages[g->recursive_index]->info.stage == MESA_SHADER_CLOSEST_HIT))
+               g_tri++;
+            else
+               g_gen++;
+            if (g->ahit_index != VK_SHADER_UNUSED_KHR)
+               g_ahit++;
+         }
+         mesa_logi("tu-rt: shape groups gen=%u tri=%u (ahit=%u) proc=%u | trace_sites=%u call_sites=%u",
+                   g_gen, g_tri, g_ahit, g_proc, trace_sites, call_sites);
+         for (unsigned st = 0; st < 32; st++)
+            if (n_by_stage[st])
+               mesa_logi("tu-rt: shape   %s x%u = %" PRIu64 " instrs",
+                         _mesa_shader_stage_to_abbrev((mesa_shader_stage) st),
+                         n_by_stage[st], by_stage[st]);
+      }
       if (total > budget) {
          c.nohit = true;
          c.has_ahit = false;
