@@ -9651,7 +9651,7 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
 
       uint64_t iova = 0;
 
-      if (!info->indirect) {
+      if (!info->indirect || info->rt_cmd) {
          struct ir3_driver_params_cs driver_params =
             build_driver_params_cs(variant, info);
 
@@ -9732,7 +9732,7 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
       uint32_t num_consts = MIN2(const_state->num_driver_params,
                                  (variant->constlen - offset) * 4);
 
-      if (!info->indirect) {
+      if (!info->indirect || info->rt_cmd) {
          struct ir3_driver_params_cs driver_params =
             build_driver_params_cs(variant, info);
 
@@ -9787,7 +9787,7 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
       /* Fill out IR3_DP_CS_SUBGROUP_SIZE and IR3_DP_SUBGROUP_ID_SHIFT for
        * indirect dispatch.
        */
-      if (info->indirect && num_consts > IR3_DP_CS(base_group_x)) {
+      if (info->indirect && !info->rt_cmd && num_consts > IR3_DP_CS(base_group_x)) {
          bool emit_local = num_consts > IR3_DP_CS(local_group_size_x);
          tu_cs_emit_pkt7(cs, tu6_stage2opcode(type), 7 + (emit_local ? 4 : 0));
          tu_cs_emit(cs, CP_LOAD_STATE6_0_DST_OFF(offset + (IR3_DP_CS(base_group_x) / 4)) |
@@ -10120,6 +10120,120 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
 TU_GENX(tu_CmdDispatchIndirect);
 
 template <chip CHIP>
+static void
+tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
+              const uint32_t *dims, uint64_t dims_iova)
+{
+   struct tu_pipeline *pipeline = cmd->state.rt_pipeline;
+   if (!pipeline || !pipeline->shaders[MESA_SHADER_COMPUTE])
+      return;
+
+   struct tu_cs *cs = &cmd->cs;
+   struct tu_dispatch_info info = {};
+   info.rt_cmd = rt_cmd_iova;
+
+   if (dims) {
+      if (!dims[0] || !dims[1] || !dims[2])
+         return;
+      info.unaligned = true;
+      info.blocks[0] = dims[0];
+      info.blocks[1] = dims[1];
+      info.blocks[2] = dims[2];
+   } else {
+      struct tu_cs_memory grp;
+      tu_cs_set_writeable(&cmd->sub_cs, true);
+      VkResult result = tu_cs_alloc(&cmd->sub_cs, 1, 4, &grp);
+      tu_cs_set_writeable(&cmd->sub_cs, false);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
+      const struct tu_shader *rt_shader = pipeline->shaders[MESA_SHADER_COMPUTE];
+      for (unsigned k = 0; k < 3; k++) {
+         unsigned local = rt_shader->variant->local_size[k];
+         cs->mem_to_reg(tu_scratch_reg<CHIP>(0), dims_iova + 4 * k,
+                        { .one_reg_wr = true, .wait_cache_flush = true });
+         if (local > 1) {
+            cs->rmw(tu_scratch_reg<CHIP>(0), {
+               .src1_add = true,
+               .src0 = 0xffffffff,
+               .src1 = local - 1,
+            });
+            cs->rmw(tu_scratch_reg<CHIP>(0), {
+               .rotate = (32 - util_logbase2(local)) & 0x1f,
+               .src0 = ~(local - 1),
+               .src1 = 0,
+            });
+         }
+         cs->reg_to_mem(grp.iova + 4 * k, tu_scratch_reg<CHIP>(0));
+      }
+      tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+      info.indirect = grp.iova;
+   }
+
+   struct tu_shader *prev_shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
+   struct tu_shader *rt_shader = pipeline->shaders[MESA_SHADER_COMPUTE];
+
+   cmd->state.shaders[MESA_SHADER_COMPUTE] = rt_shader;
+   tu_cs_emit_state_ib(cs, rt_shader->state);
+
+   struct tu_descriptor_state tmp = cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE];
+   cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE] = cmd->descriptors[TU_BIND_POINT_RT];
+   cmd->descriptors[TU_BIND_POINT_RT] = tmp;
+   cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   tu_dispatch<CHIP>(cmd, &info);
+
+   tmp = cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE];
+   cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE] = cmd->descriptors[TU_BIND_POINT_RT];
+   cmd->descriptors[TU_BIND_POINT_RT] = tmp;
+   cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   cmd->state.shaders[MESA_SHADER_COMPUTE] = prev_shader;
+   if (prev_shader)
+      tu_cs_emit_state_ib(cs, prev_shader->state);
+}
+
+static bool
+tu_rt_cmd_alloc(struct tu_cmd_buffer *cmd,
+                const VkStridedDeviceAddressRegionKHR *rg,
+                const VkStridedDeviceAddressRegionKHR *ms,
+                const VkStridedDeviceAddressRegionKHR *ht,
+                const VkStridedDeviceAddressRegionKHR *cl,
+                uint32_t width, uint32_t height, uint32_t depth,
+                bool writeable, struct tu_cs_memory *mem)
+{
+   VkTraceRaysIndirectCommand2KHR rt_cmd = {
+      .raygenShaderRecordAddress = rg->deviceAddress,
+      .raygenShaderRecordSize = rg->size,
+      .missShaderBindingTableAddress = ms->deviceAddress,
+      .missShaderBindingTableSize = ms->size,
+      .missShaderBindingTableStride = ms->stride,
+      .hitShaderBindingTableAddress = ht->deviceAddress,
+      .hitShaderBindingTableSize = ht->size,
+      .hitShaderBindingTableStride = ht->stride,
+      .callableShaderBindingTableAddress = cl->deviceAddress,
+      .callableShaderBindingTableSize = cl->size,
+      .callableShaderBindingTableStride = cl->stride,
+      .width = width,
+      .height = height,
+      .depth = depth,
+   };
+   if (writeable)
+      tu_cs_set_writeable(&cmd->sub_cs, true);
+   VkResult result = tu_cs_alloc(&cmd->sub_cs,
+                                 DIV_ROUND_UP(sizeof(rt_cmd), 16), 4, mem);
+   if (writeable)
+      tu_cs_set_writeable(&cmd->sub_cs, false);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return false;
+   }
+   memcpy(mem->map, &rt_cmd, sizeof(rt_cmd));
+   return true;
+}
+
+template <chip CHIP>
 VKAPI_ATTR void VKAPI_CALL
 tu_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
                    const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
@@ -10131,67 +10245,57 @@ tu_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
                    uint32_t depth)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
-   struct tu_pipeline *pipeline = cmd->state.rt_pipeline;
-
-   if (!pipeline || !pipeline->shaders[MESA_SHADER_COMPUTE] ||
-       !width || !height || !depth)
+   if (!width || !height || !depth)
       return;
-
-   VkTraceRaysIndirectCommand2KHR rt_cmd = {
-      .raygenShaderRecordAddress = pRaygenShaderBindingTable->deviceAddress,
-      .raygenShaderRecordSize = pRaygenShaderBindingTable->size,
-      .missShaderBindingTableAddress = pMissShaderBindingTable->deviceAddress,
-      .missShaderBindingTableSize = pMissShaderBindingTable->size,
-      .missShaderBindingTableStride = pMissShaderBindingTable->stride,
-      .hitShaderBindingTableAddress = pHitShaderBindingTable->deviceAddress,
-      .hitShaderBindingTableSize = pHitShaderBindingTable->size,
-      .hitShaderBindingTableStride = pHitShaderBindingTable->stride,
-      .callableShaderBindingTableAddress = pCallableShaderBindingTable->deviceAddress,
-      .callableShaderBindingTableSize = pCallableShaderBindingTable->size,
-      .callableShaderBindingTableStride = pCallableShaderBindingTable->stride,
-      .width = width,
-      .height = height,
-      .depth = depth,
-   };
-
    struct tu_cs_memory mem;
-   VkResult result = tu_cs_alloc(&cmd->sub_cs,
-                                 DIV_ROUND_UP(sizeof(rt_cmd), 16), 4, &mem);
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmd->vk, result);
+   if (!tu_rt_cmd_alloc(cmd, pRaygenShaderBindingTable, pMissShaderBindingTable,
+                        pHitShaderBindingTable, pCallableShaderBindingTable,
+                        width, height, depth, false, &mem))
       return;
-   }
-   memcpy(mem.map, &rt_cmd, sizeof(rt_cmd));
-
-   struct tu_shader *prev_shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
-   struct tu_shader *rt_shader = pipeline->shaders[MESA_SHADER_COMPUTE];
-
-   cmd->state.shaders[MESA_SHADER_COMPUTE] = rt_shader;
-   tu_cs_emit_state_ib(&cmd->cs, rt_shader->state);
-
-   struct tu_descriptor_state tmp = cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE];
-   cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE] = cmd->descriptors[TU_BIND_POINT_RT];
-   cmd->descriptors[TU_BIND_POINT_RT] = tmp;
-   cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
-
-   struct tu_dispatch_info info = {};
-   info.unaligned = true;
-   info.blocks[0] = width;
-   info.blocks[1] = height;
-   info.blocks[2] = depth;
-   info.rt_cmd = mem.iova;
-   tu_dispatch<CHIP>(cmd, &info);
-
-   tmp = cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE];
-   cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE] = cmd->descriptors[TU_BIND_POINT_RT];
-   cmd->descriptors[TU_BIND_POINT_RT] = tmp;
-   cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
-
-   cmd->state.shaders[MESA_SHADER_COMPUTE] = prev_shader;
-   if (prev_shader)
-      tu_cs_emit_state_ib(&cmd->cs, prev_shader->state);
+   const uint32_t dims[3] = { width, height, depth };
+   tu_trace_rays<CHIP>(cmd, mem.iova, dims, 0);
 }
 TU_GENX(tu_CmdTraceRaysKHR);
+
+template <chip CHIP>
+VKAPI_ATTR void VKAPI_CALL
+tu_CmdTraceRaysIndirectKHR(VkCommandBuffer commandBuffer,
+                           const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
+                           const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
+                           const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
+                           const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
+                           VkDeviceAddress indirectDeviceAddress)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+   struct tu_cs_memory mem;
+   if (!tu_rt_cmd_alloc(cmd, pRaygenShaderBindingTable, pMissShaderBindingTable,
+                        pHitShaderBindingTable, pCallableShaderBindingTable,
+                        0, 0, 0, true, &mem))
+      return;
+   struct tu_cs *cs = &cmd->cs;
+   const uint64_t dst = mem.iova + offsetof(VkTraceRaysIndirectCommand2KHR, width);
+   for (unsigned i = 0; i < 3; i++) {
+      tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
+      tu_cs_emit(cs, 0);
+      tu_cs_emit_qw(cs, dst + 4 * i);
+      tu_cs_emit_qw(cs, indirectDeviceAddress + 4 * i);
+   }
+   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+   tu_trace_rays<CHIP>(cmd, mem.iova, NULL, indirectDeviceAddress);
+}
+TU_GENX(tu_CmdTraceRaysIndirectKHR);
+
+template <chip CHIP>
+VKAPI_ATTR void VKAPI_CALL
+tu_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
+                            VkDeviceAddress indirectDeviceAddress)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+   tu_trace_rays<CHIP>(cmd, indirectDeviceAddress, NULL,
+                       indirectDeviceAddress +
+                       offsetof(VkTraceRaysIndirectCommand2KHR, width));
+}
+TU_GENX(tu_CmdTraceRaysIndirect2KHR);
 
 void
 tu_dispatch_unaligned(VkCommandBuffer commandBuffer,

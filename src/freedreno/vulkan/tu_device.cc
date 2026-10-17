@@ -861,12 +861,13 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_KHR_ray_tracing_maintenance1 */
    features->rayTracingMaintenance1 = true;
+   features->rayTracingPipelineTraceRaysIndirect2 = true;
 
    /* VK_KHR_ray_tracing_pipeline */
    features->rayTracingPipeline = true;
    features->rayTracingPipelineShaderGroupHandleCaptureReplay = false;
    features->rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false;
-   features->rayTracingPipelineTraceRaysIndirect = false;
+   features->rayTracingPipelineTraceRaysIndirect = true;
    features->rayTraversalPrimitiveCulling = true;
 
    /* VK_KHR_robustness2 */
