@@ -1992,10 +1992,16 @@ get_alu_uub(struct analysis_state *state, struct scalar_query q, uint32_t *resul
       nir_scalar src1_scalar = nir_scalar_chase_alu_src(q.scalar, 1);
       if (nir_scalar_is_const(src0_scalar)) {
          uint32_t const_val = nir_scalar_as_uint(src0_scalar);
-         *result = const_val ? MIN2(*result, max / const_val * const_val) : 0;
+         if (!const_val)
+            *result = 0;
+         else if (util_is_power_of_two_nonzero(const_val))
+            *result = MIN2(*result, max / const_val * const_val);
       } else if (nir_scalar_is_const(src1_scalar)) {
          uint32_t const_val = nir_scalar_as_uint(src1_scalar);
-         *result = const_val ? MIN2(*result, max / const_val * const_val) : 0;
+         if (!const_val)
+            *result = 0;
+         else if (util_is_power_of_two_nonzero(const_val))
+            *result = MIN2(*result, max / const_val * const_val);
       }
       break;
    }
