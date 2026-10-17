@@ -288,6 +288,7 @@ struct tu_ray_tracing_pipeline {
    uint32_t stage_count;
    uint32_t group_count;
    nir_shader **stages;
+   uint8_t *stage_hashes;
    struct tu_rt_group *groups;
 };
 
@@ -312,10 +313,17 @@ tu_pipeline_finish(struct tu_pipeline *pipeline,
                    struct tu_device *dev,
                    const VkAllocationCallbacks *alloc);
 
+struct tu_shader *
+tu_compute_pipeline_cache_lookup(struct tu_device *dev,
+                                 struct vk_pipeline_cache *cache,
+                                 const unsigned char *blake3);
+
 VkResult
 tu_compute_pipeline_init_nir(struct tu_device *dev,
                              struct tu_compute_pipeline *pipeline,
                              struct tu_pipeline_layout *layout,
+                             struct vk_pipeline_cache *cache,
+                             struct tu_shader *shader,
                              nir_shader *nir,
                              const struct tu_shader_key *key,
                              const unsigned char *blake3);

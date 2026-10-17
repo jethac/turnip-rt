@@ -316,7 +316,6 @@ struct tu_device
    struct tu_queue *queues[TU_MAX_QUEUE_FAMILIES];
    int queue_count[TU_MAX_QUEUE_FAMILIES];
 
-   uint32_t rt_group_handle_alloc;
 
    struct tu_physical_device *physical_device;
    uint32_t device_idx;

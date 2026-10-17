@@ -5116,23 +5116,38 @@ fail:
    return result;
 }
 
+struct tu_shader *
+tu_compute_pipeline_cache_lookup(struct tu_device *dev,
+                                 struct vk_pipeline_cache *cache,
+                                 const unsigned char *blake3)
+{
+   bool app_hit = false;
+   return tu_pipeline_cache_lookup(cache ? cache : dev->mem_cache, blake3,
+                                   BLAKE3_KEY_LEN, &app_hit);
+}
+
 VkResult
 tu_compute_pipeline_init_nir(struct tu_device *dev,
                              struct tu_compute_pipeline *pipeline,
                              struct tu_pipeline_layout *layout,
+                             struct vk_pipeline_cache *cache,
+                             struct tu_shader *shader,
                              nir_shader *nir,
                              const struct tu_shader_key *key,
                              const unsigned char *blake3)
 {
-   struct tu_shader *shader = NULL;
-   struct ir3_shader_key ir3_key = {};
-   struct tu_shader_info info = {};
+   VkResult result = VK_SUCCESS;
+   if (!shader) {
+      struct ir3_shader_key ir3_key = {};
+      struct tu_shader_info info = {};
 
-   tu_lower_nir(dev, nir, key, &ir3_key, &info);
-   VkResult result = tu_shader_create(dev, &shader, nir, key, &info, &ir3_key,
-                                      blake3, BLAKE3_KEY_LEN, layout, false);
-   if (!shader)
-      return result;
+      tu_lower_nir(dev, nir, key, &ir3_key, &info);
+      result = tu_shader_create(dev, &shader, nir, key, &info, &ir3_key,
+                                blake3, BLAKE3_KEY_LEN, layout, false);
+      if (!shader)
+         return result;
+      shader = tu_pipeline_cache_insert(cache ? cache : dev->mem_cache, shader);
+   }
 
    pipeline->base.active_desc_sets = shader->active_desc_sets;
 

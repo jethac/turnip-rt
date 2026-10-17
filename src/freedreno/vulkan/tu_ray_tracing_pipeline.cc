@@ -19,6 +19,7 @@
 
 static VkResult
 tu_rt_compile_stages(struct tu_device *dev,
+                     struct vk_pipeline_cache *cache,
                      struct tu_ray_tracing_pipeline *pipeline,
                      const VkRayTracingPipelineCreateInfoKHR *create_info,
                      VkPipelineCreateFlags2KHR flags,
@@ -57,7 +58,24 @@ tu_rt_init_groups(struct tu_device *dev,
          UNREACHABLE("Unimplemented VkRayTracingShaderGroupTypeKHR");
       }
 
-      dst->handle = p_atomic_inc_return(&dev->rt_group_handle_alloc);
+      uint32_t idx[3] = { dst->recursive_index, dst->ahit_index, dst->isec_index };
+      struct mesa_blake3 h;
+      unsigned char out[BLAKE3_KEY_LEN];
+      _mesa_blake3_init(&h);
+      _mesa_blake3_update(&h, &group_info->type, sizeof(group_info->type));
+      for (unsigned k = 0; k < 3; k++) {
+         if (idx[k] == VK_SHADER_UNUSED_KHR) {
+            uint32_t none = ~0u;
+            _mesa_blake3_update(&h, &none, sizeof(none));
+         } else {
+            _mesa_blake3_update(&h, pipeline->stage_hashes + idx[k] * BLAKE3_KEY_LEN,
+                                BLAKE3_KEY_LEN);
+         }
+      }
+      _mesa_blake3_final(&h, out);
+      memcpy(&dst->handle, out, sizeof(dst->handle));
+      if (!dst->handle)
+         dst->handle = 1;
    }
 
    if (!create_info->pLibraryInfo)
@@ -261,26 +279,51 @@ tu_rt_lower_hit_attribs(nir_shader *nir)
 
 static VkResult
 tu_rt_compile_stages(struct tu_device *dev,
+                     struct vk_pipeline_cache *cache,
                      struct tu_ray_tracing_pipeline *pipeline,
                      const VkRayTracingPipelineCreateInfoKHR *create_info,
                      VkPipelineCreateFlags2KHR flags,
                      const struct tu_shader_key *key)
 {
+   const nir_shader_compiler_options *nir_options =
+      ir3_get_compiler_options(dev->compiler);
+   cache = cache ? cache : dev->mem_cache;
+   bool can_cache = !(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+
    uint32_t i = 0;
    for (; i < create_info->stageCount; i++) {
       const VkPipelineShaderStageCreateInfo *stage_info =
          create_info->pStages + i;
       mesa_shader_stage stage = vk_to_mesa_shader_stage(stage_info->stage);
 
-      nir_shader *nir = tu_spirv_to_nir(dev, pipeline->mem_ctx, flags,
-                                        stage_info, key, stage);
-      if (!nir)
-         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      static const char version[] = "tu-rt-stage-3";
+      unsigned char nir_key[BLAKE3_KEY_LEN];
+      struct mesa_blake3 h;
+      _mesa_blake3_init(&h);
+      _mesa_blake3_update(&h, version, sizeof(version));
+      _mesa_blake3_update(&h, pipeline->stage_hashes + i * BLAKE3_KEY_LEN, BLAKE3_KEY_LEN);
+      _mesa_blake3_update(&h, key, sizeof(*key));
+      enum ir3_shader_debug ir3_debug_key = ir3_shader_debug_hash_key();
+      _mesa_blake3_update(&h, &ir3_debug_key, sizeof(ir3_debug_key));
+      _mesa_blake3_final(&h, nir_key);
 
-      NIR_PASS(_, nir, tu_rt_retag_constant_derefs);
-      NIR_PASS(_, nir, tu_rt_lower_hit_attribs);
-      NIR_PASS(_, nir, nir_shader_intrinsics_pass, tu_rt_move_intrinsic,
-               nir_metadata_control_flow, NULL);
+      nir_shader *nir = NULL;
+      if (can_cache)
+         nir = vk_pipeline_cache_lookup_nir(cache, nir_key, sizeof(nir_key),
+                                            nir_options, NULL, pipeline->mem_ctx);
+      if (!nir) {
+         nir = tu_spirv_to_nir(dev, pipeline->mem_ctx, flags, stage_info, key, stage);
+         if (!nir)
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+         NIR_PASS(_, nir, tu_rt_retag_constant_derefs);
+         NIR_PASS(_, nir, tu_rt_lower_hit_attribs);
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, tu_rt_move_intrinsic,
+                  nir_metadata_control_flow, NULL);
+
+         if (can_cache)
+            vk_pipeline_cache_add_nir(cache, nir_key, sizeof(nir_key), nir);
+      }
 
       pipeline->stages[i] = nir;
    }
@@ -1235,6 +1278,8 @@ tu_rt_pipeline_create(struct tu_device *dev,
 
    pipeline->stages = rzalloc_array(pipeline->mem_ctx, nir_shader *,
                                     MAX2(pipeline->stage_count, 1));
+   pipeline->stage_hashes = rzalloc_array(pipeline->mem_ctx, uint8_t,
+                                          MAX2(pipeline->stage_count, 1) * BLAKE3_KEY_LEN);
    pipeline->groups = rzalloc_array(pipeline->mem_ctx, struct tu_rt_group,
                                     MAX2(pipeline->group_count, 1));
 
@@ -1245,26 +1290,80 @@ tu_rt_pipeline_create(struct tu_device *dev,
                                      create_info->pNext, NULL);
    tu_shader_key_robustness(&key, &rs);
 
-   result = tu_rt_compile_stages(dev, pipeline, create_info, flags, &key);
-   if (result != VK_SUCCESS)
-      goto fail;
+   {
+      uint32_t s = 0;
+      for (; s < create_info->stageCount; s++)
+         vk_pipeline_hash_shader_stage(flags, create_info->pStages + s, &rs,
+                                       pipeline->stage_hashes + s * BLAKE3_KEY_LEN);
+      if (create_info->pLibraryInfo) {
+         for (uint32_t l = 0; l < create_info->pLibraryInfo->libraryCount; l++) {
+            VK_FROM_HANDLE(tu_pipeline, lib_base,
+                           create_info->pLibraryInfo->pLibraries[l]);
+            struct tu_ray_tracing_pipeline *lib = tu_pipeline_to_ray_tracing(lib_base);
+            memcpy(pipeline->stage_hashes + s * BLAKE3_KEY_LEN, lib->stage_hashes,
+                   lib->stage_count * BLAKE3_KEY_LEN);
+            s += lib->stage_count;
+         }
+      }
+   }
 
    tu_rt_init_groups(dev, pipeline, create_info);
 
-   if (!(flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)) {
-      nir_shader *nir = tu_rt_build_shader(dev, pipeline, create_info, flags);
-      ralloc_steal(pipeline->mem_ctx, nir);
-
+   if (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) {
+      result = tu_rt_compile_stages(dev, cache, pipeline, create_info, flags, &key);
+      if (result != VK_SUCCESS)
+         goto fail;
+   } else {
+      static const char version[] = "tu-rt-3";
       unsigned char blake3[BLAKE3_KEY_LEN];
       struct mesa_blake3 ctx;
       _mesa_blake3_init(&ctx);
-      _mesa_blake3_update(&ctx, &pipeline, sizeof(pipeline));
-      uint32_t serial = p_atomic_inc_return(&dev->rt_group_handle_alloc);
-      _mesa_blake3_update(&ctx, &serial, sizeof(serial));
+      _mesa_blake3_update(&ctx, version, sizeof(version));
+      if (layout)
+         _mesa_blake3_update(&ctx, layout->blake3, sizeof(layout->blake3));
+      _mesa_blake3_update(&ctx, &key, sizeof(key));
+      enum ir3_shader_debug ir3_debug_key = ir3_shader_debug_hash_key();
+      _mesa_blake3_update(&ctx, &ir3_debug_key, sizeof(ir3_debug_key));
+      VkPipelineCreateFlags2KHR hflags = flags &
+         (VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR |
+          VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR);
+      _mesa_blake3_update(&ctx, &hflags, sizeof(hflags));
+      uint32_t depth = MIN2(create_info->maxPipelineRayRecursionDepth, 1);
+      _mesa_blake3_update(&ctx, &depth, sizeof(depth));
+      for (uint32_t g = 0; g < pipeline->group_count; g++) {
+         const struct tu_rt_group *grp = pipeline->groups + g;
+         _mesa_blake3_update(&ctx, &grp->handle, sizeof(grp->handle));
+         uint32_t idx[3] = { grp->recursive_index, grp->ahit_index, grp->isec_index };
+         for (unsigned k = 0; k < 3; k++) {
+            if (idx[k] == VK_SHADER_UNUSED_KHR) {
+               uint32_t none = ~0u;
+               _mesa_blake3_update(&ctx, &none, sizeof(none));
+            } else {
+               _mesa_blake3_update(&ctx, pipeline->stage_hashes + idx[k] * BLAKE3_KEY_LEN,
+                                   BLAKE3_KEY_LEN);
+            }
+         }
+      }
       _mesa_blake3_final(&ctx, blake3);
 
-      result = tu_compute_pipeline_init_nir(dev, &pipeline->base, layout, nir,
-                                            &key, blake3);
+      struct tu_shader *shader = NULL;
+      nir_shader *nir = NULL;
+      if (!(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR))
+         shader = tu_compute_pipeline_cache_lookup(dev, cache, blake3);
+      if (!shader) {
+         if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+            result = VK_PIPELINE_COMPILE_REQUIRED;
+            goto fail;
+         }
+         result = tu_rt_compile_stages(dev, cache, pipeline, create_info, flags, &key);
+         if (result != VK_SUCCESS)
+            goto fail;
+         nir = tu_rt_build_shader(dev, pipeline, create_info, flags);
+         ralloc_steal(pipeline->mem_ctx, nir);
+      }
+
+      result = tu_compute_pipeline_init_nir(dev, &pipeline->base, layout, cache,
+                                            shader, nir, &key, blake3);
       if (result != VK_SUCCESS)
          goto fail;
    }
