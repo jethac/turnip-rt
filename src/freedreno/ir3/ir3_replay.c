@@ -11,8 +11,10 @@
 #include <sys/resource.h>
 
 #include "nir_serialize.h"
+#include "compiler/glsl_types.h"
 #include "util/blob.h"
 #include "util/os_time.h"
+#include "util/mesa-blake3.h"
 #include "freedreno_dev_info.h"
 
 static void *
@@ -69,6 +71,7 @@ main(int argc, char **argv)
       return 1;
    fclose(f);
 
+   glsl_type_singleton_init_or_ref();
    copts->disable_cache = true;
    struct ir3_compiler *compiler =
       ir3_compiler_create(NULL, dev_id, fd_dev_info_raw(dev_id), copts);
@@ -86,6 +89,10 @@ main(int argc, char **argv)
       struct ir3_shader *shader = ir3_shader_from_nir(compiler, nir, sopts);
       struct ir3_shader_variant *v = ir3_shader_create_variant(shader, key, false);
       int64_t t1 = os_time_get_nano();
+      unsigned char h[BLAKE3_OUT_LEN] = {0};
+      if (v && v->bin)
+         _mesa_blake3_compute(v->bin, v->info.size, h);
+      printf("REPLAY bin=%02x%02x%02x%02x%02x%02x ", h[0], h[1], h[2], h[3], h[4], h[5]);
       printf("REPLAY %s: %s instrs=%u regs=%u half=%u stp=%u ldp=%u nops=%u mov=%u "
              "time=%.1fms maxrss=%ldM (+%ldM)\n",
              argv[1], v ? "ok" : "FAIL", v ? v->info.instrs_count : 0,

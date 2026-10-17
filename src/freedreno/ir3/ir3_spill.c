@@ -4,6 +4,8 @@
  */
 
 #include "util/rb_tree.h"
+#include "util/u_dynarray.h"
+#include "util/u_debug.h"
 #include "ir3_ra.h"
 #include "ir3_shader.h"
 
@@ -69,6 +71,9 @@ struct ra_spill_interval {
 struct ra_spill_block_state {
    unsigned *next_use_end;
    unsigned *next_use_start;
+
+   unsigned *in_names, *start_vals, in_count;
+   unsigned *out_names, *end_vals, out_count;
 
    unsigned cycles;
 
@@ -283,9 +288,197 @@ compute_block_next_distance(struct ra_spill_ctx *ctx, struct ir3_block *block,
    return progress;
 }
 
+static int
+find_name(const unsigned *names, unsigned count, unsigned name)
+{
+   unsigned lo = 0, hi = count;
+   while (lo < hi) {
+      unsigned mid = (lo + hi) / 2;
+      if (names[mid] < name)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   return (lo < count && names[lo] == name) ? (int) lo : -1;
+}
+
+static unsigned *
+bitset_to_names(void *mem_ctx, const BITSET_WORD *set, unsigned size,
+                unsigned *count)
+{
+   unsigned n = __bitset_count(set, BITSET_WORDS(size));
+   unsigned *names = ralloc_array(mem_ctx, unsigned, MAX2(n, 1));
+   unsigned i = 0, name;
+   BITSET_FOREACH_SET (name, set, size)
+      names[i++] = name;
+   *count = n;
+   return names;
+}
+
+static inline void
+touch(unsigned *tmp, struct util_dynarray *touched, unsigned name, unsigned v)
+{
+   tmp[name] = v;
+   util_dynarray_append(touched, name);
+}
+
+static bool
+compute_block_next_distance_sparse(struct ra_spill_ctx *ctx,
+                                   struct ir3_block *block, unsigned *tmp,
+                                   struct util_dynarray *touched)
+{
+   struct ra_spill_block_state *state = &ctx->blocks[block->index];
+   for (unsigned k = 0; k < state->out_count; k++)
+      tmp[state->out_names[k]] = state->end_vals[k];
+
+   unsigned cycle = state->cycles;
+   foreach_instr_rev (instr, &block->instr_list) {
+      ra_foreach_dst (dst, instr) {
+         dst->next_use = tmp[dst->name];
+      }
+
+      ra_foreach_src (src, instr) {
+         src->next_use = tmp[src->def->name];
+      }
+
+      cycle -= instr_cycles(instr);
+
+      if (instr->opc == OPC_META_PARALLEL_COPY) {
+         ra_foreach_src_n (src, i, instr) {
+            if (src->def->merge_set == instr->dsts[i]->merge_set &&
+                src->def->merge_set_offset == instr->dsts[i]->merge_set_offset) {
+               touch(tmp, touched, src->def->name, tmp[instr->dsts[i]->name]);
+            } else {
+               touch(tmp, touched, src->def->name, cycle);
+            }
+         }
+      } else if (instr->opc != OPC_META_PHI) {
+         ra_foreach_src (src, instr) {
+            touch(tmp, touched, src->def->name, cycle);
+         }
+      }
+
+      ra_foreach_dst (dst, instr) {
+         touch(tmp, touched, dst->name, UINT_MAX);
+      }
+   }
+
+   for (unsigned k = 0; k < state->in_count; k++)
+      state->start_vals[k] = tmp[state->in_names[k]];
+
+   for (unsigned k = 0; k < state->out_count; k++)
+      tmp[state->out_names[k]] = UINT_MAX;
+   util_dynarray_foreach (touched, unsigned, n)
+      tmp[*n] = UINT_MAX;
+   util_dynarray_clear(touched);
+
+   bool progress = false;
+   for (unsigned i = 0; i < block->predecessors_count; i++) {
+      const struct ir3_block *pred = block->predecessors[i];
+      struct ra_spill_block_state *pred_state = &ctx->blocks[pred->index];
+
+      bool loop_exit = pred->loop_depth < block->loop_depth;
+      unsigned block_distance = pred_state->cycles + (loop_exit ? 100000 : 0);
+
+      unsigned a = 0, b = 0;
+      while (a < state->in_count && b < pred_state->out_count) {
+         unsigned na = state->in_names[a], nb = pred_state->out_names[b];
+         if (na < nb) {
+            a++;
+         } else if (nb < na) {
+            b++;
+         } else {
+            unsigned s = state->start_vals[a];
+            if (s < UINT_MAX && s + block_distance < pred_state->end_vals[b]) {
+               pred_state->end_vals[b] = s + block_distance;
+               progress = true;
+            }
+            a++;
+            b++;
+         }
+      }
+
+      foreach_instr (phi, &block->instr_list) {
+         if (phi->opc != OPC_META_PHI)
+            break;
+         if (!phi->srcs[i]->def)
+            continue;
+         int k = find_name(pred_state->out_names, pred_state->out_count,
+                           phi->srcs[i]->def->name);
+         if (k < 0)
+            continue;
+         if (phi->dsts[0]->next_use < UINT_MAX &&
+             phi->dsts[0]->next_use + block_distance < pred_state->end_vals[k]) {
+            pred_state->end_vals[k] = phi->dsts[0]->next_use + block_distance;
+            progress = true;
+         }
+      }
+   }
+
+   return progress;
+}
+
+static void
+compute_next_distance_sparse(struct ra_spill_ctx *ctx, struct ir3 *ir)
+{
+   unsigned defs = ctx->live->definitions_count;
+   for (unsigned i = 0; i < ctx->live->block_count; i++) {
+      struct ra_spill_block_state *st = &ctx->blocks[i];
+      st->in_names = bitset_to_names(ctx, ctx->live->live_in[i], defs, &st->in_count);
+      st->out_names = bitset_to_names(ctx, ctx->live->live_out[i], defs, &st->out_count);
+      st->start_vals = ralloc_array(ctx, unsigned, MAX2(st->in_count, 1));
+      st->end_vals = ralloc_array(ctx, unsigned, MAX2(st->out_count, 1));
+      for (unsigned k = 0; k < st->in_count; k++)
+         st->start_vals[k] = UINT_MAX;
+      for (unsigned k = 0; k < st->out_count; k++)
+         st->end_vals[k] = UINT_MAX;
+   }
+
+   foreach_block (block, &ir->block_list) {
+      struct ra_spill_block_state *state = &ctx->blocks[block->index];
+      state->cycles = 0;
+      foreach_instr (instr, &block->instr_list) {
+         state->cycles += instr_cycles(instr);
+         foreach_dst (dst, instr) {
+            dst->spill_slot = ~0;
+         }
+      }
+   }
+
+   unsigned *tmp = ralloc_array(ctx, unsigned, MAX2(defs, 1));
+   for (unsigned j = 0; j < defs; j++)
+      tmp[j] = UINT_MAX;
+   struct util_dynarray touched;
+   util_dynarray_init(&touched, ctx);
+
+   bool progress = true;
+   while (progress) {
+      progress = false;
+      foreach_block_rev (block, &ir->block_list) {
+         progress |= compute_block_next_distance_sparse(ctx, block, tmp, &touched);
+      }
+   }
+   util_dynarray_fini(&touched);
+}
+
+static unsigned
+block_next_use_start(struct ra_spill_ctx *ctx, struct ir3_block *block,
+                     unsigned name)
+{
+   struct ra_spill_block_state *st = &ctx->blocks[block->index];
+   if (st->next_use_start)
+      return st->next_use_start[name];
+   int k = find_name(st->in_names, st->in_count, name);
+   return k < 0 ? UINT_MAX : st->start_vals[k];
+}
+
 static void
 compute_next_distance(struct ra_spill_ctx *ctx, struct ir3 *ir)
 {
+   if (!debug_get_bool_option("IR3_SPILL_DENSE", false)) {
+      compute_next_distance_sparse(ctx, ir);
+      return;
+   }
    for (unsigned i = 0; i < ctx->live->block_count; i++) {
       ctx->blocks[i].next_use_start =
          ralloc_array(ctx, unsigned, ctx->live->definitions_count);
@@ -1345,8 +1538,7 @@ handle_live_in(struct ra_spill_ctx *ctx, struct ir3_block *block,
    struct ra_spill_interval *interval = ctx->intervals[def->name];
    ra_spill_interval_init(interval, def);
    if (ctx->spilling) {
-      interval->next_use_distance =
-         ctx->blocks[block->index].next_use_start[def->name];
+      interval->next_use_distance = block_next_use_start(ctx, block, def->name);
    }
 
    ra_spill_ctx_insert(ctx, interval);
