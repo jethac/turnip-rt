@@ -484,7 +484,7 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
          *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
 
          /* space for CP_COND_REG_EXEC in next bo */
-         reserved_size += 3;
+         reserved_size += cs->cond_has_imm[i] ? 4 : 3;
       }
 
       /* switch to a new BO */
@@ -501,8 +501,10 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
 
       /* Re-emit CP_COND_REG_EXECs */
       for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
-         tu_cs_emit_pkt7(cs, CP_COND_REG_EXEC, 2);
+         tu_cs_emit_pkt7(cs, CP_COND_REG_EXEC, cs->cond_has_imm[i] ? 3 : 2);
          tu_cs_emit(cs, cs->cond_flags[i]);
+         if (cs->cond_has_imm[i])
+            tu_cs_emit(cs, cs->cond_imm[i]);
 
          cs->cond_dwords[i] = cs->cur;
 

@@ -16,6 +16,7 @@
 #include "util/blob.h"
 #include "nir/nir_serialize.h"
 #include <pthread.h>
+#include <atomic>
 #include <malloc.h>
 #include "vk_pipeline.h"
 
@@ -477,6 +478,7 @@ struct tu_rt_compiler {
    bool has_ahit;
    bool has_isec;
    bool nohit;
+   int only_raygen;
    unsigned max_call_depth;
 };
 
@@ -752,6 +754,9 @@ tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
    if (c->nohit && want == MESA_SHADER_CLOSEST_HIT)
       return;
    for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
+      if (want == MESA_SHADER_RAYGEN && c->only_raygen >= 0 &&
+          i != (uint32_t) c->only_raygen)
+         continue;
       struct tu_rt_group *group = c->pipeline->groups + i;
       nir_shader *stage = tu_rt_group_stage(c, group->recursive_index);
       if (!stage || stage->info.stage != want ||
@@ -1437,7 +1442,7 @@ static nir_shader *
 tu_rt_build_shader(struct tu_device *dev,
                    struct tu_ray_tracing_pipeline *pipeline,
                    const VkRayTracingPipelineCreateInfoKHR *create_info,
-                   VkPipelineCreateFlags2KHR flags)
+                   VkPipelineCreateFlags2KHR flags, int only_raygen)
 {
    nir_builder _b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, ir3_get_compiler_options(dev->compiler),
@@ -1451,6 +1456,7 @@ tu_rt_build_shader(struct tu_device *dev,
    struct tu_rt_compiler c = {};
    c.pipeline = pipeline;
    c.flags = flags;
+   c.only_raygen = only_raygen;
    c.fn_ctx = _mesa_pointer_hash_table_create(NULL);
    c.fn_cache = (nir_function **)
       calloc(MAX2(pipeline->stage_count, 1) * 2 * (TU_RT_MAX_CALL_DEPTH + 1),
@@ -1470,7 +1476,11 @@ tu_rt_build_shader(struct tu_device *dev,
    }
    {
       uint64_t total = 0;
+      const uint32_t keep_rg = only_raygen >= 0 ?
+         pipeline->groups[only_raygen].recursive_index : VK_SHADER_UNUSED_KHR;
       for (uint32_t i = 0; i < pipeline->stage_count; i++)
+         if (only_raygen < 0 || i == keep_rg ||
+             pipeline->stages[i]->info.stage != MESA_SHADER_RAYGEN)
          nir_foreach_function_impl (impl, pipeline->stages[i])
             nir_foreach_block (block, impl)
                nir_foreach_instr (instr, block)
@@ -1538,7 +1548,10 @@ tu_rt_build_shader(struct tu_device *dev,
       }
    }
    for (uint32_t i = 0; i < pipeline->stage_count; i++)
-      if (!c.nohit || (pipeline->stages[i]->info.stage != MESA_SHADER_CLOSEST_HIT &&
+      if (only_raygen >= 0 && pipeline->stages[i]->info.stage == MESA_SHADER_RAYGEN &&
+          i != pipeline->groups[only_raygen].recursive_index)
+         continue;
+      else if (!c.nohit || (pipeline->stages[i]->info.stage != MESA_SHADER_CLOSEST_HIT &&
                        pipeline->stages[i]->info.stage != MESA_SHADER_ANY_HIT &&
                        pipeline->stages[i]->info.stage != MESA_SHADER_INTERSECTION))
          c.used |= tu_rt_scan_used(pipeline->stages[i]);
@@ -1639,6 +1652,143 @@ tu_rt_build_shader(struct tu_device *dev,
    return b->shader;
 }
 
+struct tu_rt_variant_job {
+   struct tu_device *dev;
+   struct tu_ray_tracing_pipeline *pipeline;
+   const VkRayTracingPipelineCreateInfoKHR *create_info;
+   VkPipelineCreateFlags2KHR flags;
+   struct tu_pipeline_layout *layout;
+   struct vk_pipeline_cache *cache;
+   const struct tu_shader_key *key;
+   const uint32_t *groups;
+   const unsigned char *hashes;
+   uint32_t count;
+   std::atomic<uint32_t> next;
+   std::atomic<int> result;
+};
+
+static void *
+tu_rt_variant_worker(void *data)
+{
+   struct tu_rt_variant_job *job = (struct tu_rt_variant_job *) data;
+   for (;;) {
+      uint32_t v = job->next.fetch_add(1);
+      if (v >= job->count)
+         break;
+      struct tu_rt_variant *var = job->pipeline->variants + v;
+      if (var->shader)
+         continue;
+      nir_shader *nir = tu_rt_build_shader(job->dev, job->pipeline, job->create_info,
+                                           job->flags, (int) job->groups[v]);
+      if (!nir) {
+         job->result.store(VK_ERROR_OUT_OF_HOST_MEMORY);
+         continue;
+      }
+      struct tu_shader *shader = NULL;
+      VkResult r = tu_compute_shader_compile(job->dev, job->layout, job->cache, nir,
+                                             job->key, job->hashes + v * BLAKE3_KEY_LEN,
+                                             &shader);
+      if (r != VK_SUCCESS || !shader) {
+         job->result.store(r != VK_SUCCESS ? r : VK_ERROR_OUT_OF_HOST_MEMORY);
+         continue;
+      }
+      var->shader = shader;
+   }
+   return NULL;
+}
+
+static VkResult
+tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
+                     struct tu_ray_tracing_pipeline *pipeline,
+                     const VkRayTracingPipelineCreateInfoKHR *create_info,
+                     VkPipelineCreateFlags2KHR flags,
+                     struct tu_pipeline_layout *layout,
+                     const struct tu_shader_key *key,
+                     const unsigned char *base_blake3,
+                     const uint32_t *groups, uint32_t count)
+{
+   pipeline->variant_count = count;
+   pipeline->variants = rzalloc_array(pipeline->mem_ctx, struct tu_rt_variant, count);
+   unsigned char *hashes = rzalloc_array(pipeline->mem_ctx, unsigned char,
+                                         count * BLAKE3_KEY_LEN);
+   uint32_t missing = 0;
+   for (uint32_t v = 0; v < count; v++) {
+      const struct tu_rt_group *g = pipeline->groups + groups[v];
+      pipeline->variants[v].handle = g->handle;
+      struct mesa_blake3 ctx;
+      _mesa_blake3_init(&ctx);
+      _mesa_blake3_update(&ctx, base_blake3, BLAKE3_KEY_LEN);
+      static const char tag[] = "tu-rt-raygen-1";
+      _mesa_blake3_update(&ctx, tag, sizeof(tag));
+      _mesa_blake3_update(&ctx, &g->handle, sizeof(g->handle));
+      _mesa_blake3_final(&ctx, hashes + v * BLAKE3_KEY_LEN);
+      if (!(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR))
+         pipeline->variants[v].shader =
+            tu_compute_pipeline_cache_lookup(dev, cache, hashes + v * BLAKE3_KEY_LEN);
+      if (!pipeline->variants[v].shader)
+         missing++;
+   }
+
+   if (missing) {
+      if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
+         return VK_PIPELINE_COMPILE_REQUIRED;
+      void *nir_ctx = ralloc_context(NULL);
+      VkResult result = tu_rt_compile_stages(dev, cache, pipeline, create_info,
+                                             flags, key, nir_ctx);
+      if (result != VK_SUCCESS) {
+         ralloc_free(nir_ctx);
+         return result;
+      }
+
+      struct tu_rt_variant_job job;
+      job.dev = dev;
+      job.pipeline = pipeline;
+      job.create_info = create_info;
+      job.flags = flags;
+      job.layout = layout;
+      job.cache = cache;
+      job.key = key;
+      job.groups = groups;
+      job.hashes = hashes;
+      job.count = count;
+      job.next.store(0);
+      job.result.store(VK_SUCCESS);
+
+      static const unsigned max_jobs = debug_get_num_option("TU_RT_JOBS", 4);
+      unsigned nthreads = MIN2(MAX2(max_jobs, 1u), missing);
+      pthread_t threads[16];
+      unsigned started = 0;
+      for (unsigned t = 1; t < MIN2(nthreads, 16u); t++) {
+         pthread_attr_t attr;
+         pthread_attr_init(&attr);
+         pthread_attr_setstacksize(&attr, 256u << 20);
+         if (pthread_create(&threads[started], &attr, tu_rt_variant_worker, &job) == 0)
+            started++;
+         pthread_attr_destroy(&attr);
+      }
+      tu_rt_variant_worker(&job);
+      for (unsigned t = 0; t < started; t++)
+         pthread_join(threads[t], NULL);
+
+      ralloc_free(nir_ctx);
+      memset(pipeline->stages, 0, pipeline->stage_count * sizeof(pipeline->stages[0]));
+      if (job.result.load() != VK_SUCCESS)
+         return (VkResult) job.result.load();
+   }
+
+   if (debug_get_bool_option("TU_RT_LOG", false)) {
+      uint64_t instrs = 0;
+      unsigned max_regs = 0;
+      for (uint32_t v = 0; v < count; v++) {
+         instrs += pipeline->variants[v].shader->variant->info.instrs_count;
+         max_regs = MAX2(max_regs, pipeline->variants[v].shader->variant->info.max_reg + 1u);
+      }
+      mesa_logi("tu-rt: %u raygen variants (%u compiled) total instrs=%" PRIu64 " max regs=%u",
+                count, missing, instrs, max_regs);
+   }
+   return VK_SUCCESS;
+}
+
 static VkResult
 tu_rt_pipeline_create(struct tu_device *dev,
                       struct vk_pipeline_cache *cache,
@@ -1681,6 +1831,8 @@ tu_rt_pipeline_create(struct tu_device *dev,
                                     MAX2(pipeline->stage_count, 1));
    pipeline->stage_hashes = rzalloc_array(pipeline->mem_ctx, uint8_t,
                                           MAX2(pipeline->stage_count, 1) * BLAKE3_KEY_LEN);
+   pipeline->stage_types = rzalloc_array(pipeline->mem_ctx, uint8_t,
+                                         MAX2(pipeline->stage_count, 1));
    pipeline->groups = rzalloc_array(pipeline->mem_ctx, struct tu_rt_group,
                                     MAX2(pipeline->group_count, 1));
 
@@ -1694,9 +1846,11 @@ tu_rt_pipeline_create(struct tu_device *dev,
 
    {
       uint32_t s = 0;
-      for (; s < create_info->stageCount; s++)
+      for (; s < create_info->stageCount; s++) {
          vk_pipeline_hash_shader_stage(flags, create_info->pStages + s, &rs,
                                        pipeline->stage_hashes + s * BLAKE3_KEY_LEN);
+         pipeline->stage_types[s] = vk_to_mesa_shader_stage(create_info->pStages[s].stage);
+      }
       if (create_info->pLibraryInfo) {
          for (uint32_t l = 0; l < create_info->pLibraryInfo->libraryCount; l++) {
             VK_FROM_HANDLE(tu_pipeline, lib_base,
@@ -1704,6 +1858,7 @@ tu_rt_pipeline_create(struct tu_device *dev,
             struct tu_ray_tracing_pipeline *lib = tu_pipeline_to_ray_tracing(lib_base);
             memcpy(pipeline->stage_hashes + s * BLAKE3_KEY_LEN, lib->stage_hashes,
                    lib->stage_count * BLAKE3_KEY_LEN);
+            memcpy(pipeline->stage_types + s, lib->stage_types, lib->stage_count);
             s += lib->stage_count;
          }
       }
@@ -1753,9 +1908,31 @@ tu_rt_pipeline_create(struct tu_device *dev,
       }
       _mesa_blake3_final(&ctx, blake3);
 
+      uint32_t *rg_groups = rzalloc_array(pipeline->mem_ctx, uint32_t,
+                                          MAX2(pipeline->group_count, 1));
+      uint32_t rg_count = 0;
+      for (uint32_t g = 0; g < pipeline->group_count; g++) {
+         const struct tu_rt_group *grp = pipeline->groups + g;
+         if (grp->recursive_index == VK_SHADER_UNUSED_KHR ||
+             pipeline->stage_types[grp->recursive_index] != MESA_SHADER_RAYGEN)
+            continue;
+         bool dup = false;
+         for (uint32_t k = 0; k < rg_count; k++)
+            dup |= pipeline->groups[rg_groups[k]].handle == grp->handle;
+         if (!dup)
+            rg_groups[rg_count++] = g;
+      }
+
       struct tu_shader *shader = NULL;
       nir_shader *nir = NULL;
-      if (!(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR))
+      if (rg_count > 1 && !debug_get_bool_option("TU_RT_NO_VARIANTS", false)) {
+         result = tu_rt_build_variants(dev, cache, pipeline, create_info, flags,
+                                       layout, &key, blake3, rg_groups, rg_count);
+         if (result != VK_SUCCESS)
+            goto fail;
+         shader = pipeline->variants[0].shader;
+         vk_pipeline_cache_object_ref(&shader->base);
+      } else if (!(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR))
          shader = tu_compute_pipeline_cache_lookup(dev, cache, blake3);
       if (!shader) {
          if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
@@ -1769,7 +1946,7 @@ tu_rt_pipeline_create(struct tu_device *dev,
             ralloc_free(nir_ctx);
             goto fail;
          }
-         nir = tu_rt_build_shader(dev, pipeline, create_info, flags);
+         nir = tu_rt_build_shader(dev, pipeline, create_info, flags, -1);
          if (!nir) {
             ralloc_free(nir_ctx);
             tu_rt_prof_end("final-abort");
@@ -1788,6 +1965,9 @@ tu_rt_pipeline_create(struct tu_device *dev,
       tu_rt_prof_end("final");
       if (result != VK_SUCCESS)
          goto fail;
+      for (uint32_t v = 1; v < pipeline->variant_count; v++)
+         pipeline->base.base.active_desc_sets |=
+            pipeline->variants[v].shader->active_desc_sets;
    }
 
    if (debug_get_bool_option("TU_RT_LOG", false)) {

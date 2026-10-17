@@ -133,6 +133,8 @@ struct tu_cs
    /* state for cond_exec_start/cond_exec_end */
    uint32_t cond_stack_depth;
    uint32_t cond_flags[TU_COND_EXEC_STACK_SIZE];
+   uint32_t cond_imm[TU_COND_EXEC_STACK_SIZE];
+   bool cond_has_imm[TU_COND_EXEC_STACK_SIZE];
    uint32_t *cond_dwords[TU_COND_EXEC_STACK_SIZE];
 
    uint32_t breadcrumb_emit_after;
@@ -648,10 +650,30 @@ tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
    tu_cs_emit(cs, cond_flags);
 
    cs->cond_flags[cs->cond_stack_depth] = cond_flags;
+   cs->cond_has_imm[cs->cond_stack_depth] = false;
    cs->cond_dwords[cs->cond_stack_depth] = cs->cur;
 
    /* Emit dummy DWORD field here */
    tu_cs_emit(cs, RENDER_MODE_CP_COND_REG_EXEC_1_DWORDS(0));
+
+   cs->cond_stack_depth++;
+}
+
+static inline void
+tu_cond_exec_start_imm(struct tu_cs *cs, uint32_t cond_flags, uint32_t imm)
+{
+   assert(cs->cond_stack_depth < TU_COND_EXEC_STACK_SIZE);
+
+   tu_cs_emit_pkt7(cs, CP_COND_REG_EXEC, 3);
+   tu_cs_emit(cs, cond_flags);
+   tu_cs_emit(cs, imm);
+
+   cs->cond_flags[cs->cond_stack_depth] = cond_flags;
+   cs->cond_imm[cs->cond_stack_depth] = imm;
+   cs->cond_has_imm[cs->cond_stack_depth] = true;
+   cs->cond_dwords[cs->cond_stack_depth] = cs->cur;
+
+   tu_cs_emit(cs, 0);
 
    cs->cond_stack_depth++;
 }
@@ -667,13 +689,15 @@ tu_cond_exec_end(struct tu_cs *cs)
    cs->cond_stack_depth--;
 
    cs->cond_flags[cs->cond_stack_depth] = 0;
+   bool has_imm = cs->cond_has_imm[cs->cond_stack_depth];
+   cs->cond_has_imm[cs->cond_stack_depth] = false;
    /* Subtract one here to account for the DWORD field itself. */
    uint32_t cond_len = cs->cur - cs->cond_dwords[cs->cond_stack_depth] - 1;
    if (cond_len) {
       *cs->cond_dwords[cs->cond_stack_depth] = cond_len;
    } else {
       /* rewind the CS to drop the empty cond reg packet. */
-      cs->cur = cs->cur - 3;
+      cs->cur = cs->cur - (has_imm ? 4 : 3);
    }
 }
 

@@ -4509,8 +4509,14 @@ tu_pipeline_finish(struct tu_pipeline *pipeline,
       vk_free2(&dev->vk.alloc, alloc, library->state_data);
    }
 
-   if (pipeline->type == TU_PIPELINE_RAY_TRACING)
-      ralloc_free(tu_pipeline_to_ray_tracing(pipeline)->mem_ctx);
+   if (pipeline->type == TU_PIPELINE_RAY_TRACING) {
+      struct tu_ray_tracing_pipeline *rt = tu_pipeline_to_ray_tracing(pipeline);
+      for (uint32_t i = 0; i < rt->variant_count; i++) {
+         if (rt->variants[i].shader)
+            vk_pipeline_cache_object_unref(&dev->vk, &rt->variants[i].shader->base);
+      }
+      ralloc_free(rt->mem_ctx);
+   }
 
    for (unsigned i = 0; i < ARRAY_SIZE(pipeline->shaders); i++) {
       if (pipeline->shaders[i])
@@ -5127,6 +5133,30 @@ tu_compute_pipeline_cache_lookup(struct tu_device *dev,
 }
 
 VkResult
+tu_compute_shader_compile(struct tu_device *dev,
+                          struct tu_pipeline_layout *layout,
+                          struct vk_pipeline_cache *cache,
+                          nir_shader *nir,
+                          const struct tu_shader_key *key,
+                          const unsigned char *blake3,
+                          struct tu_shader **out)
+{
+   struct ir3_shader_key ir3_key = {};
+   struct tu_shader_info info = {};
+   struct tu_shader *shader = NULL;
+
+   tu_lower_nir(dev, nir, key, &ir3_key, &info);
+   VkResult result = tu_shader_create(dev, &shader, nir, key, &info, &ir3_key,
+                                      blake3, BLAKE3_KEY_LEN, layout, false);
+   if (!shader) {
+      *out = NULL;
+      return result;
+   }
+   *out = tu_pipeline_cache_insert(cache ? cache : dev->mem_cache, shader);
+   return VK_SUCCESS;
+}
+
+VkResult
 tu_compute_pipeline_init_nir(struct tu_device *dev,
                              struct tu_compute_pipeline *pipeline,
                              struct tu_pipeline_layout *layout,
@@ -5138,15 +5168,9 @@ tu_compute_pipeline_init_nir(struct tu_device *dev,
 {
    VkResult result = VK_SUCCESS;
    if (!shader) {
-      struct ir3_shader_key ir3_key = {};
-      struct tu_shader_info info = {};
-
-      tu_lower_nir(dev, nir, key, &ir3_key, &info);
-      result = tu_shader_create(dev, &shader, nir, key, &info, &ir3_key,
-                                blake3, BLAKE3_KEY_LEN, layout, false);
+      result = tu_compute_shader_compile(dev, layout, cache, nir, key, blake3, &shader);
       if (!shader)
          return result;
-      shader = tu_pipeline_cache_insert(cache ? cache : dev->mem_cache, shader);
    }
 
    pipeline->base.active_desc_sets = shader->active_desc_sets;

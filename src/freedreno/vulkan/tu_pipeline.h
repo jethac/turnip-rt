@@ -292,6 +292,11 @@ struct tu_rt_stage_set {
    struct tu_rt_stage_blob *blobs[];
 };
 
+struct tu_rt_variant {
+   uint32_t handle;
+   struct tu_shader *shader;
+};
+
 struct tu_ray_tracing_pipeline {
    struct tu_compute_pipeline base;
 
@@ -300,6 +305,9 @@ struct tu_ray_tracing_pipeline {
    uint32_t group_count;
    nir_shader **stages;
    struct tu_rt_stage_set *stage_set;
+   uint32_t variant_count;
+   struct tu_rt_variant *variants;
+   uint8_t *stage_types;
    uint8_t *stage_hashes;
    struct tu_rt_group *groups;
 };
@@ -329,6 +337,15 @@ struct tu_shader *
 tu_compute_pipeline_cache_lookup(struct tu_device *dev,
                                  struct vk_pipeline_cache *cache,
                                  const unsigned char *blake3);
+
+VkResult
+tu_compute_shader_compile(struct tu_device *dev,
+                          struct tu_pipeline_layout *layout,
+                          struct vk_pipeline_cache *cache,
+                          nir_shader *nir,
+                          const struct tu_shader_key *key,
+                          const unsigned char *blake3,
+                          struct tu_shader **out);
 
 VkResult
 tu_compute_pipeline_init_nir(struct tu_device *dev,
