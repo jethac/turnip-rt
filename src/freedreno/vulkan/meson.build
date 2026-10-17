@@ -64,6 +64,7 @@ libtu_files = files(
   'tu_suballoc.cc',
   'tu_subsampled_image.cc',
   'tu_tile_config.cc',
+  'tu_foveate.cc',
   'tu_util.cc',
 )
 

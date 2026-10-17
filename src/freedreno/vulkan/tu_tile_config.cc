@@ -13,6 +13,7 @@
 #include "util/u_worklist.h"
 
 #include "tu_cmd_buffer.h"
+#include "tu_foveate.h"
 #include "tu_subsampled_image.h"
 
 static void
@@ -96,6 +97,9 @@ tu_calc_frag_area(struct tu_cmd_buffer *cmd,
                                         fb->width, fb->height, i,
                                         &raw_areas[i]);
       }
+   } else if (tu_foveate_enabled()) {
+      for (unsigned i = 0; i < views; i++)
+         tu_foveate_frag_area(cmd, x1, y1, x2, y2, i, &raw_areas[i]);
    } else {
       for (unsigned i = 0; i < views; i++)
          raw_areas[i].width = raw_areas[i].height = 1.0f;

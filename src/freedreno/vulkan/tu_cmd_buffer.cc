@@ -7,6 +7,7 @@
  * Copyright © 2015 Intel Corporation
  */
 
+#include "tu_foveate.h"
 #include "tu_cmd_buffer.h"
 
 #include "vk_common_entrypoints.h"
@@ -1478,6 +1479,11 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
 
    if (TU_DEBUG(GMEM)) {
       cmd->state.rp.force_render_mode_reason = "TU_DEBUG(GMEM)";
+      return false;
+   }
+
+   if (tu_foveate_pass_eligible(cmd)) {
+      cmd->state.rp.force_render_mode_reason = "TU_FOVEATE";
       return false;
    }
 

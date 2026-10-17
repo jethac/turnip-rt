@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "tu_foveate.h"
 #include "tu_util.h"
 
 #include <errno.h>
@@ -130,6 +131,10 @@ static void
 tu_env_init_once(void)
 {
    tu_env.start_debug = tu_env.debug = parse_debug_string(os_get_option("TU_DEBUG"), tu_debug_options);
+   if (tu_foveate_enabled()) {
+      tu_env.start_debug |= TU_DEBUG_FDM;
+      tu_env.debug |= TU_DEBUG_FDM;
+   }
 
    if (TU_DEBUG(STARTUP))
       mesa_logi("TU_DEBUG=0x%" PRIx64, tu_env.debug.load());
