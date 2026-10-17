@@ -24,6 +24,7 @@ struct tu_foveate_cfg {
    float fixed_x, fixed_y;
    uint32_t min_w, min_h;
    uint32_t max_area;
+   uint32_t max_bin;
    uint64_t stale_ns;
    const char *path;
 };
@@ -50,6 +51,7 @@ tu_foveate_init_once(void)
    cfg.min_w = debug_get_num_option("TU_FOVEATE_MIN_W", 1024);
    cfg.min_h = debug_get_num_option("TU_FOVEATE_MIN_H", 768);
    cfg.max_area = debug_get_num_option("TU_FOVEATE_MAX", 4);
+   cfg.max_bin = debug_get_num_option("TU_FOVEATE_BIN", 256);
    cfg.stale_ns = (uint64_t) debug_get_num_option("TU_FOVEATE_STALE_MS", 250) * 1000000ull;
    cfg.path = os_get_option("TU_FOVEATE_SHM");
    if (!cfg.path)
@@ -124,13 +126,25 @@ tu_foveate_gaze(unsigned eye, float *gx, float *gy)
    *gy = y;
 }
 
+uint32_t
+tu_foveate_max_bin(void)
+{
+   tu_foveate_init();
+   return cfg.max_bin;
+}
+
 bool
 tu_foveate_pass_eligible(struct tu_cmd_buffer *cmd)
 {
+   return tu_foveate_fb_eligible(cmd->state.pass, cmd->state.framebuffer);
+}
+
+bool
+tu_foveate_fb_eligible(const struct tu_render_pass *pass,
+                       const struct tu_framebuffer *fb)
+{
    if (!tu_foveate_enabled())
       return false;
-   const struct tu_render_pass *pass = cmd->state.pass;
-   const struct tu_framebuffer *fb = cmd->state.framebuffer;
    if (!pass || !fb || !pass->has_fdm ||
        pass->fragment_density_map.attachment != VK_ATTACHMENT_UNUSED)
       return false;
