@@ -396,6 +396,7 @@ struct tu_rt_compiler {
    uint32_t used;
    bool has_ahit;
    bool has_isec;
+   unsigned max_call_depth;
 };
 
 static void
@@ -496,7 +497,7 @@ tu_rt_load_sbt_entry(nir_builder *b, nir_def *index, uint32_t addr_offset)
    };
 }
 
-#define TU_RT_MAX_CALL_DEPTH 4
+#define TU_RT_MAX_CALL_DEPTH 8
 
 struct tu_rt_fn_ctx {
    mesa_shader_stage stage;
@@ -882,7 +883,8 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
 
          nir_def *prev_tmax = nir_load_var(b, s->tmax);
          nir_store_var(b, s->accept, nir_imm_false(b), 0x1);
-         nir_store_var(b, s->terminate, nir_imm_false(b), 0x1);
+         nir_store_var(b, s->terminate,
+                       nir_test_mask(b, flags, SpvRayFlagsTerminateOnFirstHitKHRMask), 0x1);
          nir_store_var(b, s->opaque,
                        nir_rq_load(b, 1, 1, rq,
                                    .ray_query_value = nir_ray_query_value_intersection_candidate_aabb_opaque,
@@ -1057,6 +1059,10 @@ tu_rt_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *dat
          nir_store_var(b, s->hit_kind, prev_hit_kind, 0x1);
       }
       nir_pop_if(b, NULL);
+
+      nir_push_if(b, nir_iand(b, nir_load_var(b, commit), nir_load_var(b, s->terminate)));
+      nir_jump(b, nir_jump_return);
+      nir_pop_if(b, NULL);
    }
    nir_pop_if(b, NULL);
 
@@ -1111,7 +1117,7 @@ tu_rt_lower_instr(nir_builder *b, nir_instr *instr, void *data)
 
    switch (intr->intrinsic) {
    case nir_intrinsic_execute_callable:
-      if (tu_rt_ctx(c, b->impl->function)->call_depth < TU_RT_MAX_CALL_DEPTH)
+      if (tu_rt_ctx(c, b->impl->function)->call_depth < c->max_call_depth)
          tu_rt_execute_callable(b, c, intr);
       break;
    case nir_intrinsic_trace_ray:
@@ -1362,6 +1368,25 @@ tu_rt_build_shader(struct tu_device *dev,
    }
    for (uint32_t i = 0; i < pipeline->stage_count; i++)
       c.used |= tu_rt_scan_used(pipeline->stages[i]);
+
+   {
+      uint32_t ncall = 0;
+      for (uint32_t i = 0; i < pipeline->group_count; i++) {
+         nir_shader *s = tu_rt_group_stage(&c, pipeline->groups[i].recursive_index);
+         if (s && s->info.stage == MESA_SHADER_CALLABLE &&
+             !tu_rt_handle_seen(&c, i, pipeline->groups[i].handle, 0))
+            ncall++;
+      }
+      uint64_t bodies = 0, level = 1;
+      c.max_call_depth = 0;
+      while (c.max_call_depth < TU_RT_MAX_CALL_DEPTH) {
+         level *= MAX2(ncall, 1);
+         if (c.max_call_depth >= 2 && bodies + level > 64)
+            break;
+         bodies += level;
+         c.max_call_depth++;
+      }
+   }
 
    nir_def *launch_id = nir_load_ray_launch_id(b);
    nir_def *launch_size = nir_load_ray_launch_size(b);
