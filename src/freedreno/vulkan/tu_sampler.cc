@@ -107,6 +107,19 @@ tu_CreateSampler(VkDevice _device,
    unsigned aniso = pCreateInfo->anisotropyEnable ?
       util_last_bit(MIN2(static_cast<uint32_t>(pCreateInfo->maxAnisotropy) >> 1, 8)) : 0;
    bool miplinear = (pCreateInfo->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR);
+   float lod_bias = pCreateInfo->mipLodBias;
+   if (!pCreateInfo->compareEnable && !pCreateInfo->unnormalizedCoordinates &&
+       !ycbcr_conversion &&
+       sampler->vk.reduction_mode == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE) {
+      static const int64_t max_aniso = debug_get_num_option("TU_MAX_ANISO", 16);
+      static const bool force_bilinear = debug_get_bool_option("TU_FORCE_BILINEAR", false);
+      static const char *bias_env = os_get_option("TU_LOD_BIAS");
+      static const float extra_bias = bias_env ? strtof(bias_env, NULL) : 0.0f;
+      aniso = MIN2(aniso, util_last_bit(MIN2((uint32_t) MAX2(max_aniso, 1) >> 1, 8)));
+      if (force_bilinear)
+         miplinear = false;
+      lod_bias = CLAMP(lod_bias + extra_bias, -16.0f, 15.99f);
+   }
    float min_lod = CLAMP(pCreateInfo->minLod, 0.0f, 4095.0f / 256.0f);
    float max_lod = CLAMP(pCreateInfo->maxLod, 0.0f, 4095.0f / 256.0f);
 
@@ -121,7 +134,7 @@ tu_CreateSampler(VkDevice _device,
          A8XX_TEX_SAMP_0_WRAP_S(tu6_tex_wrap(pCreateInfo->addressModeU)) |
          A8XX_TEX_SAMP_0_WRAP_T(tu6_tex_wrap(pCreateInfo->addressModeV)) |
          A8XX_TEX_SAMP_0_WRAP_R(tu6_tex_wrap(pCreateInfo->addressModeW)) |
-         A8XX_TEX_SAMP_0_LOD_BIAS(pCreateInfo->mipLodBias) |
+         A8XX_TEX_SAMP_0_LOD_BIAS(lod_bias) |
          A8XX_TEX_SAMP_0_ANISO(static_cast<enum a6xx_tex_aniso>(aniso));
 
       sampler->descriptor[1] =
@@ -155,7 +168,7 @@ tu_CreateSampler(VkDevice _device,
          A6XX_TEX_SAMP_0_WRAP_S(tu6_tex_wrap(pCreateInfo->addressModeU)) |
          A6XX_TEX_SAMP_0_WRAP_T(tu6_tex_wrap(pCreateInfo->addressModeV)) |
          A6XX_TEX_SAMP_0_WRAP_R(tu6_tex_wrap(pCreateInfo->addressModeW)) |
-         A6XX_TEX_SAMP_0_LOD_BIAS(pCreateInfo->mipLodBias);
+         A6XX_TEX_SAMP_0_LOD_BIAS(lod_bias);
       sampler->descriptor[1] =
          COND(pCreateInfo->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT,
             A6XX_TEX_SAMP_1_CUBEMAPSEAMLESSFILTOFF) |
