@@ -1718,6 +1718,17 @@ tu_rt_create_job_run(void *data)
    struct tu_rt_create_job *job = (struct tu_rt_create_job *) data;
    job->result = tu_rt_pipeline_create(job->dev, job->cache, job->info,
                                        job->flags, job->alloc, job->out);
+   if (debug_get_bool_option("TU_RT_TRIM", true)) {
+      if (debug_get_bool_option("TU_RT_LOG", false)) {
+         struct mallinfo2 a = mallinfo2();
+         malloc_trim(0);
+         struct mallinfo2 b = mallinfo2();
+         mesa_logi("tu-rt: trim used=%zuM free=%zuM -> free=%zuM arena=%zuM",
+                   (a.uordblks + a.hblkhd) >> 20, a.fordblks >> 20, b.fordblks >> 20, b.arena >> 20);
+      } else {
+         malloc_trim(0);
+      }
+   }
    return NULL;
 }
 
