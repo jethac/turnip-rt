@@ -21,6 +21,7 @@
 
 #include "tu_device.h"
 #include "tu_shader.h"
+#include "tu_rt_prof.h"
 #include "ir3/ir3_nir.h"
 
 static VkResult
@@ -1504,9 +1505,11 @@ tu_rt_build_shader(struct tu_device *dev,
    nir_shader_instructions_pass(b->shader, tu_rt_lower_instr,
                                 nir_metadata_none, &c);
 
+   tu_rt_prof_mark("pre-inline", b->shader);
    NIR_PASS(_, b->shader, nir_lower_continue_constructs);
    NIR_PASS(_, b->shader, nir_lower_returns);
    NIR_PASS(_, b->shader, nir_inline_functions);
+   tu_rt_prof_mark("post-inline", b->shader);
    nir_remove_non_entrypoints(b->shader);
    NIR_PASS(_, b->shader, nir_opt_deref);
    NIR_PASS(_, b->shader, nir_opt_copy_prop);
@@ -1521,6 +1524,7 @@ tu_rt_build_shader(struct tu_device *dev,
    NIR_PASS(_, b->shader, nir_opt_copy_prop);
    NIR_PASS(_, b->shader, nir_opt_dce);
 
+   tu_rt_prof_mark("pre-rq", b->shader);
    NIR_PASS(_, b->shader, nir_opt_ray_queries);
    NIR_PASS(_, b->shader, tu_nir_lower_ray_queries);
    NIR_PASS(_, b->shader, nir_split_var_copies);
@@ -1533,8 +1537,10 @@ tu_rt_build_shader(struct tu_device *dev,
 
    nir_shader_gather_info(b->shader, nir_shader_get_entrypoint(b->shader));
 
+   tu_rt_prof_mark("pre-optloop", b->shader);
    struct ir3_optimize_options optimize_options = {};
    ir3_optimize_loop(dev->compiler, &optimize_options, b->shader);
+   tu_rt_prof_mark("post-optloop", b->shader);
 
    return b->shader;
 }
@@ -1662,6 +1668,7 @@ tu_rt_pipeline_create(struct tu_device *dev,
             result = VK_PIPELINE_COMPILE_REQUIRED;
             goto fail;
          }
+         tu_rt_prof_begin();
          void *nir_ctx = ralloc_context(NULL);
          result = tu_rt_compile_stages(dev, cache, pipeline, create_info, flags, &key, nir_ctx);
          if (result != VK_SUCCESS) {
@@ -1674,8 +1681,11 @@ tu_rt_pipeline_create(struct tu_device *dev,
          memset(pipeline->stages, 0, pipeline->stage_count * sizeof(pipeline->stages[0]));
       }
 
+      if (nir)
+         tu_rt_prof_mark("init_nir", nir);
       result = tu_compute_pipeline_init_nir(dev, &pipeline->base, layout, cache,
                                             shader, nir, &key, blake3);
+      tu_rt_prof_end("final");
       if (result != VK_SUCCESS)
          goto fail;
    }

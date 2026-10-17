@@ -5874,6 +5874,8 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
 
    bool is_preamble_speculatable = ir3_nir_is_preamble_speculatable(ctx->s);
 
+   if (ir3_pass_hook)
+      ir3_pass_hook("emit_instructions");
    emit_instructions(ctx);
 
    if (ctx->error) {
@@ -6141,6 +6143,8 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
    /* At this point, all the dead code should be long gone: */
    assert(!IR3_PASS(ir, ir3_dce, so));
 
+   if (ir3_pass_hook)
+      ir3_pass_hook("ir3_sched");
    ret = ir3_sched(ir);
    if (ret) {
       DBG("SCHED failed!");
@@ -6185,6 +6189,8 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
    }
 
    IR3_PASS(ir, ir3_cleanup_rpt, so);
+   if (ir3_pass_hook)
+      ir3_pass_hook("ir3_ra");
    ret = ir3_ra(so);
 
    if (ret) {

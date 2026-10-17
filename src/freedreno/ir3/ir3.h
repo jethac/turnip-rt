@@ -2088,8 +2088,12 @@ ir3_try_swap_signedness(opc_t opc, bool *can_swap)
    }
 }
 
+extern void (*ir3_pass_hook)(const char *name);
+
 #define IR3_PASS(ir, pass, ...)                                                \
    ({                                                                          \
+      if (ir3_pass_hook)                                                       \
+         ir3_pass_hook(#pass);                                                 \
       bool progress = pass(ir, ##__VA_ARGS__);                                 \
       if (progress) {                                                          \
          ir3_debug_print(ir, "AFTER: " #pass);                                 \

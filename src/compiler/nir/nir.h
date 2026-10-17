@@ -5411,8 +5411,12 @@ should_print_nir(UNUSED nir_shader *shader)
 }
 #endif /* NDEBUG */
 
+extern void (*nir_pass_hook)(const char *name);
+
 #define _PASS(pass, nir, do_pass)                                       \
    do {                                                                 \
+      if (nir_pass_hook)                                                \
+         nir_pass_hook(#pass);                                          \
       if (should_skip_nir(#pass)) {                                     \
          printf("skipping %s\n", #pass);                                \
          break;                                                         \

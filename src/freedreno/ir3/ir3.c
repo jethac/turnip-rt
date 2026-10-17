@@ -5,6 +5,8 @@
 
 #include "ir3.h"
 
+void (*ir3_pass_hook)(const char *name);
+
 #include <assert.h>
 #include <errno.h>
 #include <stdbool.h>

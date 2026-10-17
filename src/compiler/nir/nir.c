@@ -26,6 +26,8 @@
  */
 
 #include "nir.h"
+
+void (*nir_pass_hook)(const char *name);
 #include <assert.h>
 #include <limits.h>
 #include <math.h>
