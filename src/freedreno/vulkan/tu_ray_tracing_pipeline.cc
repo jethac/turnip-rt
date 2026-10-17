@@ -13,6 +13,7 @@
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include "util/os_time.h"
+#include <pthread.h>
 #include "vk_pipeline.h"
 
 #include "tu_device.h"
@@ -1612,6 +1613,42 @@ fail:
    return result;
 }
 
+struct tu_rt_create_job {
+   struct tu_device *dev;
+   struct vk_pipeline_cache *cache;
+   const VkRayTracingPipelineCreateInfoKHR *info;
+   VkPipelineCreateFlags2KHR flags;
+   const VkAllocationCallbacks *alloc;
+   VkPipeline *out;
+   VkResult result;
+};
+
+static void *
+tu_rt_create_job_run(void *data)
+{
+   struct tu_rt_create_job *job = (struct tu_rt_create_job *) data;
+   job->result = tu_rt_pipeline_create(job->dev, job->cache, job->info,
+                                       job->flags, job->alloc, job->out);
+   return NULL;
+}
+
+static void
+tu_rt_run_on_big_stack(struct tu_rt_create_job *job)
+{
+   pthread_attr_t attr;
+   pthread_t thread;
+   if (pthread_attr_init(&attr) == 0) {
+      bool ok = pthread_attr_setstacksize(&attr, 256u << 20) == 0 &&
+                pthread_create(&thread, &attr, tu_rt_create_job_run, job) == 0;
+      pthread_attr_destroy(&attr);
+      if (ok) {
+         pthread_join(thread, NULL);
+         return;
+      }
+   }
+   tu_rt_create_job_run(job);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateRayTracingPipelinesKHR(VkDevice _device,
                                 VkDeferredOperationKHR deferredOperation,
@@ -1629,8 +1666,11 @@ tu_CreateRayTracingPipelinesKHR(VkDevice _device,
    for (; i < createInfoCount; i++) {
       VkPipelineCreateFlags2KHR flags =
          vk_rt_pipeline_create_flags(&pCreateInfos[i]);
-      VkResult r = tu_rt_pipeline_create(dev, cache, &pCreateInfos[i], flags,
-                                         pAllocator, &pPipelines[i]);
+      struct tu_rt_create_job job = { dev, cache, &pCreateInfos[i], flags,
+                                      pAllocator, &pPipelines[i],
+                                      VK_ERROR_OUT_OF_HOST_MEMORY };
+      tu_rt_run_on_big_stack(&job);
+      VkResult r = job.result;
       if (r != VK_SUCCESS) {
          result = r;
          pPipelines[i] = VK_NULL_HANDLE;
