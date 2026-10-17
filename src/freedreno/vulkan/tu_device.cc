@@ -1120,9 +1120,10 @@ static void
 tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
                                       struct vk_properties *p)
 {
-   p->minSubgroupSize = pdevice->info->threadsize_base;
+   p->minSubgroupSize = 4;
    p->maxSubgroupSize = tu_subgroup_size(pdevice);
-   p->maxComputeWorkgroupSubgroups = pdevice->info->max_waves;
+   p->maxComputeWorkgroupSubgroups =
+      pdevice->info->max_waves * (pdevice->info->threadsize_base / 32);
    /* Only compute and fragment shaders can run with a doubled wave size, the
     * geometry stages always run at threadsize_base.  So when we expose more
     * than one possible subgroup size we can't honor a required subgroup size

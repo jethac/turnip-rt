@@ -146,6 +146,8 @@ struct tu_shader_key {
 
    enum ir3_wavesize_option api_wavesize, real_wavesize;
 
+   uint8_t emulated_subgroup_size;
+
    /* Shader version to force recompilation when TU_BUILD_ID_OVERRIDE is used. */
    uint8_t version;
 };
@@ -161,6 +163,9 @@ extern const struct vk_pipeline_cache_object_ops tu_shader_ops;
 
 void
 tu_destroy_softfloat(struct tu_device *device);
+
+bool
+tu_nir_lower_emulated_subgroups(nir_shader *shader, unsigned subgroup_size);
 
 bool
 tu_nir_lower_multiview(nir_shader *nir, uint32_t mask, struct tu_device *dev,

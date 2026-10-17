@@ -283,6 +283,9 @@ tu_spirv_to_nir(struct tu_device *dev,
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_lower_is_helper_invocation);
 
+   if (key->emulated_subgroup_size)
+      NIR_PASS(_, nir, tu_nir_lower_emulated_subgroups, key->emulated_subgroup_size);
+
    if (key->lower_view_index_to_device_index)
       NIR_PASS(_, nir, nir_lower_view_index_to_device_index);
 
@@ -4090,6 +4093,13 @@ tu_shader_key_subgroup_size(struct tu_shader_key *key,
                             struct tu_device *dev)
 {
    enum ir3_wavesize_option api_wavesize, real_wavesize;
+   key->emulated_subgroup_size = 0;
+   if (subgroup_info &&
+       subgroup_info->requiredSubgroupSize < dev->compiler->info->threadsize_base) {
+      key->api_wavesize = key->real_wavesize = IR3_SINGLE_ONLY;
+      key->emulated_subgroup_size = subgroup_info->requiredSubgroupSize;
+      return;
+   }
    if (!dev->physical_device->expose_double_threadsize) {
       api_wavesize = IR3_SINGLE_ONLY;
       real_wavesize = IR3_SINGLE_ONLY;

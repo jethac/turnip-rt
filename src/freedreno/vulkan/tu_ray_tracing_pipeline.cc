@@ -12,6 +12,7 @@
 #include "util/mesa-blake3.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
+#include "util/os_time.h"
 #include "vk_pipeline.h"
 
 #include "tu_device.h"
@@ -1471,6 +1472,7 @@ tu_rt_pipeline_create(struct tu_device *dev,
    VK_FROM_HANDLE(tu_pipeline_layout, layout, create_info->layout);
    VkResult result;
 
+   int64_t t_start = os_time_get_nano();
    struct tu_ray_tracing_pipeline *pipeline =
       (struct tu_ray_tracing_pipeline *) vk_object_zalloc(
          &dev->vk, alloc, sizeof(*pipeline), VK_OBJECT_TYPE_PIPELINE);
@@ -1588,6 +1590,17 @@ tu_rt_pipeline_create(struct tu_device *dev,
                                             shader, nir, &key, blake3);
       if (result != VK_SUCCESS)
          goto fail;
+   }
+
+   if (debug_get_bool_option("TU_RT_LOG", false)) {
+      const struct tu_shader *sh = pipeline->base.base.shaders[MESA_SHADER_COMPUTE];
+      mesa_logi("tu-rt: pipeline %s stages=%u groups=%u lib=%d %.1f ms instrs=%u regs=%u",
+                (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ? "library" : "final",
+                pipeline->stage_count, pipeline->group_count,
+                create_info->pLibraryInfo ? (int) create_info->pLibraryInfo->libraryCount : 0,
+                (os_time_get_nano() - t_start) / 1e6,
+                sh ? sh->variant->info.instrs_count : 0,
+                sh ? sh->variant->info.max_reg + 1 : 0);
    }
 
    *out_pipeline = tu_pipeline_to_handle(&pipeline->base.base);
