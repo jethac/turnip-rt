@@ -757,6 +757,7 @@ tu_rt_execute_callable(nir_builder *b, struct tu_rt_compiler *c,
 struct tu_rt_isec_state {
    struct tu_rt_compiler *compiler;
    nir_shader *ahit;
+   uint32_t isec_size;
 };
 
 static bool
@@ -797,7 +798,20 @@ tu_rt_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *dat
          nir_store_var(b, s->terminate, nir_imm_false(b), 0x1);
 
          nir_push_if(b, nir_inot(b, nir_load_var(b, s->opaque)));
-         tu_rt_call_stage(b, c, isec->ahit);
+         {
+            for (unsigned i = 0; i < TU_RT_HIT_ATTRIBS_SIZE / 4; i++) {
+               nir_store_scratch(b, nir_load_scratch(b, 1, 32, nir_imm_int(b, i * 4)),
+                                 nir_imm_int(b, isec->isec_size + i * 4));
+            }
+            nir_def *sp = nir_load_var(b, s->stack_ptr);
+            nir_def *cdo = nir_load_var(b, s->shader_call_data_offset);
+            nir_store_var(b, s->stack_ptr, nir_iadd_imm(b, sp, isec->isec_size), 0x1);
+            nir_store_var(b, s->shader_call_data_offset,
+                          nir_iadd_imm(b, cdo, -(int32_t) isec->isec_size), 0x1);
+            tu_rt_call_stage(b, c, isec->ahit);
+            nir_store_var(b, s->stack_ptr, sp, 0x1);
+            nir_store_var(b, s->shader_call_data_offset, cdo, 0x1);
+         }
          nir_pop_if(b, NULL);
 
          nir_def *terminate = nir_load_var(b, s->terminate);
@@ -840,6 +854,7 @@ tu_rt_get_isec_function(nir_builder *b, struct tu_rt_compiler *c, uint32_t group
    struct tu_rt_isec_state isec = {
       .compiler = c,
       .ahit = tu_rt_group_stage(c, g->ahit_index),
+      .isec_size = align(c->pipeline->stages[g->isec_index]->scratch_size, 4),
    };
    nir_function_intrinsics_pass(function->impl, tu_rt_lower_isec_intrinsic,
                                 nir_metadata_none, &isec);
