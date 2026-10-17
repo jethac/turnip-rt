@@ -127,6 +127,27 @@ tu_rt_lower_derefs(nir_shader *shader)
 }
 
 static bool
+tu_rt_retag_constant_derefs(nir_shader *shader)
+{
+   bool progress = false;
+   nir_foreach_function_impl (impl, shader) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->modes == nir_var_mem_constant) {
+               deref->modes = nir_var_mem_global;
+               progress = true;
+            }
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_all);
+   }
+   return progress;
+}
+
+static bool
 tu_rt_move_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
 {
    switch (instr->intrinsic) {
@@ -176,6 +197,7 @@ tu_rt_compile_stages(struct tu_device *dev,
                glsl_get_natural_size_align_bytes);
 
       NIR_PASS(_, nir, tu_rt_lower_derefs);
+      NIR_PASS(_, nir, tu_rt_retag_constant_derefs);
 
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_function_temp,
                nir_address_format_32bit_offset);

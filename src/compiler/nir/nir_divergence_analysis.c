@@ -243,6 +243,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_ray_launch_size:
    case nir_intrinsic_load_subgroup_size:
    case nir_intrinsic_load_subgroup_id_shift_ir3:
+   case nir_intrinsic_load_rt_cmd_addr_ir3:
    case nir_intrinsic_load_base_instance:
    case nir_intrinsic_load_base_vertex:
    case nir_intrinsic_load_raw_vertex_offset:
