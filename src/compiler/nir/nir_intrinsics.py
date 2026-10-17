@@ -1655,7 +1655,6 @@ system_value("rel_patch_id_ir3", 1)
 # System values for freedreno compute shaders.
 system_value("subgroup_id_shift_ir3", 1)
 system_value("rt_cmd_addr_ir3", 2)
-system_value("shader_call_data_offset_ir3", 1)
 
 # System values for freedreno fragment shaders.
 intrinsic("load_frag_coord_unscaled_ir3", dest_comp=4,

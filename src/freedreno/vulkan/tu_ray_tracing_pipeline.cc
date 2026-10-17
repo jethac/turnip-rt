@@ -7,6 +7,7 @@
 
 #include "compiler/spirv/spirv.h"
 #include "nir/nir_builder.h"
+#include "nir/nir_deref.h"
 #include "util/hash_table.h"
 #include "util/mesa-blake3.h"
 #include "util/u_atomic.h"
@@ -87,46 +88,6 @@ tu_rt_init_groups(struct tu_device *dev,
 }
 
 static bool
-tu_rt_lower_derefs(nir_shader *shader)
-{
-   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
-   bool progress = false;
-
-   nir_builder _b = nir_builder_at(nir_before_impl(impl));
-   nir_builder *b = &_b;
-
-   nir_def *arg_offset = nir_load_shader_call_data_offset_ir3(b);
-
-   nir_foreach_block (block, impl) {
-      nir_foreach_instr_safe (instr, block) {
-         if (instr->type != nir_instr_type_deref)
-            continue;
-
-         nir_deref_instr *deref = nir_instr_as_deref(instr);
-         if (!nir_deref_mode_is_one_of(deref, nir_var_shader_call_data |
-                                              nir_var_ray_hit_attrib))
-            continue;
-
-         bool is_call_data = nir_deref_mode_is(deref, nir_var_shader_call_data);
-
-         deref->modes = nir_var_function_temp;
-         progress = true;
-
-         if (deref->deref_type == nir_deref_type_var) {
-            b->cursor = nir_before_instr(&deref->instr);
-            nir_def *offset = is_call_data ? arg_offset : nir_imm_int(b, 0);
-            nir_deref_instr *replacement =
-               nir_build_deref_cast(b, offset, nir_var_function_temp,
-                                    deref->var->type, 0);
-            nir_def_replace(&deref->def, &replacement->def);
-         }
-      }
-   }
-
-   return nir_progress(progress, impl, nir_metadata_control_flow);
-}
-
-static bool
 tu_rt_retag_constant_derefs(nir_shader *shader)
 {
    bool progress = false;
@@ -166,6 +127,138 @@ tu_rt_move_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
    }
 }
 
+#define TU_RT_HIT_WORDS (TU_RT_HIT_ATTRIBS_SIZE / 4)
+static const char tu_rt_hit_words_name[] = "tu_rt_hit_words";
+
+static nir_variable *
+tu_rt_hit_words_var(nir_shader *s)
+{
+   nir_foreach_variable_with_modes (var, s, nir_var_shader_temp) {
+      if (var->name && !strcmp(var->name, tu_rt_hit_words_name))
+         return var;
+   }
+   return nir_variable_create(s, nir_var_shader_temp,
+                              glsl_array_type(glsl_uint_type(), TU_RT_HIT_WORDS, 4),
+                              tu_rt_hit_words_name);
+}
+
+static nir_deref_instr *
+tu_rt_hw(nir_builder *b, nir_variable *hw, nir_def *word)
+{
+   return nir_build_deref_array(b, nir_build_deref_var(b, hw), word);
+}
+
+static unsigned
+tu_rt_elem_size(unsigned bit_size)
+{
+   return bit_size == 1 ? 4 : bit_size / 8;
+}
+
+static nir_def *
+tu_rt_hw_load_comp(nir_builder *b, nir_variable *hw, nir_def *off,
+                   unsigned c, unsigned bs)
+{
+   unsigned esz = tu_rt_elem_size(bs);
+   nir_def *coff = nir_iadd_imm(b, off, c * esz);
+   nir_def *word = nir_ushr_imm(b, coff, 2);
+   switch (esz) {
+   case 4: {
+      nir_def *v = nir_load_deref(b, tu_rt_hw(b, hw, word));
+      return bs == 1 ? nir_ine_imm(b, v, 0) : v;
+   }
+   case 8:
+      return nir_pack_64_2x32_split(b, nir_load_deref(b, tu_rt_hw(b, hw, word)),
+                                    nir_load_deref(b, tu_rt_hw(b, hw, nir_iadd_imm(b, word, 1))));
+   default: {
+      nir_def *w = nir_load_deref(b, tu_rt_hw(b, hw, word));
+      nir_def *shift = nir_imul_imm(b, nir_iand_imm(b, coff, 3), 8);
+      return nir_u2uN(b, nir_ubitfield_extract(b, w, shift, nir_imm_int(b, bs)), bs);
+   }
+   }
+}
+
+static void
+tu_rt_hw_store_comp(nir_builder *b, nir_variable *hw, nir_def *off,
+                    unsigned c, nir_def *v)
+{
+   unsigned bs = v->bit_size;
+   unsigned esz = tu_rt_elem_size(bs);
+   nir_def *coff = nir_iadd_imm(b, off, c * esz);
+   nir_def *word = nir_ushr_imm(b, coff, 2);
+   switch (esz) {
+   case 4:
+      nir_store_deref(b, tu_rt_hw(b, hw, word), bs == 1 ? nir_b2i32(b, v) : v, 0x1);
+      break;
+   case 8:
+      nir_store_deref(b, tu_rt_hw(b, hw, word), nir_unpack_64_2x32_split_x(b, v), 0x1);
+      nir_store_deref(b, tu_rt_hw(b, hw, nir_iadd_imm(b, word, 1)),
+                      nir_unpack_64_2x32_split_y(b, v), 0x1);
+      break;
+   default: {
+      nir_deref_instr *d = tu_rt_hw(b, hw, word);
+      nir_def *shift = nir_imul_imm(b, nir_iand_imm(b, coff, 3), 8);
+      nir_store_deref(b, d, nir_bitfield_insert(b, nir_load_deref(b, d), nir_u2u32(b, v),
+                                                shift, nir_imm_int(b, bs)), 0x1);
+      break;
+   }
+   }
+}
+
+static bool
+tu_rt_lower_hit_attribs(nir_shader *nir)
+{
+   bool has = false;
+   nir_foreach_variable_with_modes (var, nir, nir_var_ray_hit_attrib)
+      has = true;
+   if (!has)
+      return false;
+
+   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_ray_hit_attrib,
+            glsl_get_natural_size_align_bytes);
+
+   nir_variable *hw = tu_rt_hit_words_var(nir);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_create(impl);
+
+   nir_foreach_block_safe (block, impl) {
+      nir_foreach_instr_safe (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_deref &&
+             intr->intrinsic != nir_intrinsic_store_deref)
+            continue;
+         nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+         if (!nir_deref_mode_is(deref, nir_var_ray_hit_attrib))
+            continue;
+
+         b.cursor = nir_before_instr(instr);
+         nir_def *off = nir_build_deref_offset(&b, deref, glsl_get_natural_size_align_bytes);
+
+         if (intr->intrinsic == nir_intrinsic_load_deref) {
+            nir_def *vals[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned c = 0; c < intr->def.num_components; c++)
+               vals[c] = tu_rt_hw_load_comp(&b, hw, off, c, intr->def.bit_size);
+            nir_def_replace(&intr->def, nir_vec(&b, vals, intr->def.num_components));
+         } else {
+            nir_def *v = intr->src[1].ssa;
+            unsigned mask = nir_intrinsic_write_mask(intr);
+            for (unsigned c = 0; c < v->num_components; c++) {
+               if (mask & (1u << c))
+                  tu_rt_hw_store_comp(&b, hw, off, c, nir_channel(&b, v, c));
+            }
+            nir_instr_remove(instr);
+         }
+      }
+   }
+
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_derefs);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_ray_hit_attrib, NULL);
+   return true;
+}
+
 static VkResult
 tu_rt_compile_stages(struct tu_device *dev,
                      struct tu_ray_tracing_pipeline *pipeline,
@@ -184,24 +277,8 @@ tu_rt_compile_stages(struct tu_device *dev,
       if (!nir)
          return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-      uint32_t base_scratch = nir->scratch_size;
-      if (stage == MESA_SHADER_ANY_HIT || stage == MESA_SHADER_CLOSEST_HIT ||
-          stage == MESA_SHADER_INTERSECTION) {
-         assert(base_scratch == 0);
-         nir->scratch_size = TU_RT_HIT_ATTRIBS_SIZE;
-      }
-
-      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types,
-               nir_var_function_temp | nir_var_shader_call_data |
-               nir_var_ray_hit_attrib,
-               glsl_get_natural_size_align_bytes);
-
-      NIR_PASS(_, nir, tu_rt_lower_derefs);
       NIR_PASS(_, nir, tu_rt_retag_constant_derefs);
-
-      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_function_temp,
-               nir_address_format_32bit_offset);
-
+      NIR_PASS(_, nir, tu_rt_lower_hit_attribs);
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, tu_rt_move_intrinsic,
                nir_metadata_control_flow, NULL);
 
@@ -224,6 +301,17 @@ tu_rt_compile_stages(struct tu_device *dev,
    return VK_SUCCESS;
 }
 
+enum {
+   TU_RT_USE_INSTANCE_ID = 1 << 0,
+   TU_RT_USE_CUSTOM_INDEX = 1 << 1,
+   TU_RT_USE_PRIMITIVE_ID = 1 << 2,
+   TU_RT_USE_GEOMETRY_INDEX = 1 << 3,
+   TU_RT_USE_OBJECT_ORIGIN = 1 << 4,
+   TU_RT_USE_OBJECT_DIR = 1 << 5,
+   TU_RT_USE_WTO = 1 << 6,
+   TU_RT_USE_OTW = 1 << 7,
+};
+
 struct tu_rt_state {
    nir_variable *flags;
    nir_variable *cull_mask;
@@ -245,8 +333,6 @@ struct tu_rt_state {
    nir_variable *otw[4];
 
    nir_variable *shader_record_ptr;
-   nir_variable *stack_ptr;
-   nir_variable *shader_call_data_offset;
 
    nir_variable *accept;
    nir_variable *terminate;
@@ -257,17 +343,14 @@ struct tu_rt_compiler {
    struct tu_ray_tracing_pipeline *pipeline;
    VkPipelineCreateFlags2KHR flags;
    struct tu_rt_state state;
+   nir_variable *hit_words;
 
    struct hash_table *functions;
    nir_function **isec_functions;
-   nir_function *main_function;
 
-   uint32_t raygen_size;
-   uint32_t ahit_size;
-   uint32_t chit_size;
-   uint32_t miss_size;
-   uint32_t isec_size;
-   uint32_t callable_size;
+   uint32_t used;
+   bool has_ahit;
+   bool has_isec;
 };
 
 static void
@@ -291,8 +374,6 @@ tu_rt_state_init(nir_shader *nir, struct tu_rt_state *s)
    VAR(object_origin, glsl_vec_type(3));
    VAR(object_dir, glsl_vec_type(3));
    VAR(shader_record_ptr, glsl_uint64_t_type());
-   VAR(stack_ptr, glsl_uint_type());
-   VAR(shader_call_data_offset, glsl_uint_type());
    VAR(accept, glsl_bool_type());
    VAR(terminate, glsl_bool_type());
    VAR(opaque, glsl_bool_type());
@@ -305,12 +386,38 @@ tu_rt_state_init(nir_shader *nir, struct tu_rt_state *s)
    }
 }
 
+static uint32_t
+tu_rt_scan_used(nir_shader *nir)
+{
+   uint32_t used = 0;
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_load_instance_id: used |= TU_RT_USE_INSTANCE_ID; break;
+            case nir_intrinsic_load_ray_instance_custom_index: used |= TU_RT_USE_CUSTOM_INDEX; break;
+            case nir_intrinsic_load_primitive_id: used |= TU_RT_USE_PRIMITIVE_ID; break;
+            case nir_intrinsic_load_ray_geometry_index: used |= TU_RT_USE_GEOMETRY_INDEX; break;
+            case nir_intrinsic_load_ray_object_origin: used |= TU_RT_USE_OBJECT_ORIGIN; break;
+            case nir_intrinsic_load_ray_object_direction: used |= TU_RT_USE_OBJECT_DIR; break;
+            case nir_intrinsic_load_ray_world_to_object: used |= TU_RT_USE_WTO; break;
+            case nir_intrinsic_load_ray_object_to_world: used |= TU_RT_USE_OTW; break;
+            default: break;
+            }
+         }
+      }
+   }
+   return used;
+}
+
 static nir_def *
 tu_rt_load_cmd(nir_builder *b, uint32_t offset, unsigned comps)
 {
    nir_def *addr = nir_pack_64_2x32(b, nir_load_rt_cmd_addr_ir3(b));
    return nir_load_global(b, comps, 32, nir_iadd_imm(b, addr, offset),
-                          .access = ACCESS_NON_WRITEABLE,
+                          .access = (gl_access_qualifier) (ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
                           .align_mul = 4);
 }
 
@@ -337,24 +444,11 @@ tu_rt_load_sbt_entry(nir_builder *b, nir_def *index, uint32_t addr_offset)
    }
 
    return (struct tu_rt_sbt_entry) {
-      .value = nir_load_global(b, 1, 32, addr, .access = ACCESS_NON_WRITEABLE,
+      .value = nir_load_global(b, 1, 32, addr,
+                               .access = (gl_access_qualifier) (ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
                                .align_mul = 4),
       .shader_record_ptr = nir_iadd_imm(b, addr, TU_RT_GROUP_HANDLE_SIZE),
    };
-}
-
-static uint32_t
-tu_rt_function_stack_size(struct tu_rt_compiler *c, nir_function *function)
-{
-   hash_table_foreach (c->functions, entry) {
-      if (entry->data == function)
-         return ((const nir_shader *) entry->key)->scratch_size;
-   }
-   for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
-      if (c->isec_functions[i] == function)
-         return c->pipeline->stages[c->pipeline->groups[i].isec_index]->scratch_size;
-   }
-   return 0;
 }
 
 static mesa_shader_stage
@@ -372,23 +466,33 @@ tu_rt_function_stage(struct tu_rt_compiler *c, nir_function *function)
 }
 
 static void
-tu_rt_track_size(struct tu_rt_compiler *c, const nir_shader *stage)
+tu_rt_bind_call_data_param(nir_function_impl *impl)
 {
-   uint32_t *size;
-   switch (stage->info.stage) {
-   case MESA_SHADER_RAYGEN: size = &c->raygen_size; break;
-   case MESA_SHADER_ANY_HIT: size = &c->ahit_size; break;
-   case MESA_SHADER_CLOSEST_HIT: size = &c->chit_size; break;
-   case MESA_SHADER_MISS: size = &c->miss_size; break;
-   case MESA_SHADER_INTERSECTION: size = &c->isec_size; break;
-   case MESA_SHADER_CALLABLE: size = &c->callable_size; break;
-   default: UNREACHABLE("Invalid ray tracing stage");
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *param = nir_load_param(&b, 0);
+
+   nir_foreach_block (block, impl) {
+      nir_foreach_instr_safe (instr, block) {
+         if (instr->type != nir_instr_type_deref)
+            continue;
+         nir_deref_instr *deref = nir_instr_as_deref(instr);
+         if (!nir_deref_mode_is(deref, nir_var_shader_call_data))
+            continue;
+         deref->modes = nir_var_function_temp;
+         if (deref->deref_type == nir_deref_type_var) {
+            b.cursor = nir_before_instr(&deref->instr);
+            nir_deref_instr *cast =
+               nir_build_deref_cast(&b, param, nir_var_function_temp,
+                                    deref->var->type, 0);
+            nir_def_replace(&deref->def, &cast->def);
+         }
+      }
    }
-   *size = MAX2(*size, stage->scratch_size);
+   nir_progress(true, impl, nir_metadata_none);
 }
 
 static nir_function *
-tu_rt_clone_stage(nir_shader *dst, nir_shader *stage)
+tu_rt_clone_stage(struct tu_rt_compiler *c, nir_shader *dst, nir_shader *stage)
 {
    nir_function_impl *copy =
       nir_function_impl_clone(dst, nir_shader_get_entrypoint(stage));
@@ -400,13 +504,20 @@ tu_rt_clone_stage(nir_shader *dst, nir_shader *stage)
             continue;
          nir_deref_instr *deref = nir_instr_as_deref(instr);
          if (deref->deref_type != nir_deref_type_var ||
-             deref->var->data.mode == nir_var_function_temp)
+             deref->var->data.mode == nir_var_function_temp ||
+             deref->var->data.mode == nir_var_shader_call_data)
             continue;
          struct hash_entry *entry =
             _mesa_hash_table_search(var_remap, deref->var);
          if (!entry) {
-            nir_variable *new_var = nir_variable_clone(deref->var, dst);
-            nir_shader_add_variable(dst, new_var);
+            nir_variable *new_var;
+            if (deref->var->name &&
+                !strcmp(deref->var->name, tu_rt_hit_words_name)) {
+               new_var = c->hit_words;
+            } else {
+               new_var = nir_variable_clone(deref->var, dst);
+               nir_shader_add_variable(dst, new_var);
+            }
             entry = _mesa_hash_table_insert(var_remap, deref->var, new_var);
          }
          deref->var = (nir_variable *) entry->data;
@@ -416,23 +527,28 @@ tu_rt_clone_stage(nir_shader *dst, nir_shader *stage)
 
    nir_function *function =
       nir_function_create(dst, _mesa_shader_stage_to_string(stage->info.stage));
+   function->num_params = 1;
+   function->params = rzalloc_array(dst, nir_parameter, 1);
+   function->params[0].num_components = 1;
+   function->params[0].bit_size = 32;
    nir_function_set_impl(function, copy);
+   tu_rt_bind_call_data_param(copy);
    return function;
 }
 
 static void
-tu_rt_call_stage(nir_builder *b, struct tu_rt_compiler *c, nir_shader *stage)
+tu_rt_call_stage(nir_builder *b, struct tu_rt_compiler *c, nir_shader *stage,
+                 nir_def *arg)
 {
    nir_function *function;
    struct hash_entry *entry = _mesa_hash_table_search(c->functions, stage);
    if (entry) {
       function = (nir_function *) entry->data;
    } else {
-      function = tu_rt_clone_stage(b->shader, stage);
+      function = tu_rt_clone_stage(c, b->shader, stage);
       _mesa_hash_table_insert(c->functions, stage, function);
    }
-   nir_build_call(b, function, 0, NULL);
-   tu_rt_track_size(c, stage);
+   nir_build_call(b, function, 1, &arg);
 }
 
 static nir_shader *
@@ -443,7 +559,7 @@ tu_rt_group_stage(struct tu_rt_compiler *c, uint32_t index)
 
 static void
 tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
-                         nir_def *handle, mesa_shader_stage want)
+                         nir_def *handle, mesa_shader_stage want, nir_def *arg)
 {
    for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
       struct tu_rt_group *group = c->pipeline->groups + i;
@@ -451,7 +567,7 @@ tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
       if (!stage || stage->info.stage != want)
          continue;
       nir_push_if(b, nir_ieq_imm(b, handle, group->handle));
-      tu_rt_call_stage(b, c, stage);
+      tu_rt_call_stage(b, c, stage, arg);
       nir_pop_if(b, NULL);
    }
 }
@@ -461,27 +577,36 @@ tu_rt_load_hit_state(nir_builder *b, struct tu_rt_compiler *c,
                      nir_def *rq, bool committed)
 {
    struct tu_rt_state *s = &c->state;
+   uint32_t u = c->used;
 
 #define RQ(n, bits, val, ...) \
    nir_rq_load(b, n, bits, rq, .ray_query_value = nir_ray_query_value_##val, \
                .committed = committed, ##__VA_ARGS__)
 
-   nir_store_var(b, s->instance_id, RQ(1, 32, intersection_instance_id), 0x1);
-   nir_store_var(b, s->custom_index,
-                 RQ(1, 32, intersection_instance_custom_index), 0x1);
-   nir_store_var(b, s->primitive_id,
-                 RQ(1, 32, intersection_primitive_index), 0x1);
-   nir_store_var(b, s->geometry_index,
-                 RQ(1, 32, intersection_geometry_index), 0x1);
-   nir_store_var(b, s->object_origin,
-                 RQ(3, 32, intersection_object_ray_origin), 0x7);
-   nir_store_var(b, s->object_dir,
-                 RQ(3, 32, intersection_object_ray_direction), 0x7);
+   if (u & TU_RT_USE_INSTANCE_ID)
+      nir_store_var(b, s->instance_id, RQ(1, 32, intersection_instance_id), 0x1);
+   if (u & TU_RT_USE_CUSTOM_INDEX)
+      nir_store_var(b, s->custom_index,
+                    RQ(1, 32, intersection_instance_custom_index), 0x1);
+   if (u & TU_RT_USE_PRIMITIVE_ID)
+      nir_store_var(b, s->primitive_id,
+                    RQ(1, 32, intersection_primitive_index), 0x1);
+   if (u & TU_RT_USE_GEOMETRY_INDEX)
+      nir_store_var(b, s->geometry_index,
+                    RQ(1, 32, intersection_geometry_index), 0x1);
+   if (u & TU_RT_USE_OBJECT_ORIGIN)
+      nir_store_var(b, s->object_origin,
+                    RQ(3, 32, intersection_object_ray_origin), 0x7);
+   if (u & TU_RT_USE_OBJECT_DIR)
+      nir_store_var(b, s->object_dir,
+                    RQ(3, 32, intersection_object_ray_direction), 0x7);
    for (unsigned col = 0; col < 4; col++) {
-      nir_store_var(b, s->wto[col],
-                    RQ(3, 32, intersection_world_to_object, .column = col), 0x7);
-      nir_store_var(b, s->otw[col],
-                    RQ(3, 32, intersection_object_to_world, .column = col), 0x7);
+      if (u & TU_RT_USE_WTO)
+         nir_store_var(b, s->wto[col],
+                       RQ(3, 32, intersection_world_to_object, .column = col), 0x7);
+      if (u & TU_RT_USE_OTW)
+         nir_store_var(b, s->otw[col],
+                       RQ(3, 32, intersection_object_to_world, .column = col), 0x7);
    }
 #undef RQ
 }
@@ -513,6 +638,19 @@ tu_rt_triangle_hit_kind(nir_builder *b, nir_def *rq, bool committed)
    return nir_bcsel(b, front, nir_imm_int(b, 0xFE), nir_imm_int(b, 0xFF));
 }
 
+static void
+tu_rt_store_bary(nir_builder *b, struct tu_rt_compiler *c, nir_def *rq,
+                 bool committed)
+{
+   nir_def *bary =
+      nir_rq_load(b, 2, 32, rq,
+                  .ray_query_value = nir_ray_query_value_intersection_barycentrics,
+                  .committed = committed);
+   for (unsigned i = 0; i < 2; i++)
+      nir_store_deref(b, tu_rt_hw(b, c->hit_words, nir_imm_int(b, i)),
+                      nir_channel(b, bary, i), 0x1);
+}
+
 static nir_function *tu_rt_get_isec_function(nir_builder *b,
                                              struct tu_rt_compiler *c,
                                              uint32_t group);
@@ -542,13 +680,6 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
    if (c->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR)
       flags = nir_ior_imm(b, flags, SpvRayFlagsSkipAABBsKHRMask);
 
-   uint32_t stack_size = tu_rt_function_stack_size(c, b->impl->function);
-   nir_def *stack_ptr = nir_load_var(b, s->stack_ptr);
-   nir_def *frame = nir_iadd_imm(b, stack_ptr, stack_size);
-   nir_store_var(b, s->stack_ptr, frame, 0x1);
-   nir_store_var(b, s->shader_call_data_offset,
-                 nir_iadd_imm(b, payload, -(int32_t) stack_size), 0x1);
-
    nir_store_var(b, s->flags, flags, 0x1);
    nir_store_var(b, s->cull_mask, cull_mask, 0x1);
    nir_store_var(b, s->sbt_offset, sbt_offset, 0x1);
@@ -569,20 +700,24 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
 
    nir_def *rq_flags =
       nir_iand_imm(b, flags, ~SpvRayFlagsSkipClosestHitShaderKHRMask);
+   if (!c->has_isec)
+      rq_flags = nir_ior_imm(b, rq_flags, SpvRayFlagsSkipAABBsKHRMask);
+   if (!c->has_ahit) {
+      nir_def *forced =
+         nir_ior_imm(b, nir_iand_imm(b, rq_flags, ~SpvRayFlagsNoOpaqueKHRMask),
+                     SpvRayFlagsOpaqueKHRMask);
+      nir_def *culls_opacity =
+         nir_test_mask(b, flags, SpvRayFlagsCullOpaqueKHRMask |
+                                 SpvRayFlagsCullNoOpaqueKHRMask);
+      rq_flags = nir_bcsel(b, culls_opacity, rq_flags, forced);
+   }
 
    nir_rq_initialize(b, rq, accel_struct, rq_flags, cull_mask, origin, tmin,
                      dir, tmax);
 
-   const unsigned attrib_dwords = TU_RT_HIT_ATTRIBS_SIZE / 4;
-
    nir_loop *loop = nir_push_loop(b);
    {
       nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, rq)));
-
-      tu_rt_load_hit_state(b, c, rq, false);
-      nir_def *sbt_index = tu_rt_sbt_index(b, c, rq, false);
-      struct tu_rt_sbt_entry entry = tu_rt_load_sbt_entry(b, sbt_index, hit_sbt);
-      nir_store_var(b, s->shader_record_ptr, entry.shader_record_ptr, 0x1);
 
       nir_def *ctype =
          nir_rq_load(b, 1, 32, rq,
@@ -590,29 +725,33 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
                      .committed = false);
 
       nir_push_if(b, nir_ieq_imm(b, ctype, 0));
-      {
+      if (!c->has_ahit) {
+         nir_rq_confirm_intersection(b, rq);
+      } else {
+         tu_rt_load_hit_state(b, c, rq, false);
+         struct tu_rt_sbt_entry entry =
+            tu_rt_load_sbt_entry(b, tu_rt_sbt_index(b, c, rq, false), hit_sbt);
+         nir_store_var(b, s->shader_record_ptr, entry.shader_record_ptr, 0x1);
+
          nir_def *t = nir_rq_load(b, 1, 32, rq,
                                   .ray_query_value = nir_ray_query_value_intersection_t,
                                   .committed = false);
          nir_def *prev_tmax = nir_load_var(b, s->tmax);
-         nir_def *prev_bary = nir_load_scratch(b, 2, 32, frame);
+         nir_def *prev_w0 = nir_load_deref(b, tu_rt_hw(b, c->hit_words, nir_imm_int(b, 0)));
+         nir_def *prev_w1 = nir_load_deref(b, tu_rt_hw(b, c->hit_words, nir_imm_int(b, 1)));
 
          nir_store_var(b, s->accept, nir_imm_true(b), 0x1);
          nir_store_var(b, s->terminate, nir_imm_false(b), 0x1);
          nir_store_var(b, s->tmax, t, 0x1);
          nir_store_var(b, s->hit_kind, tu_rt_triangle_hit_kind(b, rq, false), 0x1);
-         nir_store_scratch(b,
-                           nir_rq_load(b, 2, 32, rq,
-                                       .ray_query_value = nir_ray_query_value_intersection_barycentrics,
-                                       .committed = false),
-                           frame);
+         tu_rt_store_bary(b, c, rq, false);
 
          for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
             nir_shader *ahit = tu_rt_group_stage(c, c->pipeline->groups[i].ahit_index);
             if (!ahit || c->pipeline->groups[i].isec_index != VK_SHADER_UNUSED_KHR)
                continue;
             nir_push_if(b, nir_ieq_imm(b, entry.value, c->pipeline->groups[i].handle));
-            tu_rt_call_stage(b, c, ahit);
+            tu_rt_call_stage(b, c, ahit, payload);
             nir_pop_if(b, NULL);
          }
 
@@ -625,16 +764,22 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
          }
          nir_push_else(b, NULL);
          {
-            nir_store_scratch(b, prev_bary, frame);
+            nir_store_deref(b, tu_rt_hw(b, c->hit_words, nir_imm_int(b, 0)), prev_w0, 0x1);
+            nir_store_deref(b, tu_rt_hw(b, c->hit_words, nir_imm_int(b, 1)), prev_w1, 0x1);
          }
          nir_pop_if(b, NULL);
          nir_store_var(b, s->tmax, prev_tmax, 0x1);
       }
       nir_push_else(b, NULL);
-      {
-         nir_def *prev_attribs[TU_RT_HIT_ATTRIBS_SIZE / 4];
-         for (unsigned i = 0; i < attrib_dwords; i++)
-            prev_attribs[i] = nir_load_scratch(b, 1, 32, nir_iadd_imm(b, frame, i * 4));
+      if (c->has_isec) {
+         tu_rt_load_hit_state(b, c, rq, false);
+         struct tu_rt_sbt_entry entry =
+            tu_rt_load_sbt_entry(b, tu_rt_sbt_index(b, c, rq, false), hit_sbt);
+         nir_store_var(b, s->shader_record_ptr, entry.shader_record_ptr, 0x1);
+
+         nir_def *prev_words[TU_RT_HIT_WORDS];
+         for (unsigned i = 0; i < TU_RT_HIT_WORDS; i++)
+            prev_words[i] = nir_load_deref(b, tu_rt_hw(b, c->hit_words, nir_imm_int(b, i)));
 
          nir_def *prev_tmax = nir_load_var(b, s->tmax);
          nir_store_var(b, s->accept, nir_imm_false(b), 0x1);
@@ -654,8 +799,7 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
             if (c->pipeline->groups[i].isec_index == VK_SHADER_UNUSED_KHR)
                continue;
             nir_push_if(b, nir_ieq_imm(b, entry.value, c->pipeline->groups[i].handle));
-            nir_build_call(b, tu_rt_get_isec_function(b, c, i), 0, NULL);
-            tu_rt_track_size(c, c->pipeline->stages[c->pipeline->groups[i].isec_index]);
+            nir_build_call(b, tu_rt_get_isec_function(b, c, i), 1, &payload);
             nir_pop_if(b, NULL);
          }
 
@@ -669,8 +813,9 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
          }
          nir_push_else(b, NULL);
          {
-            for (unsigned i = 0; i < attrib_dwords; i++)
-               nir_store_scratch(b, prev_attribs[i], nir_iadd_imm(b, frame, i * 4));
+            for (unsigned i = 0; i < TU_RT_HIT_WORDS; i++)
+               nir_store_deref(b, tu_rt_hw(b, c->hit_words, nir_imm_int(b, i)),
+                               prev_words[i], 0x1);
          }
          nir_pop_if(b, NULL);
          nir_store_var(b, s->tmax, prev_tmax, 0x1);
@@ -686,36 +831,37 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
 
    nir_push_if(b, nir_ine_imm(b, committed_type, 0));
    {
-      tu_rt_load_hit_state(b, c, rq, true);
-      nir_store_var(b, s->tmax,
-                    nir_rq_load(b, 1, 32, rq,
-                                .ray_query_value = nir_ray_query_value_intersection_t,
-                                .committed = true),
-                    0x1);
-
-      nir_push_if(b, nir_ieq_imm(b, committed_type, 1));
-      {
-         nir_store_var(b, s->hit_kind, tu_rt_triangle_hit_kind(b, rq, true), 0x1);
-         nir_store_scratch(b,
-                           nir_rq_load(b, 2, 32, rq,
-                                       .ray_query_value = nir_ray_query_value_intersection_barycentrics,
-                                       .committed = true),
-                           frame);
-      }
-      nir_push_else(b, NULL);
-      {
-         nir_store_var(b, s->hit_kind, nir_load_var(b, committed_hit_kind), 0x1);
-      }
-      nir_pop_if(b, NULL);
-
       nir_def *skip_chit =
          nir_test_mask(b, flags, SpvRayFlagsSkipClosestHitShaderKHRMask);
       nir_push_if(b, nir_inot(b, skip_chit));
       {
+         tu_rt_load_hit_state(b, c, rq, true);
+         nir_store_var(b, s->tmax,
+                       nir_rq_load(b, 1, 32, rq,
+                                   .ray_query_value = nir_ray_query_value_intersection_t,
+                                   .committed = true),
+                       0x1);
+
+         if (c->has_isec) {
+            nir_push_if(b, nir_ieq_imm(b, committed_type, 1));
+            {
+               nir_store_var(b, s->hit_kind, tu_rt_triangle_hit_kind(b, rq, true), 0x1);
+               tu_rt_store_bary(b, c, rq, true);
+            }
+            nir_push_else(b, NULL);
+            {
+               nir_store_var(b, s->hit_kind, nir_load_var(b, committed_hit_kind), 0x1);
+            }
+            nir_pop_if(b, NULL);
+         } else {
+            nir_store_var(b, s->hit_kind, tu_rt_triangle_hit_kind(b, rq, true), 0x1);
+            tu_rt_store_bary(b, c, rq, true);
+         }
+
          struct tu_rt_sbt_entry chit =
             tu_rt_load_sbt_entry(b, tu_rt_sbt_index(b, c, rq, true), hit_sbt);
          nir_store_var(b, s->shader_record_ptr, chit.shader_record_ptr, 0x1);
-         tu_rt_dispatch_recursive(b, c, chit.value, MESA_SHADER_CLOSEST_HIT);
+         tu_rt_dispatch_recursive(b, c, chit.value, MESA_SHADER_CLOSEST_HIT, payload);
       }
       nir_pop_if(b, NULL);
    }
@@ -725,39 +871,27 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
          b, miss_index,
          offsetof(VkTraceRaysIndirectCommand2KHR, missShaderBindingTableAddress));
       nir_store_var(b, s->shader_record_ptr, miss.shader_record_ptr, 0x1);
-      tu_rt_dispatch_recursive(b, c, miss.value, MESA_SHADER_MISS);
+      tu_rt_dispatch_recursive(b, c, miss.value, MESA_SHADER_MISS, payload);
    }
    nir_pop_if(b, NULL);
-
-   nir_store_var(b, s->stack_ptr, stack_ptr, 0x1);
 }
 
 static void
 tu_rt_execute_callable(nir_builder *b, struct tu_rt_compiler *c,
                        nir_intrinsic_instr *instr)
 {
-   struct tu_rt_state *s = &c->state;
-
    struct tu_rt_sbt_entry entry = tu_rt_load_sbt_entry(
       b, instr->src[0].ssa,
       offsetof(VkTraceRaysIndirectCommand2KHR, callableShaderBindingTableAddress));
-   nir_store_var(b, s->shader_record_ptr, entry.shader_record_ptr, 0x1);
-
-   uint32_t stack_size = tu_rt_function_stack_size(c, b->impl->function);
-   nir_def *stack_ptr = nir_load_var(b, s->stack_ptr);
-   nir_store_var(b, s->stack_ptr, nir_iadd_imm(b, stack_ptr, stack_size), 0x1);
-   nir_store_var(b, s->shader_call_data_offset,
-                 nir_iadd_imm(b, instr->src[1].ssa, -(int32_t) stack_size), 0x1);
-
-   tu_rt_dispatch_recursive(b, c, entry.value, MESA_SHADER_CALLABLE);
-
-   nir_store_var(b, s->stack_ptr, stack_ptr, 0x1);
+   nir_def *prev_record = nir_load_var(b, c->state.shader_record_ptr);
+   nir_store_var(b, c->state.shader_record_ptr, entry.shader_record_ptr, 0x1);
+   tu_rt_dispatch_recursive(b, c, entry.value, MESA_SHADER_CALLABLE, instr->src[1].ssa);
+   nir_store_var(b, c->state.shader_record_ptr, prev_record, 0x1);
 }
 
 struct tu_rt_isec_state {
    struct tu_rt_compiler *compiler;
    nir_shader *ahit;
-   uint32_t isec_size;
 };
 
 static bool
@@ -798,20 +932,7 @@ tu_rt_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *dat
          nir_store_var(b, s->terminate, nir_imm_false(b), 0x1);
 
          nir_push_if(b, nir_inot(b, nir_load_var(b, s->opaque)));
-         {
-            for (unsigned i = 0; i < TU_RT_HIT_ATTRIBS_SIZE / 4; i++) {
-               nir_store_scratch(b, nir_load_scratch(b, 1, 32, nir_imm_int(b, i * 4)),
-                                 nir_imm_int(b, isec->isec_size + i * 4));
-            }
-            nir_def *sp = nir_load_var(b, s->stack_ptr);
-            nir_def *cdo = nir_load_var(b, s->shader_call_data_offset);
-            nir_store_var(b, s->stack_ptr, nir_iadd_imm(b, sp, isec->isec_size), 0x1);
-            nir_store_var(b, s->shader_call_data_offset,
-                          nir_iadd_imm(b, cdo, -(int32_t) isec->isec_size), 0x1);
-            tu_rt_call_stage(b, c, isec->ahit);
-            nir_store_var(b, s->stack_ptr, sp, 0x1);
-            nir_store_var(b, s->shader_call_data_offset, cdo, 0x1);
-         }
+         tu_rt_call_stage(b, c, isec->ahit, nir_load_param(b, 0));
          nir_pop_if(b, NULL);
 
          nir_def *terminate = nir_load_var(b, s->terminate);
@@ -848,13 +969,12 @@ tu_rt_get_isec_function(nir_builder *b, struct tu_rt_compiler *c, uint32_t group
 
    struct tu_rt_group *g = c->pipeline->groups + group;
    nir_function *function =
-      tu_rt_clone_stage(b->shader, c->pipeline->stages[g->isec_index]);
+      tu_rt_clone_stage(c, b->shader, c->pipeline->stages[g->isec_index]);
    c->isec_functions[group] = function;
 
    struct tu_rt_isec_state isec = {
       .compiler = c,
       .ahit = tu_rt_group_stage(c, g->ahit_index),
-      .isec_size = align(c->pipeline->stages[g->isec_index]->scratch_size, 4),
    };
    nir_function_intrinsics_pass(function->impl, tu_rt_lower_isec_intrinsic,
                                 nir_metadata_none, &isec);
@@ -952,30 +1072,11 @@ tu_rt_lower_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_load_cull_mask:
       def = nir_iand_imm(b, nir_load_var(b, s->cull_mask), 0xFF);
       break;
-   case nir_intrinsic_load_ray_world_to_object: {
-      unsigned col = nir_intrinsic_column(intr);
-      def = nir_load_var(b, s->wto[col]);
+   case nir_intrinsic_load_ray_world_to_object:
+      def = nir_load_var(b, s->wto[nir_intrinsic_column(intr)]);
       break;
-   }
-   case nir_intrinsic_load_ray_object_to_world: {
-      unsigned col = nir_intrinsic_column(intr);
-      def = nir_load_var(b, s->otw[col]);
-      break;
-   }
-   case nir_intrinsic_load_scratch:
-      if (b->impl->function == c->main_function)
-         return false;
-      nir_src_rewrite(&intr->src[0],
-                      nir_iadd(b, nir_load_var(b, s->stack_ptr), intr->src[0].ssa));
-      return true;
-   case nir_intrinsic_store_scratch:
-      if (b->impl->function == c->main_function)
-         return false;
-      nir_src_rewrite(&intr->src[1],
-                      nir_iadd(b, nir_load_var(b, s->stack_ptr), intr->src[1].ssa));
-      return true;
-   case nir_intrinsic_load_shader_call_data_offset_ir3:
-      def = nir_load_var(b, s->shader_call_data_offset);
+   case nir_intrinsic_load_ray_object_to_world:
+      def = nir_load_var(b, s->otw[nir_intrinsic_column(intr)]);
       break;
    default:
       return false;
@@ -985,6 +1086,24 @@ tu_rt_lower_instr(nir_builder *b, nir_instr *instr, void *data)
       nir_def_rewrite_uses(&intr->def, def);
    nir_instr_remove(instr);
    return true;
+}
+
+static bool
+tu_rt_has_function_temp_cast(nir_shader *nir)
+{
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type == nir_deref_type_cast &&
+                nir_deref_mode_may_be(deref, nir_var_function_temp))
+               return true;
+         }
+      }
+   }
+   return false;
 }
 
 static nir_shader *
@@ -1008,8 +1127,18 @@ tu_rt_build_shader(struct tu_device *dev,
    c.functions = _mesa_pointer_hash_table_create(NULL);
    c.isec_functions = (nir_function **)
       calloc(MAX2(pipeline->group_count, 1), sizeof(nir_function *));
-   c.main_function = b->impl->function;
    tu_rt_state_init(b->shader, &c.state);
+   c.hit_words = tu_rt_hit_words_var(b->shader);
+
+   for (uint32_t i = 0; i < pipeline->group_count; i++) {
+      const struct tu_rt_group *g = pipeline->groups + i;
+      if (g->ahit_index != VK_SHADER_UNUSED_KHR)
+         c.has_ahit = true;
+      if (g->isec_index != VK_SHADER_UNUSED_KHR)
+         c.has_isec = true;
+   }
+   for (uint32_t i = 0; i < pipeline->stage_count; i++)
+      c.used |= tu_rt_scan_used(pipeline->stages[i]);
 
    nir_def *launch_id = nir_load_ray_launch_id(b);
    nir_def *launch_size = nir_load_ray_launch_size(b);
@@ -1020,12 +1149,11 @@ tu_rt_build_shader(struct tu_device *dev,
    nir_jump(b, nir_jump_return);
    nir_pop_if(b, NULL);
 
-   nir_store_var(b, c.state.stack_ptr, nir_load_ray_tracing_stack_base_lvp(b), 0x1);
-
    struct tu_rt_sbt_entry raygen = tu_rt_load_sbt_entry(
       b, NULL, offsetof(VkTraceRaysIndirectCommand2KHR, raygenShaderRecordAddress));
    nir_store_var(b, c.state.shader_record_ptr, raygen.shader_record_ptr, 0x1);
-   tu_rt_dispatch_recursive(b, &c, raygen.value, MESA_SHADER_RAYGEN);
+   tu_rt_dispatch_recursive(b, &c, raygen.value, MESA_SHADER_RAYGEN,
+                            nir_undef(b, 1, 32));
 
    nir_shader_instructions_pass(b->shader, tu_rt_lower_instr,
                                 nir_metadata_none, &c);
@@ -1034,25 +1162,22 @@ tu_rt_build_shader(struct tu_device *dev,
    NIR_PASS(_, b->shader, nir_lower_returns);
    NIR_PASS(_, b->shader, nir_inline_functions);
    nir_remove_non_entrypoints(b->shader);
+   NIR_PASS(_, b->shader, nir_opt_deref);
+   NIR_PASS(_, b->shader, nir_opt_copy_prop);
+   NIR_PASS(_, b->shader, nir_opt_deref);
+
+   if (tu_rt_has_function_temp_cast(b->shader)) {
+      mesa_logw("tu: ray tracing payload type mismatch, using scratch");
+      NIR_PASS(_, b->shader, nir_lower_vars_to_explicit_types,
+               nir_var_function_temp, glsl_get_natural_size_align_bytes);
+      NIR_PASS(_, b->shader, nir_lower_explicit_io, nir_var_function_temp,
+               nir_address_format_32bit_offset);
+   }
 
    NIR_PASS(_, b->shader, nir_lower_global_vars_to_local);
    NIR_PASS(_, b->shader, nir_lower_vars_to_ssa);
    NIR_PASS(_, b->shader, nir_opt_copy_prop);
    NIR_PASS(_, b->shader, nir_opt_dce);
-
-   NIR_PASS(_, b->shader, nir_lower_vars_to_explicit_types,
-            nir_var_shader_temp, glsl_get_natural_size_align_bytes);
-   NIR_PASS(_, b->shader, nir_lower_explicit_io, nir_var_shader_temp,
-            nir_address_format_32bit_offset);
-
-   uint32_t base = align(b->shader->scratch_size, 16);
-   NIR_PASS(_, b->shader, nir_inline_sysval,
-            nir_intrinsic_load_ray_tracing_stack_base_lvp, base);
-
-   uint32_t depth = MIN2(create_info->maxPipelineRayRecursionDepth, 1);
-   b->shader->scratch_size = base + c.raygen_size +
-      depth * MAX3(c.chit_size, c.miss_size, c.isec_size + c.ahit_size) +
-      2 * c.callable_size;
 
    NIR_PASS(_, b->shader, nir_opt_ray_queries);
    NIR_PASS(_, b->shader, tu_nir_lower_ray_queries);
