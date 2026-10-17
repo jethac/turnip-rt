@@ -646,6 +646,23 @@ tu_rt_group_stage(struct tu_rt_compiler *c, uint32_t index)
    return index == VK_SHADER_UNUSED_KHR ? NULL : c->pipeline->stages[index];
 }
 
+static bool
+tu_rt_payload_compatible(nir_shader *stage, nir_def *arg)
+{
+   if (!nir_def_is_deref(arg))
+      return true;
+   const struct glsl_type *pt = nir_def_as_deref(arg)->type;
+   nir_foreach_variable_with_modes (var, stage, nir_var_shader_call_data) {
+      if (var->type == pt)
+         return true;
+      unsigned sa, aa, sb, ab;
+      glsl_get_natural_size_align_bytes(var->type, &sa, &aa);
+      glsl_get_natural_size_align_bytes(pt, &sb, &ab);
+      return sa == sb;
+   }
+   return true;
+}
+
 static void
 tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
                          nir_def *handle, mesa_shader_stage want, nir_def *arg,
@@ -655,7 +672,8 @@ tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
       struct tu_rt_group *group = c->pipeline->groups + i;
       nir_shader *stage = tu_rt_group_stage(c, group->recursive_index);
       if (!stage || stage->info.stage != want ||
-          tu_rt_handle_seen(c, i, group->handle, 0))
+          tu_rt_handle_seen(c, i, group->handle, 0) ||
+          !tu_rt_payload_compatible(stage, arg))
          continue;
       nir_push_if(b, nir_ieq_imm(b, handle, group->handle));
       tu_rt_call_stage(b, c, stage, arg, ray_depth, call_depth);
@@ -848,7 +866,8 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
          for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
             nir_shader *ahit = tu_rt_group_stage(c, c->pipeline->groups[i].ahit_index);
             if (!ahit || c->pipeline->groups[i].isec_index != VK_SHADER_UNUSED_KHR ||
-                tu_rt_handle_seen(c, i, c->pipeline->groups[i].handle, 1))
+                tu_rt_handle_seen(c, i, c->pipeline->groups[i].handle, 1) ||
+                !tu_rt_payload_compatible(ahit, payload))
                continue;
             nir_push_if(b, nir_ieq_imm(b, entry.value, c->pipeline->groups[i].handle));
             tu_rt_call_stage(b, c, ahit, payload, 1, cd);
