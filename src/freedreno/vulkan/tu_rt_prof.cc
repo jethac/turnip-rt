@@ -127,7 +127,7 @@ tu_rt_prof_begin(void)
 void
 tu_rt_prof_mark(const char *name, const nir_shader *nir)
 {
-   if (!prof.active.load())
+   if (!prof.active.load() || !pthread_equal(pthread_self(), prof.owner))
       return;
    prof_hook(name);
    if (nir) {

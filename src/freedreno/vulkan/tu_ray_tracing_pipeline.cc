@@ -1506,6 +1506,25 @@ tu_rt_build_shader(struct tu_device *dev,
                                 nir_metadata_none, &c);
 
    tu_rt_prof_mark("pre-inline", b->shader);
+   {
+      uint64_t instrs = 0;
+      nir_foreach_function_impl (impl, b->shader)
+         nir_foreach_block (block, impl)
+            nir_foreach_instr (instr, block)
+               instrs++;
+      static const uint64_t max_instrs =
+         debug_get_num_option("TU_RT_MAX_PREINLINE", 400000);
+      if (instrs > max_instrs) {
+         mesa_loge("tu-rt: pipeline too large to inline (%" PRIu64 " > %" PRIu64
+                   " instrs, %u stages, %u groups)", instrs, max_instrs,
+                   pipeline->stage_count, pipeline->group_count);
+         ralloc_free(c.fn_ctx);
+         free(c.fn_cache);
+         free(c.isec_cache);
+         ralloc_free(b->shader);
+         return NULL;
+      }
+   }
    NIR_PASS(_, b->shader, nir_lower_continue_constructs);
    NIR_PASS(_, b->shader, nir_lower_returns);
    NIR_PASS(_, b->shader, nir_inline_functions);
@@ -1676,6 +1695,12 @@ tu_rt_pipeline_create(struct tu_device *dev,
             goto fail;
          }
          nir = tu_rt_build_shader(dev, pipeline, create_info, flags);
+         if (!nir) {
+            ralloc_free(nir_ctx);
+            tu_rt_prof_end("final-abort");
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto fail;
+         }
          ralloc_steal(pipeline->mem_ctx, nir);
          ralloc_free(nir_ctx);
          memset(pipeline->stages, 0, pipeline->stage_count * sizeof(pipeline->stages[0]));
