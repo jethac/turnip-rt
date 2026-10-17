@@ -13,7 +13,10 @@
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include "util/os_time.h"
+#include "util/blob.h"
+#include "nir/nir_serialize.h"
 #include <pthread.h>
+#include <malloc.h>
 #include "vk_pipeline.h"
 
 #include "tu_device.h"
@@ -280,14 +283,67 @@ tu_rt_lower_hit_attribs(nir_shader *nir)
    return true;
 }
 
+static struct tu_rt_stage_blob *
+tu_rt_blob_from_nir(const nir_shader *nir)
+{
+   struct blob b;
+   blob_init(&b);
+   nir_serialize(&b, nir, false);
+   struct tu_rt_stage_blob *sb = NULL;
+   if (!b.out_of_memory) {
+      sb = (struct tu_rt_stage_blob *) malloc(sizeof(*sb) + b.size);
+      if (sb) {
+         sb->refcnt = 1;
+         sb->size = b.size;
+         memcpy(sb->data, b.data, b.size);
+      }
+   }
+   blob_finish(&b);
+   return sb;
+}
+
+static nir_shader *
+tu_rt_nir_from_blob(struct tu_device *dev, void *mem_ctx,
+                    const struct tu_rt_stage_blob *sb)
+{
+   struct blob_reader r;
+   blob_reader_init(&r, sb->data, sb->size);
+   return nir_deserialize(mem_ctx, ir3_get_compiler_options(dev->compiler), &r);
+}
+
+static void
+tu_rt_stage_set_destroy(void *p)
+{
+   struct tu_rt_stage_set *set = (struct tu_rt_stage_set *) p;
+   for (uint32_t i = 0; i < set->count; i++) {
+      struct tu_rt_stage_blob *sb = set->blobs[i];
+      if (sb && p_atomic_dec_zero(&sb->refcnt))
+         free(sb);
+   }
+}
+
+static struct tu_rt_stage_set *
+tu_rt_stage_set_create(void *mem_ctx, uint32_t count)
+{
+   struct tu_rt_stage_set *set = (struct tu_rt_stage_set *)
+      rzalloc_size(mem_ctx, sizeof(*set) + MAX2(count, 1) * sizeof(set->blobs[0]));
+   if (!set)
+      return NULL;
+   set->count = count;
+   ralloc_set_destructor(set, tu_rt_stage_set_destroy);
+   return set;
+}
+
 static VkResult
 tu_rt_compile_stages(struct tu_device *dev,
                      struct vk_pipeline_cache *cache,
                      struct tu_ray_tracing_pipeline *pipeline,
                      const VkRayTracingPipelineCreateInfoKHR *create_info,
                      VkPipelineCreateFlags2KHR flags,
-                     const struct tu_shader_key *key)
+                     const struct tu_shader_key *key,
+                     void *nir_ctx)
 {
+   struct tu_rt_stage_set *set = pipeline->stage_set;
    const nir_shader_compiler_options *nir_options =
       ir3_get_compiler_options(dev->compiler);
    cache = cache ? cache : dev->mem_cache;
@@ -310,14 +366,18 @@ tu_rt_compile_stages(struct tu_device *dev,
       _mesa_blake3_update(&h, &ir3_debug_key, sizeof(ir3_debug_key));
       _mesa_blake3_final(&h, nir_key);
 
+      void *tmp_ctx = nir_ctx ? NULL : ralloc_context(NULL);
+      void *ctx = nir_ctx ? nir_ctx : tmp_ctx;
       nir_shader *nir = NULL;
       if (can_cache)
          nir = vk_pipeline_cache_lookup_nir(cache, nir_key, sizeof(nir_key),
-                                            nir_options, NULL, pipeline->mem_ctx);
+                                            nir_options, NULL, ctx);
       if (!nir) {
-         nir = tu_spirv_to_nir(dev, pipeline->mem_ctx, flags, stage_info, key, stage);
-         if (!nir)
+         nir = tu_spirv_to_nir(dev, ctx, flags, stage_info, key, stage);
+         if (!nir) {
+            ralloc_free(tmp_ctx);
             return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
 
          NIR_PASS(_, nir, tu_rt_retag_constant_derefs);
          NIR_PASS(_, nir, tu_rt_lower_hit_attribs);
@@ -328,7 +388,15 @@ tu_rt_compile_stages(struct tu_device *dev,
             vk_pipeline_cache_add_nir(cache, nir_key, sizeof(nir_key), nir);
       }
 
-      pipeline->stages[i] = nir;
+      if (set) {
+         set->blobs[i] = tu_rt_blob_from_nir(nir);
+         if (!set->blobs[i]) {
+            ralloc_free(tmp_ctx);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+      }
+      pipeline->stages[i] = nir_ctx ? nir : NULL;
+      ralloc_free(tmp_ctx);
    }
 
    if (!create_info->pLibraryInfo)
@@ -339,9 +407,18 @@ tu_rt_compile_stages(struct tu_device *dev,
                      create_info->pLibraryInfo->pLibraries[l]);
       struct tu_ray_tracing_pipeline *lib =
          tu_pipeline_to_ray_tracing(lib_base);
-      for (uint32_t s = 0; s < lib->stage_count; s++)
-         pipeline->stages[i++] =
-            nir_shader_clone(pipeline->mem_ctx, lib->stages[s]);
+      for (uint32_t s = 0; s < lib->stage_count; s++, i++) {
+         struct tu_rt_stage_blob *sb = lib->stage_set->blobs[s];
+         if (set) {
+            p_atomic_inc(&sb->refcnt);
+            set->blobs[i] = sb;
+         }
+         if (nir_ctx) {
+            pipeline->stages[i] = tu_rt_nir_from_blob(dev, nir_ctx, sb);
+            if (!pipeline->stages[i])
+               return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+      }
    }
 
    return VK_SUCCESS;
@@ -1535,7 +1612,12 @@ tu_rt_pipeline_create(struct tu_device *dev,
    tu_rt_init_groups(dev, pipeline, create_info);
 
    if (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) {
-      result = tu_rt_compile_stages(dev, cache, pipeline, create_info, flags, &key);
+      pipeline->stage_set = tu_rt_stage_set_create(pipeline->mem_ctx, pipeline->stage_count);
+      if (!pipeline->stage_set) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail;
+      }
+      result = tu_rt_compile_stages(dev, cache, pipeline, create_info, flags, &key, NULL);
       if (result != VK_SUCCESS)
          goto fail;
    } else {
@@ -1580,11 +1662,16 @@ tu_rt_pipeline_create(struct tu_device *dev,
             result = VK_PIPELINE_COMPILE_REQUIRED;
             goto fail;
          }
-         result = tu_rt_compile_stages(dev, cache, pipeline, create_info, flags, &key);
-         if (result != VK_SUCCESS)
+         void *nir_ctx = ralloc_context(NULL);
+         result = tu_rt_compile_stages(dev, cache, pipeline, create_info, flags, &key, nir_ctx);
+         if (result != VK_SUCCESS) {
+            ralloc_free(nir_ctx);
             goto fail;
+         }
          nir = tu_rt_build_shader(dev, pipeline, create_info, flags);
          ralloc_steal(pipeline->mem_ctx, nir);
+         ralloc_free(nir_ctx);
+         memset(pipeline->stages, 0, pipeline->stage_count * sizeof(pipeline->stages[0]));
       }
 
       result = tu_compute_pipeline_init_nir(dev, &pipeline->base, layout, cache,
@@ -1595,13 +1682,15 @@ tu_rt_pipeline_create(struct tu_device *dev,
 
    if (debug_get_bool_option("TU_RT_LOG", false)) {
       const struct tu_shader *sh = pipeline->base.base.shaders[MESA_SHADER_COMPUTE];
-      mesa_logi("tu-rt: pipeline %s stages=%u groups=%u lib=%d %.1f ms instrs=%u regs=%u",
+      struct mallinfo2 mi = mallinfo2();
+      mesa_logi("tu-rt: pipeline %s stages=%u groups=%u lib=%d %.1f ms instrs=%u regs=%u heap=%zuM",
                 (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ? "library" : "final",
                 pipeline->stage_count, pipeline->group_count,
                 create_info->pLibraryInfo ? (int) create_info->pLibraryInfo->libraryCount : 0,
                 (os_time_get_nano() - t_start) / 1e6,
                 sh ? sh->variant->info.instrs_count : 0,
-                sh ? sh->variant->info.max_reg + 1 : 0);
+                sh ? sh->variant->info.max_reg + 1 : 0,
+                (mi.uordblks + mi.hblkhd) >> 20);
    }
 
    *out_pipeline = tu_pipeline_to_handle(&pipeline->base.base);

@@ -281,6 +281,17 @@ struct tu_rt_group {
    uint32_t handle;
 };
 
+struct tu_rt_stage_blob {
+   uint32_t refcnt;
+   uint32_t size;
+   uint8_t data[];
+};
+
+struct tu_rt_stage_set {
+   uint32_t count;
+   struct tu_rt_stage_blob *blobs[];
+};
+
 struct tu_ray_tracing_pipeline {
    struct tu_compute_pipeline base;
 
@@ -288,6 +299,7 @@ struct tu_ray_tracing_pipeline {
    uint32_t stage_count;
    uint32_t group_count;
    nir_shader **stages;
+   struct tu_rt_stage_set *stage_set;
    uint8_t *stage_hashes;
    struct tu_rt_group *groups;
 };
