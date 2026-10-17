@@ -87,27 +87,26 @@ emu_per_cluster_scan(nir_builder *b, const struct emu_state *s,
                      nir_intrinsic_instr *intr)
 {
    nir_def *x = intr->src[0].ssa;
-   nir_variable *res = nir_local_variable_create(b->impl,
-                                   glsl_vector_type(x->bit_size == 64 ? GLSL_TYPE_UINT64 :
-                                                    x->bit_size == 16 ? GLSL_TYPE_UINT16 :
-                                                    x->bit_size == 8 ? GLSL_TYPE_UINT8 :
-                                                    x->bit_size == 1 ? GLSL_TYPE_BOOL :
-                                                    GLSL_TYPE_UINT,
-                                                    x->num_components),
-                                   "emu_scan");
+   nir_op op = (nir_op) nir_intrinsic_reduction_op(intr);
+   nir_def *identity =
+      nir_build_imm(b, 1, x->bit_size,
+                    (nir_const_value[]) { nir_alu_binop_identity(op, x->bit_size) });
+   nir_def *ids[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned c = 0; c < x->num_components; c++)
+      ids[c] = identity;
+   nir_def *idv = nir_vec(b, ids, x->num_components);
+
    nir_def *cluster = nir_ushr_imm(b, emu_lane(b), s->log2);
+   nir_def *result = NULL;
    for (unsigned k = 0; k < TU_HW_WAVE / s->size; k++) {
-      nir_push_if(b, nir_ieq_imm(b, cluster, k));
-      nir_intrinsic_instr *scan = nir_intrinsic_instr_create(b->shader, intr->intrinsic);
-      scan->num_components = intr->num_components;
-      scan->src[0] = nir_src_for_ssa(x);
-      nir_intrinsic_set_reduction_op(scan, nir_intrinsic_reduction_op(intr));
-      nir_def_init(&scan->instr, &scan->def, intr->def.num_components, intr->def.bit_size);
-      nir_builder_instr_insert(b, &scan->instr);
-      nir_store_var(b, res, &scan->def, nir_component_mask(x->num_components));
-      nir_pop_if(b, NULL);
+      nir_def *in_k = nir_ieq_imm(b, cluster, k);
+      nir_def *xk = nir_bcsel(b, in_k, x, idv);
+      nir_def *scan = intr->intrinsic == nir_intrinsic_inclusive_scan
+                         ? nir_inclusive_scan(b, xk, .reduction_op = op)
+                         : nir_exclusive_scan(b, xk, .reduction_op = op);
+      result = result ? nir_bcsel(b, in_k, scan, result) : scan;
    }
-   return nir_load_var(b, res);
+   return result;
 }
 
 static bool
