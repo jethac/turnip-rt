@@ -620,6 +620,25 @@ tu_rt_call_stage(nir_builder *b, struct tu_rt_compiler *c, nir_shader *stage,
    nir_build_call(b, function, 1, &arg);
 }
 
+static bool
+tu_rt_handle_seen(struct tu_rt_compiler *c, uint32_t upto, uint32_t handle,
+                  uint32_t mask_kind)
+{
+   for (uint32_t j = 0; j < upto; j++) {
+      const struct tu_rt_group *g = c->pipeline->groups + j;
+      if (g->handle != handle)
+         continue;
+      if (mask_kind == 0 && g->recursive_index != VK_SHADER_UNUSED_KHR)
+         return true;
+      if (mask_kind == 1 && g->ahit_index != VK_SHADER_UNUSED_KHR &&
+          g->isec_index == VK_SHADER_UNUSED_KHR)
+         return true;
+      if (mask_kind == 2 && g->isec_index != VK_SHADER_UNUSED_KHR)
+         return true;
+   }
+   return false;
+}
+
 static nir_shader *
 tu_rt_group_stage(struct tu_rt_compiler *c, uint32_t index)
 {
@@ -634,7 +653,8 @@ tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
    for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
       struct tu_rt_group *group = c->pipeline->groups + i;
       nir_shader *stage = tu_rt_group_stage(c, group->recursive_index);
-      if (!stage || stage->info.stage != want)
+      if (!stage || stage->info.stage != want ||
+          tu_rt_handle_seen(c, i, group->handle, 0))
          continue;
       nir_push_if(b, nir_ieq_imm(b, handle, group->handle));
       tu_rt_call_stage(b, c, stage, arg, ray_depth, call_depth);
@@ -747,11 +767,6 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
    nir_def *payload = instr->src[10].ssa;
    const unsigned cd = tu_rt_ctx(c, b->impl->function)->call_depth;
 
-   if (c->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR)
-      flags = nir_ior_imm(b, flags, SpvRayFlagsSkipTrianglesKHRMask);
-   if (c->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR)
-      flags = nir_ior_imm(b, flags, SpvRayFlagsSkipAABBsKHRMask);
-
    nir_store_var(b, s->flags, flags, 0x1);
    nir_store_var(b, s->cull_mask, cull_mask, 0x1);
    nir_store_var(b, s->sbt_offset, sbt_offset, 0x1);
@@ -772,8 +787,19 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
 
    nir_def *rq_flags =
       nir_iand_imm(b, flags, ~SpvRayFlagsSkipClosestHitShaderKHRMask);
-   if (!c->has_isec)
+   if (c->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR) {
+      rq_flags = nir_ior_imm(b, nir_iand_imm(b, rq_flags,
+                                             ~(SpvRayFlagsCullBackFacingTrianglesKHRMask |
+                                               SpvRayFlagsCullFrontFacingTrianglesKHRMask)),
+                             SpvRayFlagsSkipTrianglesKHRMask);
+   }
+   if (c->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR)
       rq_flags = nir_ior_imm(b, rq_flags, SpvRayFlagsSkipAABBsKHRMask);
+   if (!c->has_isec) {
+      rq_flags = nir_bcsel(b, nir_test_mask(b, rq_flags, SpvRayFlagsSkipTrianglesKHRMask),
+                           rq_flags,
+                           nir_ior_imm(b, rq_flags, SpvRayFlagsSkipAABBsKHRMask));
+   }
    if (!c->has_ahit) {
       nir_def *forced =
          nir_ior_imm(b, nir_iand_imm(b, rq_flags, ~SpvRayFlagsNoOpaqueKHRMask),
@@ -820,7 +846,8 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
 
          for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
             nir_shader *ahit = tu_rt_group_stage(c, c->pipeline->groups[i].ahit_index);
-            if (!ahit || c->pipeline->groups[i].isec_index != VK_SHADER_UNUSED_KHR)
+            if (!ahit || c->pipeline->groups[i].isec_index != VK_SHADER_UNUSED_KHR ||
+                tu_rt_handle_seen(c, i, c->pipeline->groups[i].handle, 1))
                continue;
             nir_push_if(b, nir_ieq_imm(b, entry.value, c->pipeline->groups[i].handle));
             tu_rt_call_stage(b, c, ahit, payload, 1, cd);
@@ -868,7 +895,8 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
                        0x1);
 
          for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
-            if (c->pipeline->groups[i].isec_index == VK_SHADER_UNUSED_KHR)
+            if (c->pipeline->groups[i].isec_index == VK_SHADER_UNUSED_KHR ||
+                tu_rt_handle_seen(c, i, c->pipeline->groups[i].handle, 2))
                continue;
             nir_push_if(b, nir_ieq_imm(b, entry.value, c->pipeline->groups[i].handle));
             nir_build_call(b, tu_rt_get_isec_function(b, c, i, cd), 1, &payload);
