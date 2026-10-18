@@ -103,6 +103,14 @@ tu_descriptor_set_layout_destroy(struct vk_device *vk_dev,
    vk_descriptor_set_layout_destroy(vk_dev, vk_layout);
 }
 
+bool
+tu_push_ubo_speculate(void)
+{
+   static const bool enabled =
+      debug_get_bool_option("TU_PUSH_UBO_SPECULATE", false);
+   return enabled;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateDescriptorSetLayout(
    VkDevice _device,
@@ -196,14 +204,20 @@ tu_CreateDescriptorSetLayout(
       set_layout->binding[b].offset = set_layout->size;
       set_layout->binding[b].dynamic_offset_offset = dynamic_offset_size;
       set_layout->binding[b].shader_stages = binding->stageFlags;
+      bool push_ubo =
+         tu_push_ubo_speculate() &&
+         (pCreateInfo->flags &
+          VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) &&
+         binding->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
       set_layout->binding[b].partially_bound =
          /* Descriptor buffer implies PARTIALLY_BOUND. From a NOTE in the
           * spec: "The requirements above imply that all descriptor bindings
           * have been defined with the equivalent of ...
           * VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT"
           */
-         (pCreateInfo->flags &
-          VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) ||
+         ((pCreateInfo->flags &
+           VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) &&
+          !push_ubo) ||
          (variable_flags && j < variable_flags->bindingCount &&
           (variable_flags->pBindingFlags[j] &
            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT));

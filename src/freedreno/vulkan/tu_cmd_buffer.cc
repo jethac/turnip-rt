@@ -5214,6 +5214,8 @@ tu_push_descriptor_set_update_layout(struct tu_device *device,
       set->mapped_ptr = static_cast<uint32_t *>(new_buf);
       set->host_size = layout->size;
    }
+   if (tu_push_ubo_speculate())
+      memset(set->mapped_ptr, 0, layout->size);
    return VK_SUCCESS;
 }
 

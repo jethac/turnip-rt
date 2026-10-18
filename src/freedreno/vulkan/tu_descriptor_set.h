@@ -121,6 +121,8 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(tu_pipeline_layout, base, VkPipelineLayout,
 
 void tu_pipeline_layout_init(struct tu_pipeline_layout *layout);
 
+bool tu_push_ubo_speculate(void);
+
 struct tu_descriptor_set
 {
    struct vk_object_base base;
