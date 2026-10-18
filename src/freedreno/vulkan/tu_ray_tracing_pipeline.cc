@@ -746,6 +746,79 @@ tu_rt_payload_compatible(nir_shader *stage, nir_def *arg)
    return true;
 }
 
+struct tu_rt_case {
+   uint32_t handle;
+   uint32_t group;
+};
+
+static int
+tu_rt_case_cmp(const void *a, const void *b)
+{
+   uint32_t ha = ((const struct tu_rt_case *) a)->handle;
+   uint32_t hb = ((const struct tu_rt_case *) b)->handle;
+   return ha < hb ? -1 : (ha > hb ? 1 : 0);
+}
+
+static bool
+tu_rt_use_case_tree(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("TU_RT_BST", true);
+   return enabled;
+}
+
+template <typename F>
+static void
+tu_rt_emit_case_chain(nir_builder *b, nir_def *handle, const struct tu_rt_case *cases,
+                      unsigned count, F &emit)
+{
+   for (unsigned i = 0; i < count; i++) {
+      nir_push_if(b, nir_ieq_imm(b, handle, cases[i].handle));
+      emit(cases[i]);
+      if (i + 1 < count)
+         nir_push_else(b, NULL);
+   }
+   for (unsigned i = 0; i < count; i++)
+      nir_pop_if(b, NULL);
+}
+
+template <typename F>
+static void
+tu_rt_emit_case_tree(nir_builder *b, nir_def *handle, const struct tu_rt_case *cases,
+                     unsigned count, F &emit)
+{
+   if (count <= 3) {
+      tu_rt_emit_case_chain(b, handle, cases, count, emit);
+      return;
+   }
+   unsigned mid = count / 2;
+   nir_push_if(b, nir_ult(b, handle, nir_imm_int(b, cases[mid].handle)));
+   tu_rt_emit_case_tree(b, handle, cases, mid, emit);
+   nir_push_else(b, NULL);
+   tu_rt_emit_case_tree(b, handle, cases + mid, count - mid, emit);
+   nir_pop_if(b, NULL);
+}
+
+template <typename F>
+static void
+tu_rt_emit_cases(nir_builder *b, nir_def *handle, struct tu_rt_case *cases,
+                 unsigned count, F &&emit)
+{
+   if (!count)
+      return;
+   if (!tu_rt_use_case_tree()) {
+      for (unsigned i = 0; i < count; i++) {
+         nir_push_if(b, nir_ieq_imm(b, handle, cases[i].handle));
+         emit(cases[i]);
+         nir_pop_if(b, NULL);
+      }
+      return;
+   }
+   qsort(cases, count, sizeof(*cases), tu_rt_case_cmp);
+   tu_rt_emit_case_tree(b, handle, cases, count, emit);
+}
+
 static void
 tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
                          nir_def *handle, mesa_shader_stage want, nir_def *arg,
@@ -753,6 +826,9 @@ tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
 {
    if (c->nohit && want == MESA_SHADER_CLOSEST_HIT)
       return;
+   struct tu_rt_case *cases =
+      (struct tu_rt_case *) malloc(sizeof(struct tu_rt_case) * MAX2(c->pipeline->group_count, 1));
+   unsigned count = 0;
    for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
       if (want == MESA_SHADER_RAYGEN && c->only_raygen >= 0 &&
           i != (uint32_t) c->only_raygen)
@@ -763,10 +839,13 @@ tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
           tu_rt_handle_seen(c, i, group->handle, 0) ||
           !tu_rt_payload_compatible(stage, arg))
          continue;
-      nir_push_if(b, nir_ieq_imm(b, handle, group->handle));
-      tu_rt_call_stage(b, c, stage, arg, ray_depth, call_depth);
-      nir_pop_if(b, NULL);
+      cases[count++] = (struct tu_rt_case) { group->handle, i };
    }
+   tu_rt_emit_cases(b, handle, cases, count, [&](const struct tu_rt_case &cs) {
+      nir_shader *stage = tu_rt_group_stage(c, c->pipeline->groups[cs.group].recursive_index);
+      tu_rt_call_stage(b, c, stage, arg, ray_depth, call_depth);
+   });
+   free(cases);
 }
 
 static void
@@ -951,15 +1030,23 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
          nir_store_var(b, s->hit_kind, tu_rt_triangle_hit_kind(b, rq, false), 0x1);
          tu_rt_store_bary(b, c, rq, false);
 
-         for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
-            nir_shader *ahit = tu_rt_group_stage(c, c->pipeline->groups[i].ahit_index);
-            if (!ahit || c->pipeline->groups[i].isec_index != VK_SHADER_UNUSED_KHR ||
-                tu_rt_handle_seen(c, i, c->pipeline->groups[i].handle, 1) ||
-                !tu_rt_payload_compatible(ahit, payload))
-               continue;
-            nir_push_if(b, nir_ieq_imm(b, entry.value, c->pipeline->groups[i].handle));
-            tu_rt_call_stage(b, c, ahit, payload, 1, cd);
-            nir_pop_if(b, NULL);
+         {
+            struct tu_rt_case *cases = (struct tu_rt_case *)
+               malloc(sizeof(struct tu_rt_case) * MAX2(c->pipeline->group_count, 1));
+            unsigned count = 0;
+            for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
+               nir_shader *ahit = tu_rt_group_stage(c, c->pipeline->groups[i].ahit_index);
+               if (!ahit || c->pipeline->groups[i].isec_index != VK_SHADER_UNUSED_KHR ||
+                   tu_rt_handle_seen(c, i, c->pipeline->groups[i].handle, 1) ||
+                   !tu_rt_payload_compatible(ahit, payload))
+                  continue;
+               cases[count++] = (struct tu_rt_case) { c->pipeline->groups[i].handle, i };
+            }
+            tu_rt_emit_cases(b, entry.value, cases, count, [&](const struct tu_rt_case &cs) {
+               nir_shader *ahit = tu_rt_group_stage(c, c->pipeline->groups[cs.group].ahit_index);
+               tu_rt_call_stage(b, c, ahit, payload, 1, cd);
+            });
+            free(cases);
          }
 
          nir_push_if(b, nir_load_var(b, s->accept));
@@ -1003,13 +1090,20 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
                                    .committed = true),
                        0x1);
 
-         for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
-            if (c->pipeline->groups[i].isec_index == VK_SHADER_UNUSED_KHR ||
-                tu_rt_handle_seen(c, i, c->pipeline->groups[i].handle, 2))
-               continue;
-            nir_push_if(b, nir_ieq_imm(b, entry.value, c->pipeline->groups[i].handle));
-            nir_build_call(b, tu_rt_get_isec_function(b, c, i, cd), 1, &payload);
-            nir_pop_if(b, NULL);
+         {
+            struct tu_rt_case *cases = (struct tu_rt_case *)
+               malloc(sizeof(struct tu_rt_case) * MAX2(c->pipeline->group_count, 1));
+            unsigned count = 0;
+            for (uint32_t i = 0; i < c->pipeline->group_count; i++) {
+               if (c->pipeline->groups[i].isec_index == VK_SHADER_UNUSED_KHR ||
+                   tu_rt_handle_seen(c, i, c->pipeline->groups[i].handle, 2))
+                  continue;
+               cases[count++] = (struct tu_rt_case) { c->pipeline->groups[i].handle, i };
+            }
+            tu_rt_emit_cases(b, entry.value, cases, count, [&](const struct tu_rt_case &cs) {
+               nir_build_call(b, tu_rt_get_isec_function(b, c, cs.group, cd), 1, &payload);
+            });
+            free(cases);
          }
 
          nir_push_if(b, nir_load_var(b, s->accept));
@@ -1981,6 +2075,17 @@ tu_rt_pipeline_create(struct tu_device *dev,
                 sh ? sh->variant->info.instrs_count : 0,
                 sh ? sh->variant->info.max_reg + 1 : 0,
                 (mi.uordblks + mi.hblkhd) >> 20);
+      uint32_t logged = pipeline->variants ? pipeline->variant_count : (sh ? 1 : 0);
+      for (uint32_t v = 0; v < logged; v++) {
+         const struct ir3_shader_variant *iv =
+            pipeline->variants ? pipeline->variants[v].shader->variant : sh->variant;
+         mesa_logi("tu-rt: variant %u/%u handle=0x%x blake3=%s instrs=%u nops=%u regs=%u half=%d "
+                   "stp=%u ldp=%u loops=%u waves=%d wave%u",
+                   v, logged, pipeline->variants ? pipeline->variants[v].handle : 0, iv->blake3_str,
+                   iv->info.instrs_count, iv->info.nops_count, iv->info.max_reg + 1,
+                   iv->info.max_half_reg + 1, iv->info.stp_count, iv->info.ldp_count,
+                   iv->info.loops, iv->info.max_waves, iv->info.double_threadsize ? 128 : 64);
+      }
    }
 
    *out_pipeline = tu_pipeline_to_handle(&pipeline->base.base);
