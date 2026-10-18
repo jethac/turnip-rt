@@ -8,6 +8,8 @@
  */
 
 #include "tu_foveate.h"
+#include "util/os_time.h"
+#include <atomic>
 #include "tu_cmd_buffer.h"
 
 #include "vk_common_entrypoints.h"
@@ -10135,6 +10137,29 @@ tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
    if (!pipeline || !pipeline->shaders[MESA_SHADER_COMPUTE])
       return;
 
+   static const bool rt_skip = debug_get_bool_option("TU_RT_SKIP", false);
+   static const bool rt_stats = debug_get_bool_option("TU_RT_STATS", false);
+   if (rt_stats) {
+      static std::atomic<uint64_t> n_disp, n_rays, n_indirect;
+      static std::atomic<int64_t> last;
+      n_disp++;
+      if (dims)
+         n_rays += (uint64_t) dims[0] * dims[1] * dims[2];
+      else
+         n_indirect++;
+      int64_t now = os_time_get_nano(), prev = last.load();
+      if (now - prev > 2000000000ll && last.compare_exchange_strong(prev, now) && prev) {
+         double s = (now - prev) / 1e9;
+         mesa_logi("tu-rt-stats: %.1f dispatch/s %.2f Mray-launch/s (%.0f indirect/s) last %ux%ux%u variants=%u stages=%u",
+                   n_disp.exchange(0) / s, n_rays.exchange(0) / s / 1e6, n_indirect.exchange(0) / s,
+                   dims ? dims[0] : 0, dims ? dims[1] : 0, dims ? dims[2] : 0,
+                   tu_pipeline_to_ray_tracing(pipeline)->variant_count,
+                   tu_pipeline_to_ray_tracing(pipeline)->stage_count);
+      }
+   }
+   if (rt_skip)
+      return;
+
    struct tu_cs *cs = &cmd->cs;
    struct tu_dispatch_info info = {};
    info.rt_cmd = rt_cmd_iova;
@@ -10188,10 +10213,36 @@ tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
    cmd->descriptors[TU_BIND_POINT_RT] = tmp;
    cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
 
-   if (rtp->variant_count > 1 && raygen_iova && CHIP >= A7XX) {
+   if (rtp->variant_count > 1 && CHIP >= A7XX) {
       tu_emit_cache_flush<CHIP>(cmd);
-      cs->mem_to_reg(tu_scratch_reg<CHIP>(TU_RT_RAYGEN_SCRATCH), raygen_iova,
-                     { .one_reg_wr = true, .wait_cache_flush = true });
+      if (raygen_iova) {
+         cs->mem_to_reg(tu_scratch_reg<CHIP>(TU_RT_RAYGEN_SCRATCH), raygen_iova,
+                        { .one_reg_wr = true, .wait_cache_flush = true });
+      } else {
+         struct tu_cs_memory patch;
+         tu_cs_set_writeable(&cmd->sub_cs, true);
+         VkResult r = tu_cs_alloc(&cmd->sub_cs, 1, 4, &patch);
+         tu_cs_set_writeable(&cmd->sub_cs, false);
+         if (r != VK_SUCCESS) {
+            vk_command_buffer_set_error(&cmd->vk, r);
+            return;
+         }
+         patch.map[0] = pm4_pkt7_hdr(CP_MEM_TO_REG, 3);
+         patch.map[1] = CP_MEM_TO_REG_0_REG(tu_scratch_reg<CHIP>(TU_RT_RAYGEN_SCRATCH).reg) |
+                        CP_MEM_TO_REG_0_ONE_REG_WR;
+         patch.map[2] = 0;
+         patch.map[3] = 0;
+         tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
+         tu_cs_emit(cs, CP_MEM_TO_MEM_0_DOUBLE);
+         tu_cs_emit_qw(cs, patch.iova + 2 * sizeof(uint32_t));
+         tu_cs_emit_qw(cs, rt_cmd_iova +
+                           offsetof(VkTraceRaysIndirectCommand2KHR, raygenShaderRecordAddress));
+         tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+         tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+         tu_cs_emit_pkt7(cs, CP_INDIRECT_BUFFER, 3);
+         tu_cs_emit_qw(cs, patch.iova);
+         tu_cs_emit(cs, 4);
+      }
       tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
       for (uint32_t v = 0; v < rtp->variant_count; v++) {
          struct tu_shader *vs = rtp->variants[v].shader;
