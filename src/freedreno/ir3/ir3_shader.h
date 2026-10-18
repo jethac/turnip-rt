@@ -640,6 +640,8 @@ struct ir3_shader_options {
     * anywhere (e.g., as the target of alias.rt).
     */
    bool fragdata_dynamic_remap;
+
+   bool no_early_preamble;
 };
 
 struct ir3_shader_output {

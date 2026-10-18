@@ -133,6 +133,9 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
       debug_get_bool_option("TU_PUSH_UBO_SPECULATE", false),
    };
    _mesa_blake3_update(&ctx, env_flags, sizeof(env_flags));
+   const uint64_t cs_constlen_cap =
+      (uint64_t) debug_get_num_option("TU_CS_CONSTLEN_CAP", 0);
+   _mesa_blake3_update(&ctx, &cs_constlen_cap, sizeof(cs_constlen_cap));
    const uint64_t rt_budgets[] = {
       (uint64_t) debug_get_num_option("TU_RT_HIT_BUDGET", 250000),
       (uint64_t) debug_get_num_option("TU_RT_MAX_PREINLINE", 400000),
@@ -3062,6 +3065,11 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       };
       device->compiler = ir3_compiler_create(
          NULL, &physical_device->dev_id, physical_device->info, &ir3_options);
+      unsigned cs_constlen_cap =
+         debug_get_num_option("TU_CS_CONSTLEN_CAP", 0);
+      if (device->compiler && cs_constlen_cap)
+         device->compiler->max_const_compute =
+            MIN2(device->compiler->max_const_compute, cs_constlen_cap);
    }
    if (!device->compiler) {
       result = vk_startup_errorf(physical_device->instance,

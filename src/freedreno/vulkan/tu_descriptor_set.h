@@ -123,6 +123,9 @@ void tu_pipeline_layout_init(struct tu_pipeline_layout *layout);
 
 bool tu_push_ubo_speculate(void);
 
+bool tu_push_ubo_exempt(const struct tu_descriptor_set_layout *layout,
+                        unsigned binding);
+
 struct tu_descriptor_set
 {
    struct vk_object_base base;

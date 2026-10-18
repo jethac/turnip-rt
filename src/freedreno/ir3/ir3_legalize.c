@@ -2564,7 +2564,7 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary,
    }
 
    so->early_preamble = can_speculate_preamble && has_preamble && !gpr_in_preamble &&
-      !pred_in_preamble &&
+      !pred_in_preamble && !so->shader_options.no_early_preamble &&
       ir->compiler->info->props.has_early_preamble &&
       !(ir3_shader_debug & IR3_DBG_NOEARLYPREAMBLE);
 

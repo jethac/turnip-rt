@@ -1312,6 +1312,7 @@ struct lower_instr_params {
    const struct tu_pipeline_layout *layout;
    uint32_t read_only_input_attachments;
    bool dynamic_renderpass;
+   bool ray_tracing;
    struct ir3_const_allocations *const_allocs;
 };
 
@@ -1447,9 +1448,11 @@ lower_inline_ubo(nir_builder *b, nir_intrinsic_instr *intrin, void *cb_data)
 static bool
 can_speculate_resource(nir_def *def,
                        const struct tu_pipeline_layout *layout,
-                       bool *can_speculate_descriptor)
+                       bool *can_speculate_descriptor,
+                       bool *push_ubo_exempt)
 {
    *can_speculate_descriptor = false;
+   *push_ubo_exempt = false;
 
    /* We're looking for a pattern like this:
     *
@@ -1489,15 +1492,18 @@ can_speculate_resource(nir_def *def,
    *can_speculate_descriptor =
       can_speculate_descriptor_load(resource_intr->src[0], set_layout,
                                     binding);
+   *push_ubo_exempt = tu_push_ubo_exempt(set_layout, binding);
 
    return *can_speculate_descriptor && !bind_layout->partially_bound;
 }
 
 static bool
-set_speculate_intrinsic(nir_intrinsic_instr *intrin,
-                        const struct tu_pipeline_layout *layout)
+set_speculate_intrinsic(nir_intrinsic_instr *intrin, mesa_shader_stage stage,
+                        struct lower_instr_params *params)
 {
+   const struct tu_pipeline_layout *layout = params->layout;
    bool can_speculate = false, can_speculate_descriptor = false;
+   bool push_ubo_exempt = false;
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_load_ssbo:
@@ -1506,16 +1512,29 @@ set_speculate_intrinsic(nir_intrinsic_instr *intrin,
    case nir_intrinsic_ssbo_atomic_swap:
    case nir_intrinsic_get_ssbo_size:
       can_speculate = can_speculate_resource(intrin->src[0].ssa, layout,
-                                             &can_speculate_descriptor);
+                                             &can_speculate_descriptor,
+                                             &push_ubo_exempt);
       break;
 
    case nir_intrinsic_store_ssbo:
       can_speculate = can_speculate_resource(intrin->src[1].ssa, layout,
-                                             &can_speculate_descriptor);
+                                             &can_speculate_descriptor,
+                                             &push_ubo_exempt);
       break;
 
    default:
       return false;
+   }
+
+   if (push_ubo_exempt && can_speculate) {
+      if (stage != MESA_SHADER_COMPUTE || params->ray_tracing ||
+          intrin->intrinsic != nir_intrinsic_load_ubo) {
+         can_speculate = false;
+      } else {
+         if (!nir_src_is_const(intrin->src[1]))
+            nir_intrinsic_set_range(intrin, ~0);
+         params->shader->push_ubo_speculated = true;
+      }
    }
 
    if ((intrin->intrinsic == nir_intrinsic_load_ubo ||
@@ -1542,7 +1561,7 @@ set_speculate_instr(nir_builder *b, nir_instr *instr, void *cb_data)
    struct lower_instr_params *params = static_cast<struct lower_instr_params *>(cb_data);
    if (instr->type == nir_instr_type_intrinsic) {
       return set_speculate_intrinsic(nir_instr_as_intrinsic(instr),
-                                     params->layout);
+                                     b->shader->info.stage, params);
    }
 
    return false;
@@ -1790,6 +1809,7 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
       .layout = layout,
       .read_only_input_attachments = read_only_input_attachments,
       .dynamic_renderpass = dynamic_renderpass,
+      .ray_tracing = ray_tracing,
       .const_allocs = const_allocs,
    };
 
@@ -3895,6 +3915,7 @@ tu_shader_create(struct tu_device *dev,
       .push_consts_dwords = shader->const_state.push_consts.dwords,
       .const_allocs = const_allocs,
       .nir_options = nir_options,
+      .no_early_preamble = shader->push_ubo_speculated,
    };
 
    static const char *ir3_dump_dir = os_get_option("TU_IR3_DUMP");

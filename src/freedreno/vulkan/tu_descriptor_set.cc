@@ -111,6 +111,18 @@ tu_push_ubo_speculate(void)
    return enabled;
 }
 
+bool
+tu_push_ubo_exempt(const struct tu_descriptor_set_layout *layout,
+                   unsigned binding)
+{
+   return tu_push_ubo_speculate() &&
+          (layout->flags &
+           VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) &&
+          (layout->flags &
+           VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT) &&
+          layout->binding[binding].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateDescriptorSetLayout(
    VkDevice _device,
