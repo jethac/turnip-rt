@@ -1498,9 +1498,21 @@ can_speculate_resource(nir_def *def,
 }
 
 static bool
-set_speculate_intrinsic(nir_intrinsic_instr *intrin, mesa_shader_stage stage,
+tu_push_ubo_src_allowed(const nir_shader *nir)
+{
+   static const char *list = os_get_option("TU_PUSH_UBO_SPECULATE_SRC");
+   if (!list || !*list)
+      return true;
+   char hex[9];
+   snprintf(hex, sizeof(hex), "%08x", nir->info.source_blake3[0]);
+   return strstr(list, hex) != NULL;
+}
+
+static bool
+set_speculate_intrinsic(nir_intrinsic_instr *intrin, const nir_shader *nir,
                         struct lower_instr_params *params)
 {
+   mesa_shader_stage stage = nir->info.stage;
    const struct tu_pipeline_layout *layout = params->layout;
    bool can_speculate = false, can_speculate_descriptor = false;
    bool push_ubo_exempt = false;
@@ -1528,7 +1540,8 @@ set_speculate_intrinsic(nir_intrinsic_instr *intrin, mesa_shader_stage stage,
 
    if (push_ubo_exempt && can_speculate) {
       if (stage != MESA_SHADER_COMPUTE || params->ray_tracing ||
-          intrin->intrinsic != nir_intrinsic_load_ubo) {
+          intrin->intrinsic != nir_intrinsic_load_ubo ||
+          !tu_push_ubo_src_allowed(nir)) {
          can_speculate = false;
       } else {
          if (!nir_src_is_const(intrin->src[1]))
@@ -1561,7 +1574,7 @@ set_speculate_instr(nir_builder *b, nir_instr *instr, void *cb_data)
    struct lower_instr_params *params = static_cast<struct lower_instr_params *>(cb_data);
    if (instr->type == nir_instr_type_intrinsic) {
       return set_speculate_intrinsic(nir_instr_as_intrinsic(instr),
-                                     b->shader->info.stage, params);
+                                     b->shader, params);
    }
 
    return false;
@@ -3930,11 +3943,25 @@ tu_shader_create(struct tu_device *dev,
          ir3_replay_dump(ir3_dump_dir, dev->compiler, nir, &options, ir3_key);
    }
 
+   uint32_t src_hash[2] = { nir->info.source_blake3[0],
+                            nir->info.source_blake3[1] };
+   mesa_shader_stage src_stage = nir->info.stage;
+
    struct ir3_shader *ir3_shader =
       ir3_shader_from_nir(dev->compiler, nir, &options);
 
    shader->variant =
       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
+
+   static const bool log_hashes =
+      debug_get_bool_option("TU_LOG_SHADER_HASHES", false);
+   if (log_hashes && shader->variant)
+      mesa_logi("tu-hash: %s src=%08x%08x bin=%.12s instrs=%u constlen=%u "
+                "push_ubo=%d",
+                mesa_shader_stage_name(src_stage), src_hash[0], src_hash[1],
+                shader->variant->blake3_str,
+                shader->variant->info.instrs_count,
+                shader->variant->constlen, shader->push_ubo_speculated);
 
    if (ir3_exceeds_safe_constlen(shader->variant)) {
       struct ir3_shader_key safe_constlen_key = *ir3_key;
