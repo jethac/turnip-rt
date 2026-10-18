@@ -506,7 +506,8 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* Vulkan 1.1 */
    features->storageBuffer16BitAccess            = pdevice->info->props.storage_16bit;
-   features->uniformAndStorageBuffer16BitAccess  = false;
+   features->uniformAndStorageBuffer16BitAccess  = pdevice->info->props.storage_16bit &&
+      debug_get_bool_option("TU_UBO_16BIT", true);
    features->storagePushConstant16               = false;
    features->storageInputOutput16                = false;
    features->multiview                           = true;

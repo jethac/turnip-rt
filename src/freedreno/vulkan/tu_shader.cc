@@ -182,12 +182,31 @@ tu_nir_lower_softfloat32(struct tu_device *dev, nir_shader *nir)
    ir3_optimize_loop(dev->compiler, &optimize_options, nir);
 }
 
+static bool
+tu_is_f64_to_f16(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   switch (alu->op) {
+   case nir_op_f2f16:
+   case nir_op_f2f16_rtne:
+   case nir_op_f2f16_rtz:
+      return nir_src_bit_size(alu->src[0].src) == 64;
+   case nir_op_f2f64:
+      return nir_src_bit_size(alu->src[0].src) == 16;
+   default:
+      return false;
+   }
+}
+
 static void
 tu_nir_lower_softfloat64(struct tu_device *dev, nir_shader *nir)
 {
    tu_init_softfloat64(dev);
 
    NIR_PASS(_, nir, nir_lower_frexp);
+   NIR_PASS(_, nir, nir_lower_alu_to_scalar, tu_is_f64_to_f16, NULL);
    NIR_PASS(_, nir, nir_lower_fp16_casts, nir_lower_fp16_split_fp64);
    NIR_PASS(_, nir, nir_lower_doubles, dev->float64_shader,
             (nir_lower_doubles_options) ~0);

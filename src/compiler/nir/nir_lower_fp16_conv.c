@@ -287,7 +287,10 @@ lower_fp16_cast_impl(nir_builder *b, nir_instr *instr, void *data)
    bool progress = false;
    if (src->ssa->bit_size == 64 && (options & nir_lower_fp16_split_fp64)) {
       b->cursor = nir_before_instr(instr);
-      nir_src_rewrite(src, split_f2f16_conversion(b, src->ssa, mode));
+      nir_def *parts[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned i = 0; i < src->ssa->num_components; i++)
+         parts[i] = split_f2f16_conversion(b, nir_channel(b, src->ssa, i), mode);
+      nir_src_rewrite(src, nir_vec(b, parts, src->ssa->num_components));
       if (instr->type == nir_instr_type_intrinsic)
          nir_intrinsic_set_src_type(nir_instr_as_intrinsic(instr), nir_type_float32);
       progress = true;
