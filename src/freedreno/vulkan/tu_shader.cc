@@ -187,8 +187,11 @@ tu_nir_lower_softfloat64(struct tu_device *dev, nir_shader *nir)
 {
    tu_init_softfloat64(dev);
 
+   NIR_PASS(_, nir, nir_lower_frexp);
+   NIR_PASS(_, nir, nir_lower_fp16_casts, nir_lower_fp16_split_fp64);
    NIR_PASS(_, nir, nir_lower_doubles, dev->float64_shader,
-            nir_lower_fp64_full_software);
+            (nir_lower_doubles_options) ~0);
+   NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
 
    /* Cleanup the result before linking to minimize shader size. */
    struct ir3_optimize_options optimize_options = {};
