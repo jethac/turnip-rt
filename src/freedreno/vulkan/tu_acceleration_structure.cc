@@ -127,6 +127,25 @@ tu_morton_sort_kvs_per_thread(void)
    return value;
 }
 
+static uint32_t
+tu_as_subgroup_size(const struct tu_physical_device *pdev)
+{
+   static int value = -1;
+   if (value < 0)
+      value = debug_get_num_option("TU_AS_SUBGROUP", pdev->info->threadsize_base);
+   uint32_t max = pdev->info->threadsize_base * (pdev->expose_double_threadsize ? 2 : 1);
+   return CLAMP(util_next_power_of_two((uint32_t) value), (uint32_t) pdev->info->threadsize_base, max);
+}
+
+static bool
+tu_as_use_hploc(void)
+{
+   static int value = -1;
+   if (value < 0)
+      value = debug_get_bool_option("TU_AS_HPLOC", true);
+   return value;
+}
+
 struct bvh_layout {
    uint64_t leaf_map_offset;
    uint64_t bvh_offset;
@@ -230,6 +249,13 @@ static void
 tu_get_build_config(VkDevice device,
                     struct vk_acceleration_structure_build_state *state)
 {
+   VK_FROM_HANDLE(tu_device, dev, device);
+   if (tu_as_use_hploc() && tu_as_subgroup_size(dev->physical_device) <= 64 &&
+       state->config.internal_type == VK_INTERNAL_BUILD_TYPE_PLOC) {
+      state->config.internal_type = VK_INTERNAL_BUILD_TYPE_HPLOC;
+      state->config.u64_keys = true;
+   }
+
    static int log_builds = -1;
    if (log_builds < 0)
       log_builds = debug_get_bool_option("TU_AS_LOG", false);
@@ -546,8 +572,7 @@ tu_CmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t inf
    tu_save_compute_state(cmd, &state);
 
    struct vk_acceleration_structure_build_args args = {
-      .subgroup_size = device->physical_device->info->threadsize_base *
-                       (device->physical_device->expose_double_threadsize ? 2 : 1),
+      .subgroup_size = tu_as_subgroup_size(device->physical_device),
       .bvh_bounds_offset = offsetof(tu_accel_struct_header, aabb),
       .morton_sort_workgroup_size = tu_morton_sort_workgroup_size(),
       .morton_sort_kvs_per_thread = tu_morton_sort_kvs_per_thread(),
@@ -701,8 +726,7 @@ tu_GetAccelerationStructureBuildSizesKHR(VkDevice _device, VkAccelerationStructu
    VK_FROM_HANDLE(tu_device, device, _device);
 
    struct vk_acceleration_structure_build_args args = {
-      .subgroup_size = device->physical_device->info->threadsize_base *
-                       (device->physical_device->expose_double_threadsize ? 2 : 1),
+      .subgroup_size = tu_as_subgroup_size(device->physical_device),
       .morton_sort_workgroup_size = tu_morton_sort_workgroup_size(),
       .morton_sort_kvs_per_thread = tu_morton_sort_kvs_per_thread(),
       .has_update = true,
