@@ -1618,6 +1618,7 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
             const struct tu_pipeline_layout *layout,
             uint32_t read_only_input_attachments,
             bool dynamic_renderpass,
+            bool ray_tracing,
             struct ir3_const_allocations *const_allocs)
 {
    /* Allocate driver params as early as possible as a workaround for the
@@ -1715,8 +1716,16 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
 
          if (binding->type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
             continue;
-         if (!(binding->shader_stages &
-               mesa_to_vk_shader_stage(shader->info.stage)))
+         VkShaderStageFlags stages =
+            mesa_to_vk_shader_stage(shader->info.stage);
+         if (ray_tracing)
+            stages |= VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                      VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+                      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                      VK_SHADER_STAGE_MISS_BIT_KHR |
+                      VK_SHADER_STAGE_INTERSECTION_BIT_KHR |
+                      VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+         if (!(binding->shader_stages & stages))
             continue;
 
          /* If we don't know the size at compile time due to a variable
@@ -3846,7 +3855,7 @@ tu_shader_create(struct tu_device *dev,
    struct ir3_const_allocations const_allocs = {};
    NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
             key->read_only_input_attachments, key->dynamic_renderpass,
-            &const_allocs);
+            key->ray_tracing, &const_allocs);
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 

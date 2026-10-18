@@ -1937,6 +1937,7 @@ tu_rt_pipeline_create(struct tu_device *dev,
                                      create_info->pNext, NULL);
    tu_shader_key_robustness(&key, &rs);
    key.fast_math = debug_get_bool_option("TU_RT_FAST_MATH", false);
+   key.ray_tracing = true;
 
    {
       uint32_t s = 0;
