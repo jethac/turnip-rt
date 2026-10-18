@@ -294,6 +294,27 @@ ra_ctx_dump(struct ra_ctx *ctx)
 }
 
 static bool
+moves_live_interval(struct ra_ctx *ctx, struct ir3_register *reg,
+                    physreg_t physreg)
+{
+   if (!reg->merge_set)
+      return false;
+
+   rb_tree_foreach (struct ra_interval, interval, &ctx->reg_ctx.intervals,
+                    interval.node) {
+      struct ir3_register *live = interval->interval.reg;
+      if (live->interval_end <= reg->interval_start ||
+          live->interval_start >= reg->interval_end)
+         continue;
+      if (interval->physreg_start + reg->interval_start !=
+          physreg + live->interval_start)
+         return true;
+   }
+
+   return false;
+}
+
+static bool
 get_reg_specified(struct ra_ctx *ctx, struct ir3_register *reg, physreg_t physreg)
 {
    for (unsigned i = 0; i < reg_size(reg); i++) {
@@ -304,7 +325,7 @@ get_reg_specified(struct ra_ctx *ctx, struct ir3_register *reg, physreg_t physre
           * value it holds is in the same merge set at the same offset as the
           * value in reg.
           */
-         if (!reg->merge_set) {
+         if (!reg->merge_set || moves_live_interval(ctx, reg, physreg)) {
             return false;
          }
 
@@ -992,8 +1013,10 @@ handle_dst(struct ra_ctx *ctx, struct ir3_instruction *instr,
     * reg of its merge set, as this might cause a future collect covering its
     * interval to become non-trivial.
     */
-   if (dst->merge_set && dst->merge_set->preferred_reg != (physreg_t)~0 &&
-       physreg != dst->merge_set->preferred_reg + dst->merge_set_offset) {
+   if (dst->merge_set &&
+       ((dst->merge_set->preferred_reg != (physreg_t)~0 &&
+         physreg != dst->merge_set->preferred_reg + dst->merge_set_offset) ||
+        moves_live_interval(ctx, dst, physreg))) {
       dst->merge_set = NULL;
       dst->interval_start = ctx->live->interval_offset;
       dst->interval_end = dst->interval_start + reg_size(dst);
