@@ -302,6 +302,12 @@ singular_tp('warning_lrz_write_disabled',
             args=[Arg(type='const char *', var='reason', c_format='%s')])
 singular_tp('warning_fdm_force_disabled', toggle_name='perf_warnings')
 
+singular_tp('cmd_buffer_insert_label',
+            args=[Arg(type='unsigned', var='len'),
+                  Arg(type='str', var='str', c_format='%s', length_arg='len + 1', copy_func='strncpy'),],
+            toggle_name='cmd_buffer_annotation',
+            queue_tp=False)
+
 # Annotations for Cmd(Begin|End)DebugUtilsLabelEXT
 for suffix in ["", "_rp"]:
     begin_end_tp('cmd_buffer_annotation' + suffix,

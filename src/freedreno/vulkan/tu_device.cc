@@ -128,8 +128,14 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
    const uint8_t env_flags[] = {
       debug_get_bool_option("TU_SOFTFLOAT32_SKIP", false),
       debug_get_bool_option("TU_FP16_DENORM_WIDEN", true),
+      debug_get_bool_option("TU_RT_BST", true),
    };
    _mesa_blake3_update(&ctx, env_flags, sizeof(env_flags));
+   const uint64_t rt_budgets[] = {
+      (uint64_t) debug_get_num_option("TU_RT_HIT_BUDGET", 250000),
+      (uint64_t) debug_get_num_option("TU_RT_MAX_PREINLINE", 400000),
+   };
+   _mesa_blake3_update(&ctx, rt_budgets, sizeof(rt_budgets));
    _mesa_blake3_final(&ctx, blake3);
 
    memcpy(uuid, blake3, VK_UUID_SIZE);
@@ -1128,8 +1134,10 @@ static void
 tu_get_physical_device_properties_1_3(struct tu_physical_device *pdevice,
                                       struct vk_properties *p)
 {
-   p->minSubgroupSize = 4;
    p->maxSubgroupSize = tu_subgroup_size(pdevice);
+   p->minSubgroupSize =
+      CLAMP(util_next_power_of_two((uint32_t) debug_get_num_option("TU_MIN_SUBGROUP", 32)), 4u,
+            pdevice->info->threadsize_base);
    p->maxComputeWorkgroupSubgroups =
       pdevice->info->max_waves * (pdevice->info->threadsize_base / 32);
    /* Only compute and fragment shaders can run with a doubled wave size, the
@@ -4721,6 +4729,24 @@ tu_CmdBeginDebugUtilsLabelEXT(VkCommandBuffer _commandBuffer,
       trace_start_cmd_buffer_annotation_rp(&cmd_buffer->trace, &cmd_buffer->draw_cs, cmd_buffer);
    } else {
       trace_start_cmd_buffer_annotation(&cmd_buffer->trace, &cmd_buffer->cs, cmd_buffer);
+   }
+}
+
+void
+tu_CmdInsertDebugUtilsLabelEXT(VkCommandBuffer _commandBuffer,
+                               const VkDebugUtilsLabelEXT *pLabelInfo)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, _commandBuffer);
+
+   vk_common_CmdInsertDebugUtilsLabelEXT(_commandBuffer, pLabelInfo);
+
+   const char *name = pLabelInfo->pLabelName ? pLabelInfo->pLabelName : "";
+   if (cmd_buffer->state.pass) {
+      trace_cmd_buffer_insert_label(&cmd_buffer->rp_trace, &cmd_buffer->draw_cs, cmd_buffer,
+                                    strlen(name), name);
+   } else {
+      trace_cmd_buffer_insert_label(&cmd_buffer->trace, &cmd_buffer->cs, cmd_buffer,
+                                    strlen(name), name);
    }
 }
 

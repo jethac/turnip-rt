@@ -3347,6 +3347,25 @@ tu7_emit_concurrent_binning_sysmem(struct tu_cmd_buffer *cmd,
 
 template <chip CHIP>
 static void
+tu_emit_hang_tag(struct tu_cs *cs, uint32_t tag)
+{
+   static const bool enabled = debug_get_bool_option("TU_HANG_TAG", false);
+   if (!enabled || CHIP >= A8XX)
+      return;
+   tu_cs_emit_regs(cs, tu_scratch_reg<CHIP>(7, tag));
+}
+
+template <chip CHIP>
+static void
+tu_emit_rp_hang_tag(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   const VkExtent2D *extent = &cmd->state.render_areas[0].extent;
+   tu_emit_hang_tag<CHIP>(cs, 0x80000000u | (MIN2(extent->width, 0x7fffu) << 16) |
+                              MIN2(extent->height, 0xffffu));
+}
+
+template <chip CHIP>
+static void
 tu6_sysmem_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                         tu_autotune::rp_ctx_t rp_ctx)
 {
@@ -3388,6 +3407,7 @@ tu6_sysmem_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    tu_cs_emit(cs, 0x0);
 
    tu_emit_cache_flush_ccu<CHIP>(cmd, cs, TU_CMD_CCU_SYSMEM);
+   tu_emit_rp_hang_tag<CHIP>(cmd, cs);
 
    tu_cs_emit_pkt7(cs, CP_SET_VISIBILITY_OVERRIDE, 1);
    tu_cs_emit(cs, 0x1);
@@ -3617,6 +3637,7 @@ tu6_tile_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
    /* User flushes should always be executed on BR. */
    tu_emit_cache_flush_ccu<CHIP>(cmd, cs, TU_CMD_CCU_GMEM);
+   tu_emit_rp_hang_tag<CHIP>(cmd, cs);
 
    bool use_cb = false;
 
@@ -4199,6 +4220,7 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
 {
    if (cmd_buffer->state.rp.has_tess)
       tu6_lazy_emit_tessfactor_addr<CHIP>(cmd_buffer);
+
 
    tu_autotune::rp_key_opt rp_key = cmd_buffer->device->autotune->emit_preempt_latency_tracking_rp_hash(cmd_buffer);
 
@@ -9832,6 +9854,7 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    struct tu_cs *cs = &cmd->cs;
    struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
 
+
    bool emit_instrlen_workaround =
       shader->variant->instrlen >
       cmd->device->physical_device->info->props.instr_cache_size;
@@ -9870,6 +9893,13 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
     * bitfield.
     */
    tu_emit_cache_flush<CHIP>(cmd);
+
+   {
+      char prefix[9];
+      memcpy(prefix, shader->variant->blake3_str, 8);
+      prefix[8] = 0;
+      tu_emit_hang_tag<CHIP>(cs, (uint32_t) strtoul(prefix, NULL, 16));
+   }
 
    /* note: no reason to have this in a separate IB */
    tu_cs_emit_state_ib(cs, tu_emit_consts<CHIP>(cmd, true));
