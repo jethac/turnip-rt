@@ -125,6 +125,11 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
    _mesa_blake3_update(&ctx, &device->uche_trap_base, sizeof(device->uche_trap_base));
    _mesa_blake3_update(&ctx, &device->compiler_options,
                        sizeof(device->compiler_options));
+   const uint8_t env_flags[] = {
+      debug_get_bool_option("TU_SOFTFLOAT32_SKIP", false),
+      debug_get_bool_option("TU_FP16_DENORM_WIDEN", true),
+   };
+   _mesa_blake3_update(&ctx, env_flags, sizeof(env_flags));
    _mesa_blake3_final(&ctx, blake3);
 
    memcpy(uuid, blake3, VK_UUID_SIZE);

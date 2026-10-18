@@ -15,6 +15,7 @@
 #include "vk_nir.h"
 #include "vk_nir_convert_ycbcr.h"
 #include "vk_pipeline.h"
+#include "vk_shader_module.h"
 #include "vk_util.h"
 
 #include "ir3/ir3_compiler.h"
@@ -217,6 +218,69 @@ tu_nir_lower_softfloat64(struct tu_device *dev, nir_shader *nir)
    ir3_optimize_loop(dev->compiler, &optimize_options, nir);
 }
 
+static bool
+tu_softfloat_log(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("TU_SOFTFLOAT_LOG", false);
+   return enabled;
+}
+
+static bool
+tu_softfloat32_skip(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("TU_SOFTFLOAT32_SKIP", false);
+   return enabled;
+}
+
+static unsigned
+tu_count_instrs(nir_shader *nir)
+{
+   unsigned count = 0;
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block)
+            count++;
+      }
+   }
+   return count;
+}
+
+static void
+tu_log_softfloat(const VkPipelineShaderStageCreateInfo *stage_info,
+                 mesa_shader_stage stage, bool soft32, bool soft64,
+                 unsigned before, unsigned after)
+{
+   const void *code = NULL;
+   size_t size = 0;
+   VK_FROM_HANDLE(vk_shader_module, module, stage_info->module);
+   if (module) {
+      code = module->data;
+      size = module->size;
+   } else {
+      const VkShaderModuleCreateInfo *minfo =
+         vk_find_struct_const(stage_info->pNext, SHADER_MODULE_CREATE_INFO);
+      if (minfo) {
+         code = minfo->pCode;
+         size = minfo->codeSize;
+      }
+   }
+
+   blake3_hash hash = {};
+   if (code)
+      _mesa_blake3_compute(code, size, hash);
+
+   mesa_logi("tu softfloat: spv=%02x%02x%02x%02x%02x%02x stage=%s fp32=%s "
+             "fp64=%s instrs %u -> %u",
+             hash[0], hash[1], hash[2], hash[3], hash[4], hash[5],
+             _mesa_shader_stage_to_abbrev(stage),
+             soft32 ? (tu_softfloat32_skip() ? "skipped" : "soft") : "no",
+             soft64 ? "soft" : "no", before, after);
+}
+
 static unsigned
 tu_widen_fp16_cb(const nir_instr *instr, void *data)
 {
@@ -350,13 +414,24 @@ tu_spirv_to_nir(struct tu_device *dev,
    };
    NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
 
-   if (nir_is_denorm_preserve(nir->info.float_controls_execution_mode, 32)) {
+   const bool soft32 =
+      nir_is_denorm_preserve(nir->info.float_controls_execution_mode, 32);
+   const bool soft64 = nir->info.bit_sizes_float & 64;
+   unsigned instrs_before = 0;
+   if ((soft32 || soft64) && tu_softfloat_log())
+      instrs_before = tu_count_instrs(nir);
+
+   if (soft32 && !tu_softfloat32_skip()) {
       tu_nir_lower_softfloat32(dev, nir);
    }
 
-   if (nir->info.bit_sizes_float & 64) {
+   if (soft64) {
       tu_nir_lower_softfloat64(dev, nir);
    }
+
+   if ((soft32 || soft64) && tu_softfloat_log())
+      tu_log_softfloat(stage_info, stage, soft32, soft64, instrs_before,
+                       tu_count_instrs(nir));
 
    if (dev->physical_device->info->chip < A8XX &&
        nir_is_denorm_preserve(nir->info.float_controls_execution_mode, 16) &&
