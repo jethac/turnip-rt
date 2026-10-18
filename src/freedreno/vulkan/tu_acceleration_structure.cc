@@ -495,6 +495,17 @@ tu_GetAccelerationStructureBuildSizesKHR(VkDevice _device, VkAccelerationStructu
 
    vk_get_as_build_sizes(_device, buildType, pBuildInfo, pMaxPrimitiveCounts,
                          pSizeInfo, &args);
+   if (pSizeInfo->accelerationStructureSize == 0 || pSizeInfo->buildScratchSize == 0) {
+      uint32_t prims = 0;
+      for (uint32_t i = 0; i < pBuildInfo->geometryCount; i++)
+         prims += pMaxPrimitiveCounts[i];
+      mesa_logw("tu: AS build sizes type=%u geoms=%u prims=%u -> as=%" PRIu64
+                " scratch=%" PRIu64 " update=%" PRIu64,
+                pBuildInfo->type, pBuildInfo->geometryCount, prims,
+                (uint64_t) pSizeInfo->accelerationStructureSize,
+                (uint64_t) pSizeInfo->buildScratchSize,
+                (uint64_t) pSizeInfo->updateScratchSize);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

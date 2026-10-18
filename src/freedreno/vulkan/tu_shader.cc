@@ -195,6 +195,37 @@ tu_nir_lower_softfloat64(struct tu_device *dev, nir_shader *nir)
    ir3_optimize_loop(dev->compiler, &optimize_options, nir);
 }
 
+static unsigned
+tu_widen_fp16_cb(const nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return 0;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   const nir_op_info *info = &nir_op_infos[alu->op];
+   if (nir_op_is_vec_or_mov(alu->op))
+      return 0;
+   switch (alu->op) {
+   case nir_op_f2f16:
+   case nir_op_f2f16_rtne:
+   case nir_op_f2f16_rtz:
+   case nir_op_f2f32:
+   case nir_op_f2f64:
+   case nir_op_pack_half_2x16_split:
+      return 0;
+   default:
+      break;
+   }
+   if (nir_alu_type_get_base_type(info->output_type) == nir_type_float &&
+       alu->def.bit_size == 16)
+      return 32;
+   for (unsigned i = 0; i < info->num_inputs; i++) {
+      if (nir_alu_type_get_base_type(info->input_types[i]) == nir_type_float &&
+          nir_src_bit_size(alu->src[i].src) == 16)
+         return 32;
+   }
+   return 0;
+}
+
 nir_shader *
 tu_spirv_to_nir(struct tu_device *dev,
                 void *mem_ctx,
@@ -305,6 +336,14 @@ tu_spirv_to_nir(struct tu_device *dev,
 
    if (nir->info.bit_sizes_float & 64) {
       tu_nir_lower_softfloat64(dev, nir);
+   }
+
+   if (dev->physical_device->info->chip < A8XX &&
+       nir_is_denorm_preserve(nir->info.float_controls_execution_mode, 16) &&
+       (nir->info.bit_sizes_float & 16)) {
+      NIR_PASS(_, nir, nir_lower_bit_size, tu_widen_fp16_cb, NULL);
+      struct ir3_optimize_options optimize_options = {};
+      ir3_optimize_loop(dev->compiler, &optimize_options, nir);
    }
 
    return nir;

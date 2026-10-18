@@ -8,6 +8,7 @@
  */
 
 #include "tu_pipeline.h"
+#include "vk_shader_module.h"
 
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
@@ -4918,6 +4919,48 @@ tu_graphics_pipeline_create(VkDevice device,
    return result;
 }
 
+static void
+tu_log_failed_stages(const char *kind, VkResult result,
+                     const VkPipelineShaderStageCreateInfo *stages,
+                     uint32_t stage_count)
+{
+   if (result == VK_PIPELINE_COMPILE_REQUIRED)
+      return;
+   const char *dir = os_get_option("TU_DUMP_FAILED_SPIRV");
+   for (uint32_t s = 0; s < stage_count; s++) {
+      const VkPipelineShaderStageCreateInfo *st = stages + s;
+      const uint32_t *code = NULL;
+      size_t size = 0;
+      VK_FROM_HANDLE(vk_shader_module, module, st->module);
+      if (module) {
+         code = (const uint32_t *) module->data;
+         size = module->size;
+      } else {
+         const VkShaderModuleCreateInfo *mci =
+            vk_find_struct_const(st->pNext, SHADER_MODULE_CREATE_INFO);
+         if (mci) {
+            code = mci->pCode;
+            size = mci->codeSize;
+         }
+      }
+      unsigned char h[BLAKE3_OUT_LEN] = {0};
+      if (code)
+         _mesa_blake3_compute(code, size, h);
+      mesa_loge("tu: %s pipeline failed (%d): stage %#x %s spirv=%zu bytes %02x%02x%02x%02x%02x%02x",
+                kind, result, st->stage, st->pName, size, h[0], h[1], h[2], h[3], h[4], h[5]);
+      if (dir && code) {
+         char path[512];
+         snprintf(path, sizeof(path), "%s/fail-%02x%02x%02x%02x%02x%02x-%x.spv", dir,
+                  h[0], h[1], h[2], h[3], h[4], h[5], st->stage);
+         FILE *f = fopen(path, "wb");
+         if (f) {
+            fwrite(code, 1, size, f);
+            fclose(f);
+         }
+      }
+   }
+}
+
 template <chip CHIP>
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateGraphicsPipelines(VkDevice device,
@@ -4941,6 +4984,8 @@ tu_CreateGraphicsPipelines(VkDevice device,
                                            pAllocator, &pPipelines[i]);
 
       if (result != VK_SUCCESS) {
+         tu_log_failed_stages("graphics", result, pCreateInfos[i].pStages,
+                              pCreateInfos[i].stageCount);
          final_result = result;
          pPipelines[i] = VK_NULL_HANDLE;
 
@@ -5216,6 +5261,7 @@ tu_CreateComputePipelines(VkDevice device,
                                           &pCreateInfos[i], flags,
                                           pAllocator, &pPipelines[i]);
       if (result != VK_SUCCESS) {
+         tu_log_failed_stages("compute", result, &pCreateInfos[i].stage, 1);
          final_result = result;
          pPipelines[i] = VK_NULL_HANDLE;
 

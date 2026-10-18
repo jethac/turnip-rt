@@ -488,7 +488,7 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->shaderStorageImageArrayDynamicIndexing = true;
    features->shaderClipDistance = true;
    features->shaderCullDistance = true;
-   features->shaderFloat64 = false;
+   features->shaderFloat64 = debug_get_bool_option("TU_SOFTFP64", true);
    features->shaderInt64 = true;
    features->shaderInt16 = true;
    features->sparseBinding = pdevice->has_sparse;
@@ -1049,7 +1049,8 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
       p->shaderDenormPreserveFloat16         = true;
    } else {
       p->shaderDenormFlushToZeroFloat16      = true;
-      p->shaderDenormPreserveFloat16         = false;
+      p->shaderDenormPreserveFloat16         =
+         debug_get_bool_option("TU_FP16_DENORM_WIDEN", true);
    }
 
    p->shaderRoundingModeRTEFloat16           = true;
@@ -1068,11 +1069,12 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
    p->shaderRoundingModeRTZFloat32           = false;
    p->shaderSignedZeroInfNanPreserveFloat32  = true;
 
+   const bool softfp64 = debug_get_bool_option("TU_SOFTFP64", true);
    p->shaderDenormFlushToZeroFloat64         = false;
-   p->shaderDenormPreserveFloat64            = false;
-   p->shaderRoundingModeRTEFloat64           = false;
+   p->shaderDenormPreserveFloat64            = softfp64;
+   p->shaderRoundingModeRTEFloat64           = softfp64;
    p->shaderRoundingModeRTZFloat64           = false;
-   p->shaderSignedZeroInfNanPreserveFloat64  = false;
+   p->shaderSignedZeroInfNanPreserveFloat64  = softfp64;
 
    p->shaderUniformBufferArrayNonUniformIndexingNative   = true;
    p->shaderSampledImageArrayNonUniformIndexingNative    = true;
@@ -3734,8 +3736,11 @@ tu_AllocateMemory(VkDevice _device,
 
    struct tu_memory_heap *mem_heap = &device->physical_device->heap;
    uint64_t mem_heap_used = p_atomic_read(&mem_heap->used);
-   if (mem_heap_used > mem_heap->size)
+   if (mem_heap_used > mem_heap->size) {
+      mesa_logw("tu: AllocateMemory(%" PRIu64 ") refused: heap used %" PRIu64 "M > size %" PRIu64 "M",
+                (uint64_t) pAllocateInfo->allocationSize, mem_heap_used >> 20, mem_heap->size >> 20);
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
 
    mem = static_cast<struct tu_device_memory *>(vk_device_memory_create(
       &device->vk, pAllocateInfo, pAllocator, sizeof(*mem)));
@@ -3842,6 +3847,9 @@ tu_AllocateMemory(VkDevice _device,
    if (result != VK_SUCCESS) {
       vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
       tu_memory_emit_report(device, /* mem */ NULL, pAllocateInfo, result);
+      mesa_logw("tu: AllocateMemory(%" PRIu64 ", type %u) failed: %d (heap used %" PRIu64 "M / %" PRIu64 "M)",
+                (uint64_t) pAllocateInfo->allocationSize, pAllocateInfo->memoryTypeIndex, result,
+                p_atomic_read(&mem_heap->used) >> 20, mem_heap->size >> 20);
       return result;
    }
 
