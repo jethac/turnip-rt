@@ -433,7 +433,10 @@ tu_spirv_to_nir(struct tu_device *dev,
       tu_log_softfloat(stage_info, stage, soft32, soft64, instrs_before,
                        tu_count_instrs(nir));
 
-   if (dev->physical_device->info->chip < A8XX &&
+   static int fp16_denorm_flush = -1;
+   if (fp16_denorm_flush < 0)
+      fp16_denorm_flush = debug_get_bool_option("TU_FP16_DENORM_FLUSH", false);
+   if (dev->physical_device->info->chip < A8XX && !fp16_denorm_flush &&
        nir_is_denorm_preserve(nir->info.float_controls_execution_mode, 16) &&
        (nir->info.bit_sizes_float & 16)) {
       NIR_PASS(_, nir, nir_lower_bit_size, tu_widen_fp16_cb, NULL);

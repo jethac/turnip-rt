@@ -129,6 +129,7 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
       debug_get_bool_option("TU_SOFTFLOAT32_SKIP", false),
       debug_get_bool_option("TU_FP16_DENORM_WIDEN", true),
       debug_get_bool_option("TU_RT_BST", true),
+      debug_get_bool_option("TU_FP16_DENORM_FLUSH", false),
    };
    _mesa_blake3_update(&ctx, env_flags, sizeof(env_flags));
    const uint64_t rt_budgets[] = {
