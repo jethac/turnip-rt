@@ -214,6 +214,9 @@ tu_widen_fp16_cb(const nir_instr *instr, void *data)
    case nir_op_f2f32:
    case nir_op_f2f64:
    case nir_op_pack_half_2x16_split:
+   case nir_op_b2f16:
+   case nir_op_i2f16:
+   case nir_op_u2f16:
       return 0;
    default:
       break;
@@ -221,11 +224,6 @@ tu_widen_fp16_cb(const nir_instr *instr, void *data)
    if (nir_alu_type_get_base_type(info->output_type) == nir_type_float &&
        alu->def.bit_size == 16)
       return 32;
-   for (unsigned i = 0; i < info->num_inputs; i++) {
-      if (nir_alu_type_get_base_type(info->input_types[i]) == nir_type_float &&
-          nir_src_bit_size(alu->src[i].src) == 16)
-         return 32;
-   }
    return 0;
 }
 
