@@ -28,6 +28,7 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 #include "tu_bvh_defines.h"
 #define VK_USED_BUILD_FLAGS (VK_BUILD_FLAG_HAS_QUADS)
 #include "vk_bvh_helpers.h"
+#include "tu_bvh_quantize.h"
 
 layout(push_constant) uniform CONSTS {
    encode_args args;
@@ -194,58 +195,6 @@ encode_leaf_node(uint32_t type, uint64_t src_node, uint64_t dst_node, uint64_t d
    DEREF(dst).type_flags = type_flags;
 }
 
-/* Truncate to bfloat16 while rounding down. bfloat16 is used to store the bases.
- */
-
-u16vec3 to_bfloat_round_down(vec3 coord)
-{
-   u32vec3 icoord = floatBitsToUint(coord);
-   return u16vec3(mix(icoord >> 16, (icoord + 0xffff) >> 16, notEqual(icoord & u32vec3(0x80000000), u32vec3(0))));
-}
-
-/* Approximate subtraction while rounding up. Return a result greater than or
- * equal to the infinitely-precise result. This just uses the native
- * subtraction and then shifts one ULP towards infinity. Because the result is
- * further rounded, it should usually be good enough while being faster than
- * emulated floating-point math.
- *
- * We assume here that the result is always nonnegative, because it's only used
- * to subtract away the base.
- */
-
-vec3 subtract_round_up_approx(vec3 a, vec3 b)
-{
-   vec3 f = a - b;
-   u32vec3 i = floatBitsToUint(f);
-
-   i++;
-
-   /* Handle infinity/zero special cases */
-   i = mix(i, floatBitsToUint(f), isinf(f));
-   i = mix(i, floatBitsToUint(f), equal(f, vec3(0)));
-
-   return uintBitsToFloat(i);
-}
-
-vec3 subtract_round_down_approx(vec3 a, vec3 b)
-{
-   vec3 f = a - b;
-   u32vec3 i = floatBitsToUint(f);
-
-   i--;
-
-   /* Handle infinity/zero special cases */
-   i = mix(i, floatBitsToUint(f), isinf(f));
-   i = mix(i, floatBitsToUint(f), equal(f, vec3(0)));
-
-   return uintBitsToFloat(i);
-}
-
-u32vec3 extract_mantissa(vec3 f)
-{
-   return mix((floatBitsToUint(f) & 0x7fffff) | 0x800000, u32vec3(0), equal(f, vec3(0)));
-}
-
 void
 encode_internal_node(uint32_t children[8], uint32_t children_offset, uint child_count,
                      vec3 min_offset, vec3 max_offset, uint32_t bvh_offset)
@@ -254,26 +203,9 @@ encode_internal_node(uint32_t children[8], uint32_t children_offset, uint child_
 
    DEREF(dst_node).id = children_offset;
 
-   u16vec3 base_bfloat = to_bfloat_round_down(min_offset);
-   vec3 base_float = uintBitsToFloat(u32vec3(base_bfloat) << 16);
-   DEREF(dst_node).bases[0] = base_bfloat.x;
-   DEREF(dst_node).bases[1] = base_bfloat.y;
-   DEREF(dst_node).bases[2] = base_bfloat.z;
-
-   vec3 children_max = subtract_round_up_approx(max_offset, base_float);
-
-   /* The largest child offset will be encoded in 8 bits, including the
-    * explicit leading 1. We need to downcast to this precision while rounding
-    * up to catch cases where the exponent is increased by rounding up, then
-    * extract the exponent. Because children_max is always nonnegative, we can 
-    * do the downcast with "(floatBitsToUint(children_max) + 0xffff) >> 16",
-    * and then we further shift to get the rounded exponent.
-    */
-   u16vec3 exponents = u16vec3((floatBitsToUint(children_max) + 0xffff) >> 23);
-   u8vec3 exponents_u8 = u8vec3(exponents);
-   DEREF(dst_node).exponents[0] = exponents_u8.x;
-   DEREF(dst_node).exponents[1] = exponents_u8.y;
-   DEREF(dst_node).exponents[2] = exponents_u8.z;
+   vec3 base_float;
+   u16vec3 exponents;
+   encode_node_base(dst_node, min_offset, max_offset, base_float, exponents);
 
    for (uint32_t i = 0; i < child_count; i++) {
       uint32_t offset = ir_id_to_offset(children[i]);
@@ -281,33 +213,7 @@ encode_internal_node(uint32_t children[8], uint32_t children_offset, uint child_
       vk_aabb child_aabb =
          DEREF(REF(vk_ir_node)OFFSET(args.intermediate_bvh, offset)).aabb;
 
-      /* Note: because we subtract from the minimum, we should never have a
-       * negative value here.
-       */
-      vec3 child_min = subtract_round_down_approx(child_aabb.min, base_float);
-      vec3 child_max = subtract_round_up_approx(child_aabb.max, base_float);
-      
-      u16vec3 child_min_exponents = u16vec3(floatBitsToUint(child_min) >> 23);
-      u16vec3 child_max_exponents = u16vec3(floatBitsToUint(child_max) >> 23);
-
-      u16vec3 child_min_shift = u16vec3(16) + exponents - child_min_exponents;
-      /* Divide the mantissa by 2**child_min_shift, rounding down */
-      u8vec3 child_min_mantissas =
-         mix(u8vec3(extract_mantissa(child_min) >> child_min_shift), u8vec3(0),
-		       greaterThanEqual(child_min_shift, u16vec3(32)));
-      u16vec3 child_max_shift = u16vec3(16) + exponents - child_max_exponents;
-      /* Divide the mantissa by 2**child_max_shift, rounding up */
-      u8vec3 child_max_mantissas =
-         mix(u8vec3((extract_mantissa(child_max) + ((u32vec3(1u) << u32vec3(child_max_shift)) - 1)) >> child_max_shift),
-             u8vec3(notEqual(extract_mantissa(child_max), u32vec3(0))),
-             greaterThanEqual(child_max_shift, u16vec3(32)));
-
-      DEREF(dst_node).mantissas[i][0][0] = child_min_mantissas.x;
-      DEREF(dst_node).mantissas[i][0][1] = child_min_mantissas.y;
-      DEREF(dst_node).mantissas[i][0][2] = child_min_mantissas.z;
-      DEREF(dst_node).mantissas[i][1][0] = child_max_mantissas.x;
-      DEREF(dst_node).mantissas[i][1][1] = child_max_mantissas.y;
-      DEREF(dst_node).mantissas[i][1][2] = child_max_mantissas.z;
+      encode_child_box(dst_node, i, base_float, exponents, child_aabb);
    }
 
    for (uint32_t i = child_count; i < 8; i++) {
@@ -447,6 +353,8 @@ main()
             encode_leaf_node(type, args.intermediate_bvh + offset,
                              args.output_bvh + SIZEOF(tu_internal_node) * dst_offset, dst_instances,
                              header);
+            if (args.leaf_map != 0)
+               DEREF(INDEX(uint32_t, args.leaf_map, offset / intermediate_leaf_node_size)) = dst_offset;
          }
 
          vk_aabb child_aabb =

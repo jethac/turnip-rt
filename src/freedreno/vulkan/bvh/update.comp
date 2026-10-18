@@ -1,0 +1,153 @@
+/*
+ * Copyright © 2026 jethac
+ * SPDX-License-Identifier: MIT
+ */
+
+#version 460
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "tu_bvh_defines.h"
+#define VK_USED_BUILD_FLAGS (VK_BUILD_FLAG_ALWAYS_ACTIVE)
+#include "vk_bvh_helpers.h"
+#include "tu_bvh_quantize.h"
+
+layout(push_constant) uniform CONSTS {
+   update_args args;
+};
+
+uint32_t
+fetch_parent(uint32_t node)
+{
+   return DEREF(REF(uint32_t)(args.bvh - node * 4 - 4));
+}
+
+void
+store_bounds(uint32_t node, vk_aabb bounds)
+{
+   DEREF(INDEX(vk_aabb, args.bounds, node)) = bounds;
+}
+
+vk_aabb
+load_bounds(uint32_t node)
+{
+   return DEREF(INDEX(vk_aabb, args.bounds, node));
+}
+
+vk_aabb
+update_triangle_leaf(REF(tu_leaf_node) leaf, uint32_t primitive_index)
+{
+   triangle_indices indices = load_indices(args.geom_data.indices, args.geom_data.index_format, primitive_index);
+   triangle_vertices vertices =
+      load_vertices(args.geom_data.data, indices, args.geom_data.vertex_format, args.geom_data.stride);
+
+   if (args.geom_data.transform != NULL) {
+      mat4 transform = mat4(1.0);
+
+      for (uint32_t col = 0; col < 4; col++)
+         for (uint32_t row = 0; row < 3; row++)
+            transform[col][row] = DEREF(INDEX(float, args.geom_data.transform, col + row * 4));
+
+      for (uint32_t i = 0; i < 3; i++)
+         vertices.vertex[i] = transform * vertices.vertex[i];
+   }
+
+   if (any(isnan(vertices.vertex[0])) || any(isnan(vertices.vertex[1])) || any(isnan(vertices.vertex[2]))) {
+      vertices.vertex[0] = vec4(0);
+      vertices.vertex[1] = vec4(0);
+      vertices.vertex[2] = vec4(0);
+   }
+
+   vk_aabb bounds = vk_aabb(vec3(INFINITY), vec3(-INFINITY));
+   for (uint32_t coord = 0; coord < 3; coord++) {
+      for (uint32_t comp = 0; comp < 3; comp++) {
+         float v = vertices.vertex[coord][comp];
+         DEREF(leaf).coords[coord][comp] = v;
+         bounds.min[comp] = min(bounds.min[comp], v);
+         bounds.max[comp] = max(bounds.max[comp], v);
+      }
+   }
+
+   return bounds;
+}
+
+vk_aabb
+update_aabb_leaf(REF(tu_leaf_node) leaf, uint32_t primitive_index)
+{
+   VOID_REF src = OFFSET(args.geom_data.data, primitive_index * args.geom_data.stride);
+
+   vk_aabb bounds;
+   for (uint32_t comp = 0; comp < 3; comp++) {
+      bounds.min[comp] = DEREF(INDEX(float, src, comp));
+      bounds.max[comp] = DEREF(INDEX(float, src, comp + 3));
+   }
+
+   if (any(isnan(bounds.min)) || any(isnan(bounds.max))) {
+      bounds.min = vec3(0);
+      bounds.max = vec3(0);
+   }
+
+   for (uint32_t comp = 0; comp < 3; comp++) {
+      DEREF(leaf).coords[0][comp] = bounds.min[comp];
+      DEREF(leaf).coords[1][comp] = bounds.max[comp];
+   }
+
+   return bounds;
+}
+
+void
+main()
+{
+   uint32_t primitive_index = gl_GlobalInvocationID.x;
+   if (primitive_index >= args.primitive_count)
+      return;
+
+   uint32_t node = DEREF(INDEX(uint32_t, args.leaf_map, args.geom_data.first_id + primitive_index));
+   REF(tu_leaf_node) leaf = REF(tu_leaf_node)(OFFSET(args.bvh, node * SIZEOF(tu_leaf_node)));
+
+   vk_aabb bounds;
+   if (args.geom_data.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+      bounds = update_triangle_leaf(leaf, primitive_index);
+   else
+      bounds = update_aabb_leaf(leaf, primitive_index);
+
+   store_bounds(node, bounds);
+
+   uint32_t parent = fetch_parent(node);
+   while (parent != VK_BVH_INVALID_NODE) {
+      memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer,
+                    gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+
+      REF(tu_internal_node) parent_node = REF(tu_internal_node)(OFFSET(args.bvh, parent * SIZEOF(tu_internal_node)));
+      uint32_t child_count = uint32_t(DEREF(parent_node).child_count);
+
+      uint32_t ready = atomicAdd(DEREF(INDEX(uint32_t, args.ready_count, parent)), 1, gl_ScopeDevice,
+                                 gl_StorageSemanticsBuffer,
+                                 gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+      if (ready != child_count - 1)
+         return;
+
+      uint32_t first_child = DEREF(parent_node).id;
+
+      bounds = vk_aabb(vec3(INFINITY), vec3(-INFINITY));
+      for (uint32_t i = 0; i < child_count; i++) {
+         vk_aabb child_bounds = load_bounds(first_child + i);
+         bounds.min = min(bounds.min, child_bounds.min);
+         bounds.max = max(bounds.max, child_bounds.max);
+      }
+
+      vec3 base_float;
+      u16vec3 exponents;
+      encode_node_base(parent_node, bounds.min, bounds.max, base_float, exponents);
+      for (uint32_t i = 0; i < child_count; i++)
+         encode_child_box(parent_node, i, base_float, exponents, load_bounds(first_child + i));
+
+      store_bounds(parent, bounds);
+
+      node = parent;
+      parent = fetch_parent(node);
+   }
+
+   DEREF(args.header).aabb = bounds;
+   DEREF(args.header).bvh_ptr = args.bvh;
+}

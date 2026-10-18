@@ -146,9 +146,20 @@ struct encode_args {
    VOID_REF intermediate_bvh;
    VOID_REF output_bvh;
    REF(vk_ir_header) header;
+   VOID_REF leaf_map;
    uint32_t output_bvh_offset;
    uint32_t leaf_node_count;
    uint32_t geometry_type;
+};
+
+struct update_args {
+   VOID_REF bvh;
+   VOID_REF leaf_map;
+   REF(tu_accel_struct_header) header;
+   VOID_REF ready_count;
+   VOID_REF bounds;
+   vk_bvh_geometry_data geom_data;
+   uint32_t primitive_count;
 };
 
 struct header_args {

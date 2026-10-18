@@ -35,12 +35,18 @@ bvh_shaders = [
     'copy',
     []
   ],
+  [
+    'update.comp',
+    'update',
+    []
+  ],
 ]
 
 tu_bvh_include_dir = dir_source_root + '/src/freedreno/vulkan/bvh'
 
 tu_bvh_includes = files(
   'tu_bvh_defines.h',
+  'tu_bvh_quantize.h',
 )
 
 bvh_spv = []

@@ -44,6 +44,10 @@ static const uint32_t copy_spv[] = {
 #include "bvh/copy.spv.h"
 };
 
+static const uint32_t update_spv[] = {
+#include "bvh/update.spv.h"
+};
+
 static_assert(sizeof(struct tu_instance_descriptor) == AS_RECORD_SIZE);
 static_assert(sizeof(struct tu_accel_struct_header) == AS_RECORD_SIZE);
 static_assert(sizeof(struct tu_internal_node) == AS_NODE_SIZE);
@@ -105,7 +109,26 @@ get_pipeline_spv(struct tu_device *device,
                                           name, key_size, pipeline);
 }
 
+static uint32_t
+tu_morton_sort_workgroup_size(void)
+{
+   static int value = -1;
+   if (value < 0)
+      value = debug_get_num_option("TU_MORTON_WG", 256);
+   return value;
+}
+
+static uint32_t
+tu_morton_sort_kvs_per_thread(void)
+{
+   static int value = -1;
+   if (value < 0)
+      value = debug_get_num_option("TU_MORTON_KVS", 2);
+   return value;
+}
+
 struct bvh_layout {
+   uint64_t leaf_map_offset;
    uint64_t bvh_offset;
    uint64_t size;
 };
@@ -113,6 +136,7 @@ struct bvh_layout {
 static void
 get_bvh_layout(VkGeometryTypeKHR geometry_type,
                uint32_t leaf_count,
+               bool updateable,
                struct bvh_layout *layout)
 {
    uint32_t internal_count = MAX2(leaf_count, 2) - 1;
@@ -123,6 +147,10 @@ get_bvh_layout(VkGeometryTypeKHR geometry_type,
    if (geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
       offset += leaf_count * sizeof(struct tu_instance_descriptor);
    }
+
+   layout->leaf_map_offset = offset;
+   if (updateable)
+      offset += leaf_count * sizeof(uint32_t);
 
    /* Parent links, which have to go directly before bvh_offset as we index
     * them using negative offsets from there.
@@ -145,14 +173,176 @@ get_bvh_size(VkDevice device,
 {
    struct bvh_layout layout;
    get_bvh_layout(vk_get_as_geometry_type(state->build_info),
-                  state->leaf_node_count, &layout);
+                  state->leaf_node_count, state->config.updateable, &layout);
    return layout.size;
+}
+
+struct update_scratch_layout {
+   uint64_t ready_count_offset;
+   uint64_t bounds_offset;
+   uint64_t size;
+};
+
+static void
+get_update_scratch_layout(const struct vk_acceleration_structure_build_state *state,
+                          struct update_scratch_layout *layout)
+{
+   uint32_t leaf_count = state->leaf_node_count;
+   uint32_t node_count = MAX2(leaf_count, 2) - 1 + leaf_count;
+
+   layout->ready_count_offset = 0;
+   layout->bounds_offset = align64(node_count * sizeof(uint32_t), 64);
+   layout->size = layout->bounds_offset + node_count * sizeof(vk_aabb);
+}
+
+static VkDeviceSize
+tu_get_update_scratch_size(VkDevice device,
+                           const struct vk_acceleration_structure_build_state *state)
+{
+   struct update_scratch_layout layout;
+   get_update_scratch_layout(state, &layout);
+   return layout.size;
+}
+
+static void
+tu_init_update_scratch(VkCommandBuffer commandBuffer,
+                       const struct vk_acceleration_structure_build_state *states,
+                       uint32_t build_count)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
+
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
+      if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
+
+      struct update_scratch_layout layout;
+      get_update_scratch_layout(state, &layout);
+
+      cmdbuf->device->vk.cmd_fill_buffer_addr(commandBuffer,
+                                              state->build_info->scratchData.deviceAddress +
+                                                 layout.ready_count_offset,
+                                              layout.bounds_offset - layout.ready_count_offset, 0);
+   }
 }
 
 static void
 tu_get_build_config(VkDevice device,
                     struct vk_acceleration_structure_build_state *state)
 {
+   static int log_builds = -1;
+   if (log_builds < 0)
+      log_builds = debug_get_bool_option("TU_AS_LOG", false);
+   if (log_builds) {
+      const VkAccelerationStructureBuildGeometryInfoKHR *info = state->build_info;
+      mesa_logi("tu as build: type=%s mode=%s flags=0x%x leaves=%u internal=%u",
+                info->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR ? "tlas" : "blas",
+                info->mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR ? "update" : "build",
+                info->flags, state->leaf_node_count, state->config.internal_type);
+   }
+}
+
+static void
+tu_update_as(VkCommandBuffer commandBuffer,
+             struct vk_acceleration_structure_build_state *states,
+             uint32_t build_count)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
+   struct tu_device *device = cmdbuf->device;
+   VkPipeline pipeline;
+   VkPipelineLayout layout;
+   VkResult result;
+
+   bool need_copy = false;
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
+      if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE &&
+          state->build_info->srcAccelerationStructure != state->build_info->dstAccelerationStructure)
+         need_copy = true;
+   }
+
+   if (need_copy) {
+      result = get_pipeline_spv(device, "copy", copy_spv, sizeof(copy_spv), sizeof(copy_args), &pipeline, &layout);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmdbuf->vk, result);
+         return;
+      }
+
+      tu_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+      for (uint32_t i = 0; i < build_count; i++) {
+         const struct vk_acceleration_structure_build_state *state = &states[i];
+         if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE ||
+             state->build_info->srcAccelerationStructure == state->build_info->dstAccelerationStructure)
+            continue;
+
+         VK_FROM_HANDLE(vk_acceleration_structure, src, state->build_info->srcAccelerationStructure);
+         VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
+
+         struct copy_args consts = {
+            .src_addr = vk_acceleration_structure_get_va(src),
+            .dst_addr = vk_acceleration_structure_get_va(dst),
+            .mode = TU_COPY_MODE_COPY,
+         };
+         vk_common_CmdPushConstants(commandBuffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(consts), &consts);
+
+         TU_CALLX(device, tu_CmdDispatchIndirect)(
+            commandBuffer, vk_buffer_to_handle(src->buffer),
+            src->offset + offsetof(struct tu_accel_struct_header, copy_dispatch_size));
+      }
+   }
+
+   vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+
+   result = get_pipeline_spv(device, "update", update_spv, sizeof(update_spv), sizeof(update_args), &pipeline, &layout);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmdbuf->vk, result);
+      return;
+   }
+
+   tu_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
+      if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
+
+      VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
+      VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(state->build_info);
+
+      struct bvh_layout bvh_layout;
+      get_bvh_layout(geometry_type, state->leaf_node_count, true, &bvh_layout);
+
+      struct update_scratch_layout scratch_layout;
+      get_update_scratch_layout(state, &scratch_layout);
+
+      VkDeviceAddress va = vk_acceleration_structure_get_va(dst);
+      VkDeviceAddress scratch = state->build_info->scratchData.deviceAddress;
+
+      struct update_args consts = {
+         .bvh = va + bvh_layout.bvh_offset,
+         .leaf_map = va + bvh_layout.leaf_map_offset,
+         .header = va,
+         .ready_count = scratch + scratch_layout.ready_count_offset,
+         .bounds = scratch + scratch_layout.bounds_offset,
+      };
+
+      uint32_t first_id = 0;
+      for (uint32_t j = 0; j < state->build_info->geometryCount; j++) {
+         const VkAccelerationStructureGeometryKHR *geom =
+            state->build_info->pGeometries ? &state->build_info->pGeometries[j] : state->build_info->ppGeometries[j];
+         const VkAccelerationStructureBuildRangeInfoKHR *range = &state->build_range_infos[j];
+
+         consts.geom_data = vk_fill_geometry_data(state->build_info->type, first_id, j, geom, range);
+         consts.primitive_count = range->primitiveCount;
+
+         vk_common_CmdPushConstants(commandBuffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(consts), &consts);
+         tu_dispatch_unaligned(commandBuffer, range->primitiveCount, 1, 1);
+
+         first_id += range->primitiveCount;
+      }
+   }
 }
 
 static void
@@ -169,6 +359,20 @@ tu_encode(VkCommandBuffer commandBuffer,
    VkPipeline pipeline;
    VkPipelineLayout layout;
 
+   bool has_update = false, has_build = false;
+   for (uint32_t i = 0; i < build_count; i++) {
+      if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+         has_update = true;
+      else
+         has_build = true;
+   }
+
+   if (has_update)
+      tu_update_as(commandBuffer, states, build_count);
+
+   if (!has_build)
+      return;
+
    /* Insert barrier so that build data gets reflected properly for encode pass */
    vk_bvh_build_barrier_compute_to_compute(commandBuffer, true);
 
@@ -183,6 +387,8 @@ tu_encode(VkCommandBuffer commandBuffer,
    bool has_compaction = false;
    for (uint32_t i = 0; i < build_count; i++) {
       const struct vk_acceleration_structure_build_state *state = &states[i];
+      if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
 
       if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR)
          has_compaction = true;
@@ -194,12 +400,15 @@ tu_encode(VkCommandBuffer commandBuffer,
       uint64_t intermediate_bvh_addr = state->build_info->scratchData.deviceAddress + state->scratch.ir_offset;
 
       struct bvh_layout bvh_layout;
-      get_bvh_layout(geometry_type, state->leaf_node_count, &bvh_layout);
+      get_bvh_layout(geometry_type, state->leaf_node_count, state->config.updateable, &bvh_layout);
 
       const struct encode_args args = {
          .intermediate_bvh = intermediate_bvh_addr,
          .output_bvh = vk_acceleration_structure_get_va(dst) + bvh_layout.bvh_offset,
          .header = intermediate_header_addr,
+         .leaf_map = state->config.updateable
+                        ? vk_acceleration_structure_get_va(dst) + bvh_layout.leaf_map_offset
+                        : 0,
          .output_bvh_offset = bvh_layout.bvh_offset,
          .leaf_node_count = state->leaf_node_count,
          .geometry_type = geometry_type,
@@ -232,12 +441,14 @@ tu_encode(VkCommandBuffer commandBuffer,
 
    for (uint32_t i = 0; i < build_count; i++) {
       const struct vk_acceleration_structure_build_state *state = &states[i];
+      if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
 
       VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
       VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(state->build_info);
 
       struct bvh_layout bvh_layout;
-      get_bvh_layout(geometry_type, state->leaf_node_count, &bvh_layout);
+      get_bvh_layout(geometry_type, state->leaf_node_count, state->config.updateable, &bvh_layout);
 
       uint64_t intermediate_header_addr = state->build_info->scratchData.deviceAddress + state->scratch.header_offset;
       VkDeviceAddress header_addr = vk_acceleration_structure_get_va(dst);
@@ -293,6 +504,8 @@ tu_encode(VkCommandBuffer commandBuffer,
 const struct vk_acceleration_structure_build_ops tu_as_build_ops = {
    .get_build_config = tu_get_build_config,
    .get_as_size = get_bvh_size,
+   .get_update_scratch_size = tu_get_update_scratch_size,
+   .init_update_scratch = tu_init_update_scratch,
    .encode = tu_encode,
 };
 
@@ -336,9 +549,10 @@ tu_CmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t inf
       .subgroup_size = device->physical_device->info->threadsize_base *
                        (device->physical_device->expose_double_threadsize ? 2 : 1),
       .bvh_bounds_offset = offsetof(tu_accel_struct_header, aabb),
-      .morton_sort_workgroup_size = 512,
-      .morton_sort_kvs_per_thread = 2,
+      .morton_sort_workgroup_size = tu_morton_sort_workgroup_size(),
+      .morton_sort_kvs_per_thread = tu_morton_sort_kvs_per_thread(),
       .emit_markers = false,
+      .has_update = true,
    };
 
    vk_cmd_build_acceleration_structures(commandBuffer,
@@ -489,8 +703,9 @@ tu_GetAccelerationStructureBuildSizesKHR(VkDevice _device, VkAccelerationStructu
    struct vk_acceleration_structure_build_args args = {
       .subgroup_size = device->physical_device->info->threadsize_base *
                        (device->physical_device->expose_double_threadsize ? 2 : 1),
-      .morton_sort_workgroup_size = 512,
-      .morton_sort_kvs_per_thread = 2,
+      .morton_sort_workgroup_size = tu_morton_sort_workgroup_size(),
+      .morton_sort_kvs_per_thread = tu_morton_sort_kvs_per_thread(),
+      .has_update = true,
    };
 
    vk_get_as_build_sizes(_device, buildType, pBuildInfo, pMaxPrimitiveCounts,
