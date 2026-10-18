@@ -72,9 +72,17 @@ main(void)
    }
 
    uint64_t size = DEREF(header).compacted_size;
+   bool relocate = args.mode != TU_COPY_MODE_SERIALIZE;
    for (uint64_t offset = global_id * 16; offset < size; offset += increment) {
       DEREF(REF(uvec4)(copy_dst_addr + offset)) =
          DEREF(REF(uvec4)(copy_src_addr + offset));
+
+      if (relocate && offset == 16) {
+         DEREF(REF(tu_accel_struct_header)(copy_dst_addr)).bvh_ptr =
+            copy_dst_addr + (DEREF(header).bvh_ptr - DEREF(header).self_ptr);
+      }
+      if (relocate && offset == 80)
+         DEREF(REF(tu_accel_struct_header)(copy_dst_addr)).self_ptr = copy_dst_addr;
 
       /* Do the adjustment inline in the same invocation that copies the data so that we don't have
        * to synchronize. */

@@ -50,6 +50,8 @@ static const uint32_t update_spv[] = {
 
 static_assert(sizeof(struct tu_instance_descriptor) == AS_RECORD_SIZE);
 static_assert(sizeof(struct tu_accel_struct_header) == AS_RECORD_SIZE);
+static_assert(offsetof(struct tu_accel_struct_header, bvh_ptr) == 24);
+static_assert(offsetof(struct tu_accel_struct_header, self_ptr) == 80);
 static_assert(sizeof(struct tu_internal_node) == AS_NODE_SIZE);
 static_assert(sizeof(struct tu_leaf_node) == AS_NODE_SIZE);
 
