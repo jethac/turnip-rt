@@ -1286,6 +1286,20 @@ tu_lrz_track_stencil_tag_state(struct tu_cmd_buffer *cmd, uint32_t a)
       tu_lrz_disable_write_for_rp(cmd, "stencil write based on depth test");
 }
 
+static bool
+tu_lrz_sidefx(void)
+{
+   static const bool enabled = debug_get_bool_option("TU_LRZ_SIDEFX", false);
+   return enabled;
+}
+
+static bool
+tu_lrz_draw_may_change_depth(bool z_write_enable, VkCompareOp compare_op)
+{
+   return z_write_enable && compare_op != VK_COMPARE_OP_EQUAL &&
+          compare_op != VK_COMPARE_OP_NEVER;
+}
+
 template <chip CHIP>
 static struct __GRAS_LRZ_CNTL
 tu6_calculate_lrz_state(struct tu_cmd_buffer *cmd,
@@ -1386,7 +1400,9 @@ tu6_calculate_lrz_state(struct tu_cmd_buffer *cmd,
    }
 
    if (disable_lrz_due_to_fs) {
-      if (cmd->state.lrz.prev_direction != TU_LRZ_UNKNOWN || !cmd->state.lrz.gpu_dir_tracking) {
+      if (cmd->state.lrz.prev_direction != TU_LRZ_UNKNOWN || !cmd->state.lrz.gpu_dir_tracking ||
+          (tu_lrz_sidefx() &&
+           !tu_lrz_draw_may_change_depth(z_write_enable, depth_compare_op))) {
          perf_debug(cmd->device, "Skipping LRZ due to FS");
          temporary_disable_lrz = true;
       } else {
