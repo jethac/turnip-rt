@@ -73,6 +73,7 @@ main(int argc, char **argv)
 
    glsl_type_singleton_init_or_ref();
    copts->disable_cache = true;
+   sopts->target_full_regs = 0;
    struct ir3_compiler *compiler =
       ir3_compiler_create(NULL, dev_id, fd_dev_info_raw(dev_id), copts);
    if (!compiler) {

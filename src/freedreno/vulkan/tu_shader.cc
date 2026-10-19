@@ -3884,6 +3884,53 @@ tu_lower_nir(struct tu_device *dev,
       lower_alpha_to_coverage(nir);
 }
 
+static struct ir3_shader_variant *
+tu_skytrace_variant(struct ir3_shader *ir3_shader,
+                    const struct ir3_shader_key *ir3_key,
+                    bool executable_info,
+                    struct ir3_shader_variant *v)
+{
+   static const int64_t regs = debug_get_num_option("TU_SKYTRACE_REGS", 0);
+   static const char *list = os_get_option("TU_SKYTRACE_BIN");
+   if (regs <= 0 || regs > 48 || !list ||
+       ir3_shader->type != MESA_SHADER_COMPUTE)
+      return v;
+
+   char prefix[13];
+   memcpy(prefix, v->blake3_str, 12);
+   prefix[12] = '\0';
+   if (!strstr(list, prefix) || v->info.max_reg + 1 == regs)
+      return v;
+
+   ir3_shader->options.target_full_regs = (uint8_t) regs;
+   struct ir3_shader_variant *t =
+      ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
+   ir3_shader->options.target_full_regs = 0;
+
+   if (!t) {
+      mesa_logw("tu-skytrace: %s: no variant at %u regs", prefix,
+                (unsigned) regs);
+      return v;
+   }
+
+   bool lower = regs < v->info.max_reg + 1;
+   if (lower ? t->info.max_waves <= v->info.max_waves
+             : t->info.max_reg <= v->info.max_reg) {
+      mesa_logi("tu-skytrace: %s: unchanged at %u regs", prefix,
+                (unsigned) regs);
+      ralloc_free(t);
+      return v;
+   }
+
+   mesa_logi("tu-skytrace: %s -> %.12s regs %d -> %d waves %d -> %d "
+             "instrs %u -> %u stp %u ldp %u",
+             prefix, t->blake3_str, v->info.max_reg + 1, t->info.max_reg + 1,
+             v->info.max_waves, t->info.max_waves, v->info.instrs_count,
+             t->info.instrs_count, t->info.stp_count, t->info.ldp_count);
+   ralloc_free(v);
+   return t;
+}
+
 VkResult
 tu_shader_create(struct tu_device *dev,
                  struct tu_shader **shader_out,
@@ -3994,8 +4041,12 @@ tu_shader_create(struct tu_device *dev,
    if (lane_linear)
       ir3_shader->cs.force_linear_dispatch = true;
 
-   shader->variant =
+   struct ir3_shader_variant *variant =
       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
+   if (variant)
+      variant = tu_skytrace_variant(ir3_shader, ir3_key, executable_info,
+                                    variant);
+   shader->variant = variant;
 
    static const bool log_hashes =
       debug_get_bool_option("TU_LOG_SHADER_HASHES", false);

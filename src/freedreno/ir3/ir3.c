@@ -619,6 +619,21 @@ ir3_collect_info(struct ir3_shader_variant *v)
    if (min_reg_count > 0)
       info->max_reg = MAX2(info->max_reg, min_reg_count - 1);
 
+   unsigned target_regs = v->shader_options.target_full_regs;
+   if (target_regs > regs_count && target_regs <= 48 &&
+       target_regs * (info->double_threadsize ? 2 : 1) <=
+          compiler->reg_size_vec4 &&
+       (!ir3_shader_compute(v) || !v->has_barrier ||
+        ir3_get_reg_dependent_max_waves(compiler, target_regs,
+                                        info->double_threadsize) >=
+           ir3_get_waves_per_wg(v, info->double_threadsize))) {
+      unsigned half_regs =
+         compiler->gen >= 6 ? (info->max_half_reg + 2) / 2 : 0;
+      info->max_reg =
+         MAX2(info->max_reg, (int8_t)(target_regs - 1 - half_regs));
+      regs_count = target_regs;
+   }
+
    /* TODO this is different for earlier gens, but earlier gens don't use this */
    info->subgroup_size = compiler->info->threadsize_base *
                          (info->double_threadsize ? 2 : 1);

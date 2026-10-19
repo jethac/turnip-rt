@@ -642,6 +642,8 @@ struct ir3_shader_options {
    bool fragdata_dynamic_remap;
 
    bool no_early_preamble;
+
+   uint8_t target_full_regs;
 };
 
 struct ir3_shader_output {
