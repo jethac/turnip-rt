@@ -306,7 +306,8 @@ lane_eval(const struct lane_shfl_state *st, nir_scalar s, uint32_t lane,
    nir_const_value src[NIR_ALU_MAX_INPUTS];
    nir_const_value *srcs[NIR_ALU_MAX_INPUTS];
    for (unsigned i = 0; i < info->num_inputs; i++) {
-      if (info->input_sizes[i] != 0)
+      if (info->input_sizes[i] != 0 ||
+          nir_alu_type_get_base_type(info->input_types[i]) == nir_type_float)
          return false;
       if (bit_size == 0 && !nir_alu_type_get_type_size(info->input_types[i]))
          bit_size = alu->src[i].src.ssa->bit_size;
