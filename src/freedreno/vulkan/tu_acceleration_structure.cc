@@ -48,12 +48,25 @@ static const uint32_t update_spv[] = {
 #include "bvh/update.spv.h"
 };
 
+static const uint32_t update_batch_spv[] = {
+#include "bvh/update_batch.spv.h"
+};
+
+static const uint32_t update_batch_lean_spv[] = {
+#include "bvh/update_batch_lean.spv.h"
+};
+
 static_assert(sizeof(struct tu_instance_descriptor) == AS_RECORD_SIZE);
 static_assert(sizeof(struct tu_accel_struct_header) == AS_RECORD_SIZE);
 static_assert(offsetof(struct tu_accel_struct_header, bvh_ptr) == 24);
 static_assert(offsetof(struct tu_accel_struct_header, self_ptr) == 80);
 static_assert(sizeof(struct tu_internal_node) == AS_NODE_SIZE);
 static_assert(sizeof(struct tu_leaf_node) == AS_NODE_SIZE);
+static_assert(sizeof(struct update_batch_task) == 96);
+static_assert(offsetof(struct update_batch_task, geom_data) == 40);
+static_assert(offsetof(struct update_batch_task, primitive_count) == 88);
+static_assert(offsetof(struct update_batch_task, first_group) == 92);
+static_assert(sizeof(struct update_batch_args) == 16);
 
 static VkResult
 get_pipeline_spv(struct tu_device *device,
@@ -145,6 +158,15 @@ tu_as_use_hploc(void)
    static int value = -1;
    if (value < 0)
       value = debug_get_bool_option("TU_AS_HPLOC", true);
+   return value;
+}
+
+static uint32_t
+tu_rt_batch_refit(void)
+{
+   static int value = -1;
+   if (value < 0)
+      value = CLAMP(debug_get_num_option("TU_RT_BATCH_REFIT", 0), 0, 2);
    return value;
 }
 
@@ -271,6 +293,136 @@ tu_get_build_config(VkDevice device,
 }
 
 static void
+tu_update_as_batch_dispatch(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
+                            uint64_t tasks, uint32_t task_count, uint32_t group_count)
+{
+   const struct update_batch_args consts = {
+      .tasks = tasks,
+      .task_count = task_count,
+      .group_count = group_count,
+   };
+   vk_common_CmdPushConstants(commandBuffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(consts), &consts);
+   vk_common_CmdDispatch(commandBuffer, group_count, 1, 1);
+}
+
+static bool
+tu_update_as_batched(VkCommandBuffer commandBuffer,
+                     const struct vk_acceleration_structure_build_state *states,
+                     uint32_t build_count)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
+   struct tu_device *device = cmdbuf->device;
+   const uint32_t max_groups = 65535;
+
+   uint32_t task_count = 0;
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
+      if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
+
+      for (uint32_t j = 0; j < state->build_info->geometryCount; j++) {
+         uint32_t primitive_count = state->build_range_infos[j].primitiveCount;
+         if (!primitive_count)
+            continue;
+         if (DIV_ROUND_UP(primitive_count, TU_UPDATE_WORKGROUP_SIZE) > max_groups)
+            return false;
+         task_count++;
+      }
+   }
+
+   if (!task_count)
+      return true;
+
+   VkPipeline pipeline;
+   VkPipelineLayout layout;
+   VkResult result = tu_rt_batch_refit() >= 2 ?
+      get_pipeline_spv(device, "update_batch_lean", update_batch_lean_spv, sizeof(update_batch_lean_spv),
+                       sizeof(update_batch_args), &pipeline, &layout) :
+      get_pipeline_spv(device, "update_batch", update_batch_spv, sizeof(update_batch_spv),
+                       sizeof(update_batch_args), &pipeline, &layout);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmdbuf->vk, result);
+      return true;
+   }
+
+   tu_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+   struct tu_cs_memory mem = {};
+   uint32_t remaining = task_count;
+   uint32_t chunk_tasks = 0;
+   uint32_t chunk_groups = 0;
+
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
+      if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
+
+      VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
+      VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(state->build_info);
+
+      struct bvh_layout bvh_layout;
+      get_bvh_layout(geometry_type, state->leaf_node_count, true, &bvh_layout);
+
+      struct update_scratch_layout scratch_layout;
+      get_update_scratch_layout(state, &scratch_layout);
+
+      VkDeviceAddress va = vk_acceleration_structure_get_va(dst);
+      VkDeviceAddress scratch = state->build_info->scratchData.deviceAddress;
+
+      uint32_t first_id = 0;
+      for (uint32_t j = 0; j < state->build_info->geometryCount; j++) {
+         const VkAccelerationStructureGeometryKHR *geom =
+            state->build_info->pGeometries ? &state->build_info->pGeometries[j] : state->build_info->ppGeometries[j];
+         const VkAccelerationStructureBuildRangeInfoKHR *range = &state->build_range_infos[j];
+         uint32_t primitive_count = range->primitiveCount;
+
+         if (primitive_count) {
+            uint32_t groups = DIV_ROUND_UP(primitive_count, TU_UPDATE_WORKGROUP_SIZE);
+
+            if (chunk_tasks && chunk_groups + groups > max_groups) {
+               tu_update_as_batch_dispatch(commandBuffer, layout, mem.iova, chunk_tasks, chunk_groups);
+               chunk_tasks = 0;
+               chunk_groups = 0;
+            }
+
+            if (!chunk_tasks) {
+               result = tu_cs_alloc(&cmdbuf->sub_cs,
+                                    DIV_ROUND_UP(remaining * sizeof(struct update_batch_task), 64), 64 / 4,
+                                    &mem);
+               if (result != VK_SUCCESS) {
+                  vk_command_buffer_set_error(&cmdbuf->vk, result);
+                  return true;
+               }
+            }
+
+            const struct update_batch_task task = {
+               .bvh = va + bvh_layout.bvh_offset,
+               .leaf_map = va + bvh_layout.leaf_map_offset,
+               .header = va,
+               .ready_count = scratch + scratch_layout.ready_count_offset,
+               .bounds = scratch + scratch_layout.bounds_offset,
+               .geom_data = vk_fill_geometry_data(state->build_info->type, first_id, j, geom, range),
+               .primitive_count = primitive_count,
+               .first_group = chunk_groups,
+            };
+            memcpy(reinterpret_cast<char *>(mem.map) + chunk_tasks * sizeof(task), &task, sizeof(task));
+
+            chunk_tasks++;
+            chunk_groups += groups;
+            remaining--;
+         }
+
+         first_id += primitive_count;
+      }
+   }
+
+   if (chunk_tasks)
+      tu_update_as_batch_dispatch(commandBuffer, layout, mem.iova, chunk_tasks, chunk_groups);
+
+   return true;
+}
+
+static void
 tu_update_as(VkCommandBuffer commandBuffer,
              struct vk_acceleration_structure_build_state *states,
              uint32_t build_count)
@@ -322,6 +474,9 @@ tu_update_as(VkCommandBuffer commandBuffer,
 
    vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
    vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+
+   if (tu_rt_batch_refit() && tu_update_as_batched(commandBuffer, states, build_count))
+      return;
 
    result = get_pipeline_spv(device, "update", update_spv, sizeof(update_spv), sizeof(update_args), &pipeline, &layout);
    if (result != VK_SUCCESS) {

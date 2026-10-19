@@ -162,6 +162,29 @@ struct update_args {
    uint32_t primitive_count;
 };
 
+#define TU_UPDATE_WORKGROUP_SIZE 128
+
+struct update_batch_task {
+   VOID_REF bvh;
+   VOID_REF leaf_map;
+   REF(tu_accel_struct_header) header;
+   VOID_REF ready_count;
+   VOID_REF bounds;
+   vk_bvh_geometry_data geom_data;
+   uint32_t primitive_count;
+   uint32_t first_group;
+};
+
+#ifdef VULKAN
+TYPE(update_batch_task, 8);
+#endif
+
+struct update_batch_args {
+   VOID_REF tasks;
+   uint32_t task_count;
+   uint32_t group_count;
+};
+
 struct header_args {
    REF(vk_ir_header) src;
    REF(tu_accel_struct_header) dst;
