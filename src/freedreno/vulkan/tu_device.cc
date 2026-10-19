@@ -139,6 +139,12 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
    const char *push_ubo_src = os_get_option("TU_PUSH_UBO_SPECULATE_SRC");
    if (push_ubo_src)
       _mesa_blake3_update(&ctx, push_ubo_src, strlen(push_ubo_src));
+   const uint64_t skytrace_regs =
+      (uint64_t) debug_get_num_option("TU_SKYTRACE_REGS", 0);
+   _mesa_blake3_update(&ctx, &skytrace_regs, sizeof(skytrace_regs));
+   const char *skytrace_bin = os_get_option("TU_SKYTRACE_BIN");
+   if (skytrace_bin)
+      _mesa_blake3_update(&ctx, skytrace_bin, strlen(skytrace_bin));
    const uint64_t rt_budgets[] = {
       (uint64_t) debug_get_num_option("TU_RT_HIT_BUDGET", 250000),
       (uint64_t) debug_get_num_option("TU_RT_MAX_PREINLINE", 400000),
