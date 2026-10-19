@@ -4,10 +4,15 @@
  */
 
 #include "nir/nir_builder.h"
+#include "nir/nir_constant_expressions.h"
 
 #include "tu_shader.h"
 
 #define TU_HW_WAVE 64
+#define TU_LANE_SHFL_MAX_DELTAS 4
+#define TU_LANE_SHFL_CACHE 4
+#define TU_LANE_SHFL_MAX_DEPTH 16
+#define TU_LANE_SHFL_BUDGET 64
 
 struct emu_state {
    unsigned size;
@@ -245,4 +250,202 @@ tu_nir_lower_emulated_subgroups(nir_shader *shader, unsigned subgroup_size)
    shader->info.min_subgroup_size = TU_HW_WAVE;
    shader->info.max_subgroup_size = TU_HW_WAVE;
    return p;
+}
+
+struct lane_shfl_class {
+   nir_def *idx;
+   bool ok;
+   bool is_xor;
+   uint32_t xor_mask;
+   unsigned num_deltas;
+   int32_t deltas[TU_LANE_SHFL_MAX_DELTAS];
+};
+
+struct lane_shfl_state {
+   unsigned lanes;
+   unsigned exec_mode;
+   unsigned next;
+   struct lane_shfl_class cache[TU_LANE_SHFL_CACHE];
+};
+
+static bool
+lane_eval(const struct lane_shfl_state *st, nir_scalar s, uint32_t lane,
+          unsigned depth, unsigned *budget, uint64_t *out)
+{
+   if (depth > TU_LANE_SHFL_MAX_DEPTH || *budget == 0)
+      return false;
+   (*budget)--;
+
+   s = nir_scalar_chase_movs(s);
+
+   if (nir_scalar_is_const(s)) {
+      *out = nir_scalar_as_uint(s);
+      return true;
+   }
+
+   if (nir_scalar_is_intrinsic(s)) {
+      if (nir_scalar_intrinsic_op(s) != nir_intrinsic_load_subgroup_invocation)
+         return false;
+      *out = lane & BITFIELD64_MASK(s.def->bit_size);
+      return true;
+   }
+
+   if (!nir_scalar_is_alu(s))
+      return false;
+
+   nir_alu_instr *alu = nir_scalar_as_alu(s);
+   const nir_op_info *info = &nir_op_infos[alu->op];
+   if (info->output_size != 0 ||
+       nir_alu_type_get_base_type(info->output_type) == nir_type_float)
+      return false;
+
+   unsigned bit_size = 0;
+   if (!nir_alu_type_get_type_size(info->output_type))
+      bit_size = alu->def.bit_size;
+
+   nir_const_value src[NIR_ALU_MAX_INPUTS];
+   nir_const_value *srcs[NIR_ALU_MAX_INPUTS];
+   for (unsigned i = 0; i < info->num_inputs; i++) {
+      if (info->input_sizes[i] != 0 ||
+          nir_alu_type_get_base_type(info->input_types[i]) == nir_type_float)
+         return false;
+      if (bit_size == 0 && !nir_alu_type_get_type_size(info->input_types[i]))
+         bit_size = alu->src[i].src.ssa->bit_size;
+      nir_scalar c = nir_scalar_chase_alu_src(s, i);
+      uint64_t v;
+      if (!lane_eval(st, c, lane, depth + 1, budget, &v))
+         return false;
+      src[i] = nir_const_value_for_raw_uint(v, c.def->bit_size);
+      srcs[i] = &src[i];
+   }
+
+   if (bit_size == 0)
+      bit_size = 32;
+
+   nir_const_value dst[NIR_MAX_VEC_COMPONENTS];
+   memset(dst, 0, sizeof(dst));
+   nir_eval_const_opcode(alu->op, dst, NULL, 1, bit_size, srcs, st->exec_mode);
+   *out = nir_const_value_as_uint(dst[0], alu->def.bit_size);
+   return true;
+}
+
+static const struct lane_shfl_class *
+lane_shfl_classify(struct lane_shfl_state *st, nir_def *idx)
+{
+   for (unsigned i = 0; i < TU_LANE_SHFL_CACHE; i++) {
+      if (st->cache[i].idx == idx)
+         return &st->cache[i];
+   }
+
+   struct lane_shfl_class *c = &st->cache[st->next];
+   st->next = (st->next + 1) % TU_LANE_SHFL_CACHE;
+   memset(c, 0, sizeof(*c));
+   c->idx = idx;
+
+   if (idx->num_components != 1 || idx->bit_size != 32)
+      return c;
+
+   nir_scalar s = nir_get_scalar(idx, 0);
+   bool any = false, xor_ok = true, too_many = false;
+   uint32_t mask = 0;
+   for (uint32_t lane = 0; lane < st->lanes; lane++) {
+      unsigned budget = TU_LANE_SHFL_BUDGET;
+      uint64_t v;
+      if (!lane_eval(st, s, lane, 0, &budget, &v))
+         return c;
+
+      uint32_t src = (uint32_t) v;
+      if (src >= st->lanes)
+         continue;
+
+      if (!any) {
+         mask = src ^ lane;
+         any = true;
+      } else if ((src ^ lane) != mask) {
+         xor_ok = false;
+      }
+
+      int32_t d = (int32_t) src - (int32_t) lane;
+      bool found = false;
+      for (unsigned k = 0; k < c->num_deltas; k++)
+         found |= c->deltas[k] == d;
+      if (!found) {
+         if (c->num_deltas < TU_LANE_SHFL_MAX_DELTAS)
+            c->deltas[c->num_deltas++] = d;
+         else
+            too_many = true;
+      }
+   }
+
+   if (!any)
+      return c;
+
+   if (xor_ok) {
+      c->ok = true;
+      c->is_xor = true;
+      c->xor_mask = mask;
+   } else if (!too_many) {
+      c->ok = true;
+   }
+
+   return c;
+}
+
+static nir_def *
+lane_shfl_by(nir_builder *b, nir_def *x, int32_t d)
+{
+   if (d == 0)
+      return x;
+   if (d > 0)
+      return nir_shuffle_down(b, x, nir_imm_int(b, d));
+   return nir_shuffle_up(b, x, nir_imm_int(b, -d));
+}
+
+static bool
+opt_lane_shuffle(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct lane_shfl_state *st = (struct lane_shfl_state *) data;
+
+   if (intr->intrinsic != nir_intrinsic_shuffle)
+      return false;
+
+   nir_def *x = intr->src[0].ssa;
+   nir_def *idx = intr->src[1].ssa;
+   if (x->bit_size != 16 && x->bit_size != 32)
+      return false;
+
+   const struct lane_shfl_class *c = lane_shfl_classify(st, idx);
+   if (!c->ok)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *rep;
+   if (c->is_xor) {
+      rep = c->xor_mask ? nir_shuffle_xor(b, x, nir_imm_int(b, c->xor_mask)) : x;
+   } else {
+      rep = lane_shfl_by(b, x, c->deltas[0]);
+      if (c->num_deltas > 1) {
+         nir_def *delta = nir_isub(b, idx, nir_load_subgroup_invocation(b));
+         for (unsigned k = 1; k < c->num_deltas; k++) {
+            rep = nir_bcsel(b, nir_ieq_imm(b, delta, (uint32_t) c->deltas[k]),
+                            lane_shfl_by(b, x, c->deltas[k]), rep);
+         }
+      }
+   }
+
+   nir_def_replace(&intr->def, rep);
+   return true;
+}
+
+bool
+tu_nir_opt_lane_shuffles(nir_shader *shader, unsigned lanes)
+{
+   assert(util_is_power_of_two_nonzero(lanes) && lanes <= 128);
+   struct lane_shfl_state st;
+   memset(&st, 0, sizeof(st));
+   st.lanes = lanes;
+   st.exec_mode = shader->info.float_controls_execution_mode;
+   return nir_shader_intrinsics_pass(shader, opt_lane_shuffle,
+                                     nir_metadata_control_flow, &st);
 }

@@ -170,6 +170,9 @@ bool
 tu_nir_lower_emulated_subgroups(nir_shader *shader, unsigned subgroup_size);
 
 bool
+tu_nir_opt_lane_shuffles(nir_shader *shader, unsigned lanes);
+
+bool
 tu_nir_lower_multiview(nir_shader *nir, uint32_t mask, struct tu_device *dev,
                        bool last_stage);
 

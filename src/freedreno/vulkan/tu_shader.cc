@@ -236,6 +236,34 @@ tu_softfloat32_skip(void)
    return enabled;
 }
 
+static bool
+tu_lane_shuffle_enabled(void)
+{
+   static const bool enabled =
+      debug_get_bool_option("TU_LANE_SHUFFLE", false);
+   return enabled;
+}
+
+static bool
+tu_has_const_relative_shuffle(nir_shader *nir)
+{
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if ((intr->intrinsic == nir_intrinsic_shuffle_up ||
+                 intr->intrinsic == nir_intrinsic_shuffle_down ||
+                 intr->intrinsic == nir_intrinsic_shuffle_xor) &&
+                nir_src_is_const(intr->src[1]))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static unsigned
 tu_count_instrs(nir_shader *nir)
 {
@@ -401,6 +429,14 @@ tu_spirv_to_nir(struct tu_device *dev,
 
    if (key->emulated_subgroup_size)
       NIR_PASS(_, nir, tu_nir_lower_emulated_subgroups, key->emulated_subgroup_size);
+
+   if (stage == MESA_SHADER_COMPUTE && tu_lane_shuffle_enabled() &&
+       dev->compiler->has_shfl) {
+      unsigned lanes = dev->compiler->info->threadsize_base;
+      if (key->real_wavesize != IR3_SINGLE_ONLY)
+         lanes *= 2;
+      NIR_PASS(_, nir, tu_nir_opt_lane_shuffles, lanes);
+   }
 
    if (key->lower_view_index_to_device_index)
       NIR_PASS(_, nir, nir_lower_view_index_to_device_index);
@@ -3947,8 +3983,16 @@ tu_shader_create(struct tu_device *dev,
                             nir->info.source_blake3[1] };
    mesa_shader_stage src_stage = nir->info.stage;
 
+   const bool lane_linear =
+      src_stage == MESA_SHADER_COMPUTE && !key->ray_tracing &&
+      tu_lane_shuffle_enabled() && dev->compiler->has_shfl &&
+      tu_has_const_relative_shuffle(nir);
+
    struct ir3_shader *ir3_shader =
       ir3_shader_from_nir(dev->compiler, nir, &options);
+
+   if (lane_linear)
+      ir3_shader->cs.force_linear_dispatch = true;
 
    shader->variant =
       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
