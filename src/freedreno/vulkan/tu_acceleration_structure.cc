@@ -52,6 +52,10 @@ static const uint32_t update_batch_spv[] = {
 #include "bvh/update_batch.spv.h"
 };
 
+static const uint32_t update_batch_lean_spv[] = {
+#include "bvh/update_batch_lean.spv.h"
+};
+
 static_assert(sizeof(struct tu_instance_descriptor) == AS_RECORD_SIZE);
 static_assert(sizeof(struct tu_accel_struct_header) == AS_RECORD_SIZE);
 static_assert(offsetof(struct tu_accel_struct_header, bvh_ptr) == 24);
@@ -162,7 +166,7 @@ tu_rt_batch_refit(void)
 {
    static int value = -1;
    if (value < 0)
-      value = CLAMP(debug_get_num_option("TU_RT_BATCH_REFIT", 0), 0, 1);
+      value = CLAMP(debug_get_num_option("TU_RT_BATCH_REFIT", 0), 0, 2);
    return value;
 }
 
@@ -331,8 +335,11 @@ tu_update_as_batched(VkCommandBuffer commandBuffer,
 
    VkPipeline pipeline;
    VkPipelineLayout layout;
-   VkResult result = get_pipeline_spv(device, "update_batch", update_batch_spv, sizeof(update_batch_spv),
-                                      sizeof(update_batch_args), &pipeline, &layout);
+   VkResult result = tu_rt_batch_refit() >= 2 ?
+      get_pipeline_spv(device, "update_batch_lean", update_batch_lean_spv, sizeof(update_batch_lean_spv),
+                       sizeof(update_batch_args), &pipeline, &layout) :
+      get_pipeline_spv(device, "update_batch", update_batch_spv, sizeof(update_batch_spv),
+                       sizeof(update_batch_args), &pipeline, &layout);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmdbuf->vk, result);
       return true;

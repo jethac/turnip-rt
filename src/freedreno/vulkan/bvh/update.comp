@@ -151,17 +151,28 @@ main()
 
    uint32_t parent = fetch_parent(node);
    while (parent != VK_BVH_INVALID_NODE) {
+#ifndef BATCH_LEAN
       memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer,
                     gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+#endif
 
       REF(tu_internal_node) parent_node = REF(tu_internal_node)(OFFSET(args.bvh, parent * SIZEOF(tu_internal_node)));
       uint32_t child_count = uint32_t(DEREF(parent_node).child_count);
 
+#ifdef BATCH_LEAN
+      uint32_t ready = atomicAdd(DEREF(INDEX(uint32_t, args.ready_count, parent)), 1, gl_ScopeDevice,
+                                 gl_StorageSemanticsBuffer, gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+      if (ready != child_count - 1)
+         return;
+
+      memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire | gl_SemanticsMakeVisible);
+#else
       uint32_t ready = atomicAdd(DEREF(INDEX(uint32_t, args.ready_count, parent)), 1, gl_ScopeDevice,
                                  gl_StorageSemanticsBuffer,
                                  gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
       if (ready != child_count - 1)
          return;
+#endif
 
       uint32_t first_child = DEREF(parent_node).id;
 
