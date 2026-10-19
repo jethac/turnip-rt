@@ -13,6 +13,7 @@
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
 #include "nir/nir_serialize.h"
+#include "compiler/spirv/spirv.h"
 #include "spirv/nir_spirv.h"
 #include "util/mesa-blake3.h"
 #include "util/shader_stats.h"
@@ -5001,6 +5002,42 @@ tu_CreateGraphicsPipelines(VkDevice device,
 }
 TU_GENX(tu_CreateGraphicsPipelines);
 
+static bool
+tu_stage_has_module_processed(const VkPipelineShaderStageCreateInfo *stage,
+                              const char *tag)
+{
+   const uint32_t *words = NULL;
+   size_t size = 0;
+   VK_FROM_HANDLE(vk_shader_module, module, stage->module);
+   if (module) {
+      words = (const uint32_t *) module->data;
+      size = module->size;
+   } else {
+      const VkShaderModuleCreateInfo *mci =
+         vk_find_struct_const(stage->pNext, SHADER_MODULE_CREATE_INFO);
+      if (mci) {
+         words = mci->pCode;
+         size = mci->codeSize;
+      }
+   }
+   if (!words)
+      return false;
+
+   const size_t count = size / 4;
+   const size_t tag_len = strlen(tag);
+   for (size_t i = 5; i < count;) {
+      const uint32_t op = words[i] & SpvOpCodeMask;
+      const uint32_t len = words[i] >> SpvWordCountShift;
+      if (!len || len > count - i || op == SpvOpFunction)
+         break;
+      if (op == SpvOpModuleProcessed && (len - 1) * 4 > tag_len &&
+          !memcmp(&words[i + 1], tag, tag_len + 1))
+         return true;
+      i += len;
+   }
+   return false;
+}
+
 template <chip CHIP>
 static VkResult
 tu_compute_pipeline_create(VkDevice device,
@@ -5053,6 +5090,14 @@ tu_compute_pipeline_create(VkDevice device,
    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo *subgroup_info =
       vk_find_struct_const(stage_info,
                            PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO);
+   const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo marker_subgroup_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+      .requiredSubgroupSize = 32,
+   };
+   if (!subgroup_info &&
+       tu_stage_has_module_processed(stage_info,
+                                     "turnip.required_subgroup_size=32"))
+      subgroup_info = &marker_subgroup_info;
    tu_shader_key_subgroup_size(&key, allow_varying_subgroup_size,
                                require_full_subgroups, subgroup_info,
                                dev);
