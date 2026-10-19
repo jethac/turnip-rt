@@ -236,6 +236,14 @@ tu_softfloat32_skip(void)
    return enabled;
 }
 
+static bool
+tu_lane_shuffle_enabled(void)
+{
+   static const bool enabled =
+      debug_get_bool_option("TU_LANE_SHUFFLE", false);
+   return enabled;
+}
+
 static unsigned
 tu_count_instrs(nir_shader *nir)
 {
@@ -401,6 +409,14 @@ tu_spirv_to_nir(struct tu_device *dev,
 
    if (key->emulated_subgroup_size)
       NIR_PASS(_, nir, tu_nir_lower_emulated_subgroups, key->emulated_subgroup_size);
+
+   if (stage == MESA_SHADER_COMPUTE && tu_lane_shuffle_enabled() &&
+       dev->compiler->has_shfl) {
+      unsigned lanes = dev->compiler->info->threadsize_base;
+      if (key->real_wavesize != IR3_SINGLE_ONLY)
+         lanes *= 2;
+      NIR_PASS(_, nir, tu_nir_opt_lane_shuffles, lanes);
+   }
 
    if (key->lower_view_index_to_device_index)
       NIR_PASS(_, nir, nir_lower_view_index_to_device_index);
