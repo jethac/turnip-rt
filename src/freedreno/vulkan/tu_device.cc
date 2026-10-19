@@ -131,6 +131,7 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
       debug_get_bool_option("TU_RT_BST", true),
       debug_get_bool_option("TU_FP16_DENORM_FLUSH", false),
       debug_get_bool_option("TU_PUSH_UBO_SPECULATE", false),
+      debug_get_bool_option("TU_ATOMIC_EARLY_OUT", false),
    };
    _mesa_blake3_update(&ctx, env_flags, sizeof(env_flags));
    const uint64_t cs_constlen_cap =
@@ -3064,6 +3065,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
          .storage_16bit = physical_device->info->props.storage_16bit,
          .storage_8bit = physical_device->info->props.storage_8bit,
          .shared_push_consts = !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
+         .atomic_early_out =
+            debug_get_bool_option("TU_ATOMIC_EARLY_OUT", false),
          .uche_trap_base = physical_device->uche_trap_base,
       };
       device->compiler = ir3_compiler_create(

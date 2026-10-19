@@ -55,6 +55,8 @@ struct ir3_compiler_options {
    /* "dual_color_blend_by_location" workaround is enabled: */
    bool dual_color_blend_by_location;
 
+   bool atomic_early_out;
+
    uint64_t uche_trap_base;
 };
 
