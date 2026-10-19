@@ -1571,7 +1571,11 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
    }
 
    /* Lower scratch writemasks */
-   progress |= OPT(s, nir_lower_atomics, atomic_supported);
+   const nir_lower_atomics_options atomics_options = {
+      .supported = atomic_supported,
+      .early_out_unused_idempotent = so->compiler->options.atomic_early_out,
+   };
+   progress |= OPT(s, nir_lower_atomics_with_options, &atomics_options);
 
    if (OPT(s, nir_lower_locals_to_regs, 1)) {
       progress = true;

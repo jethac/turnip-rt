@@ -44,7 +44,7 @@
  */
 
 static nir_def *
-build_atomic(nir_builder *b, nir_intrinsic_instr *intr)
+build_atomic(nir_builder *b, nir_intrinsic_instr *intr, bool early_out)
 {
    nir_def *load;
    switch (intr->intrinsic) {
@@ -84,16 +84,18 @@ build_atomic(nir_builder *b, nir_intrinsic_instr *intr)
 
    nir_def *data = nir_get_io_data_src(intr)->ssa;
    nir_loop *loop = nir_push_loop(b);
-   nir_def *xchg;
+   nir_def *before, *xchg;
    {
       nir_phi_instr *phi = nir_phi_instr_create(b->shader);
       nir_def_init(&phi->instr, &phi->def, 1, intr->def.bit_size);
       nir_phi_instr_add_src(phi, nir_def_block(load), load);
-      nir_def *before = &phi->def;
+      before = &phi->def;
       nir_def *expected = nir_build_alu2(
          b, nir_atomic_op_to_alu(nir_intrinsic_atomic_op(intr)), before, data);
       nir_alu_instr *op = nir_def_as_alu(expected);
       op->fp_math_ctrl = nir_op_valid_fp_math_ctrl(op->op, nir_fp_no_fast_math);
+      if (early_out)
+         nir_break_if(b, nir_ieq(b, expected, before));
       switch (intr->intrinsic) {
       case nir_intrinsic_ssbo_atomic:
          xchg = nir_ssbo_atomic_swap(b, intr->def.bit_size,
@@ -135,21 +137,91 @@ build_atomic(nir_builder *b, nir_intrinsic_instr *intr)
       nir_builder_instr_insert(b, &phi->instr);
    }
    nir_pop_loop(b, loop);
-   return xchg;
+   return early_out ? before : xchg;
+}
+
+struct lower_atomics_state {
+   nir_instr_filter_cb supported;
+   bool early_out;
+   nir_variable_mode release_modes;
+};
+
+static nir_variable_mode
+atomic_modes(const nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_global_atomic:
+      return nir_var_mem_ssbo | nir_var_mem_global;
+   case nir_intrinsic_shared_atomic:
+      return nir_var_mem_shared;
+   case nir_intrinsic_bindless_image_atomic:
+      return nir_var_image;
+   default:
+      UNREACHABLE("unsupported atomic type");
+   }
+}
+
+static bool
+can_early_out(const struct lower_atomics_state *state,
+              nir_intrinsic_instr *intr)
+{
+   if (!state->early_out || !nir_def_is_unused(&intr->def) ||
+       (nir_intrinsic_access(intr) & ACCESS_VOLATILE) ||
+       (state->release_modes & atomic_modes(intr)))
+      return false;
+
+   switch (nir_intrinsic_atomic_op(intr)) {
+   case nir_atomic_op_imin:
+   case nir_atomic_op_umin:
+   case nir_atomic_op_imax:
+   case nir_atomic_op_umax:
+   case nir_atomic_op_iand:
+   case nir_atomic_op_ior:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static nir_variable_mode
+gather_release_modes(nir_shader *shader)
+{
+   nir_variable_mode modes = 0;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_end_invocation_interlock) {
+               modes |= nir_var_all;
+            } else if (intr->intrinsic == nir_intrinsic_barrier &&
+                       (nir_intrinsic_memory_semantics(intr) &
+                        NIR_MEMORY_RELEASE)) {
+               modes |= nir_intrinsic_memory_modes(intr);
+            }
+         }
+      }
+   }
+
+   return modes;
 }
 
 static bool
 lower_atomics(struct nir_builder *b, nir_intrinsic_instr *intr,
-              void *supported)
+              void *data)
 {
-   nir_instr_filter_cb supported_cb = supported;
+   const struct lower_atomics_state *state = data;
 
    if (intr->intrinsic != nir_intrinsic_ssbo_atomic &&
        intr->intrinsic != nir_intrinsic_shared_atomic &&
        intr->intrinsic != nir_intrinsic_global_atomic &&
        intr->intrinsic != nir_intrinsic_bindless_image_atomic)
       return false;
-   if (supported_cb(&intr->instr, NULL))
+   if (state->supported(&intr->instr, NULL))
       return false;
    b->cursor = nir_before_instr(&intr->instr);
    switch (nir_intrinsic_atomic_op(intr)) {
@@ -164,7 +236,8 @@ lower_atomics(struct nir_builder *b, nir_intrinsic_instr *intr,
    case nir_atomic_op_fmin:
    case nir_atomic_op_fmax:
    case nir_atomic_op_iadd: {
-      nir_def_replace(&intr->def, build_atomic(b, intr));
+      bool early_out = can_early_out(state, intr);
+      nir_def_replace(&intr->def, build_atomic(b, intr, early_out));
       return true;
    }
    case nir_atomic_op_cmpxchg:
@@ -177,8 +250,26 @@ lower_atomics(struct nir_builder *b, nir_intrinsic_instr *intr,
 }
 
 bool
+nir_lower_atomics_with_options(nir_shader *shader,
+                               const nir_lower_atomics_options *options)
+{
+   struct lower_atomics_state state = {
+      .supported = options->supported,
+      .early_out = options->early_out_unused_idempotent,
+      .release_modes = options->early_out_unused_idempotent ?
+                       gather_release_modes(shader) : 0,
+   };
+
+   return nir_shader_intrinsics_pass(shader, lower_atomics,
+                                     nir_metadata_none, &state);
+}
+
+bool
 nir_lower_atomics(nir_shader *shader, nir_instr_filter_cb supported)
 {
-   return nir_shader_intrinsics_pass(shader, lower_atomics,
-                                     nir_metadata_none, supported);
+   const nir_lower_atomics_options options = {
+      .supported = supported,
+   };
+
+   return nir_lower_atomics_with_options(shader, &options);
 }
