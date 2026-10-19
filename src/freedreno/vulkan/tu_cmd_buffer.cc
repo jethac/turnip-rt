@@ -1418,6 +1418,85 @@ use_hw_binning(struct tu_cmd_buffer *cmd)
    return vsc->binning_possible && vsc->binning_useful;
 }
 
+struct tu_vkd3d_gmem_config {
+   bool enabled;
+   bool dry_run;
+   uint32_t min_draws;
+   uint32_t max_bins;
+   uint32_t max_pixels;
+};
+
+static uint32_t
+tu_vkd3d_gmem_env_u32(const char *name, uint32_t dfault)
+{
+   int64_t value = debug_get_num_option(name, dfault);
+   return (uint32_t) CLAMP(value, (int64_t) 0, (int64_t) UINT32_MAX);
+}
+
+static struct tu_vkd3d_gmem_config
+tu_vkd3d_gmem_config_init(void)
+{
+   struct tu_vkd3d_gmem_config config;
+   config.dry_run = debug_get_bool_option("TU_VKD3D_GMEM_DRYRUN", false);
+   config.enabled =
+      debug_get_bool_option("TU_VKD3D_GMEM", false) || config.dry_run;
+   config.min_draws = tu_vkd3d_gmem_env_u32("TU_VKD3D_GMEM_MIN_DRAWS", 12);
+   config.max_bins = tu_vkd3d_gmem_env_u32("TU_VKD3D_GMEM_MAX_BINS", 1);
+   config.max_pixels =
+      tu_vkd3d_gmem_env_u32("TU_VKD3D_GMEM_MAX_PIXELS", 1024 * 1024);
+   if (config.enabled)
+      mesa_logi("TU_VKD3D_GMEM: dry_run=%u min_draws=%u max_bins=%u "
+                "max_pixels=%u",
+                (unsigned) config.dry_run, config.min_draws, config.max_bins,
+                config.max_pixels);
+   return config;
+}
+
+static const struct tu_vkd3d_gmem_config &
+tu_vkd3d_gmem_get_config(void)
+{
+   static const struct tu_vkd3d_gmem_config config =
+      tu_vkd3d_gmem_config_init();
+   return config;
+}
+
+static bool
+tu_vkd3d_gmem_pass_eligible(struct tu_cmd_buffer *cmd,
+                            const struct tu_vsc_config *vsc)
+{
+   const struct tu_vkd3d_gmem_config &config = tu_vkd3d_gmem_get_config();
+   if (!config.enabled || tu_foveate_enabled())
+      return false;
+
+   const struct tu_render_pass *pass = cmd->state.pass;
+   const struct tu_render_pass_state *rp = &cmd->state.rp;
+   if (pass->has_fdm || pass->num_views || pass->subpass_count != 1 ||
+       cmd->state.framebuffer->layers > 1 ||
+       cmd->state.per_layer_render_area || rp->uses_ray_intersection ||
+       rp->xfb_used || rp->has_prim_generated_query_in_rp ||
+       cmd->state.prim_generated_query_running_before_rp ||
+       rp->drawcall_count < config.min_draws)
+      return false;
+
+   const VkExtent2D *extent = &cmd->state.render_areas[0].extent;
+   if ((uint64_t) extent->width * extent->height > config.max_pixels)
+      return false;
+
+   if (vsc->tile_count.width * vsc->tile_count.height > config.max_bins)
+      return false;
+
+   bool has_gmem_attachment = false;
+   for (uint32_t i = 0; i < pass->attachment_count; i++) {
+      const struct tu_render_pass_attachment *att = &pass->attachments[i];
+      if (att->samples != VK_SAMPLE_COUNT_1_BIT)
+         return false;
+      if (att->gmem)
+         has_gmem_attachment = true;
+   }
+
+   return has_gmem_attachment;
+}
+
 static bool
 use_sysmem_rendering(struct tu_cmd_buffer *cmd,
                      tu_autotune::rp_ctx_t *rp_ctx,
@@ -1494,6 +1573,15 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
       cmd->state.rp.force_render_mode_reason =
          "Too many tiles and HW binning is not possible";
       return true;
+   }
+
+   if (tu_vkd3d_gmem_pass_eligible(cmd, vsc)) {
+      if (tu_vkd3d_gmem_get_config().dry_run) {
+         cmd->state.rp.force_render_mode_reason = "TU_VKD3D_GMEM_DRYRUN";
+         return true;
+      }
+      cmd->state.rp.force_render_mode_reason = "TU_VKD3D_GMEM";
+      return false;
    }
 
    tu_autotune::render_mode optimal_mode =
@@ -6384,6 +6472,7 @@ tu_render_pass_state_merge(struct tu_cmd_buffer *cmd, const struct tu_render_pas
    dst->has_zpass_done_sample_count_write_in_rp |= src->has_zpass_done_sample_count_write_in_rp;
    dst->disable_gmem |= src->disable_gmem;
    dst->sysmem_single_prim_mode |= src->sysmem_single_prim_mode;
+   dst->uses_ray_intersection |= src->uses_ray_intersection;
    dst->lrz_disable_for_next_rp |= src->lrz_disable_for_next_rp;
    dst->lrz_write_disabled |= src->lrz_write_disabled;
    dst->draw_cs_writes_to_cond_pred |= src->draw_cs_writes_to_cond_pred;
@@ -8715,6 +8804,8 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
 
    /* Fill draw stats for autotuner */
    rp->drawcall_count++;
+   if (program->uses_ray_intersection)
+      rp->uses_ray_intersection = true;
 
    rp->drawcall_bandwidth_per_sample_sum +=
       cmd->state.bandwidth.color_bandwidth_per_sample;

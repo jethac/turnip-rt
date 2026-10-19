@@ -324,6 +324,7 @@ struct tu_render_pass_state
    bool has_zpass_done_sample_count_write_in_rp;
    bool disable_gmem;
    bool sysmem_single_prim_mode;
+   bool uses_ray_intersection;
    bool lrz_disable_for_next_rp;
    /* Sticky for the RP duration */
    bool lrz_write_disabled;
