@@ -1575,17 +1575,17 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
       return true;
    }
 
-   if (tu_vkd3d_gmem_pass_eligible(cmd, vsc)) {
-      if (tu_vkd3d_gmem_get_config().dry_run) {
-         cmd->state.rp.force_render_mode_reason = "TU_VKD3D_GMEM_DRYRUN";
-         return true;
-      }
+   const bool vkd3d_gmem = tu_vkd3d_gmem_pass_eligible(cmd, vsc);
+   if (vkd3d_gmem && !tu_vkd3d_gmem_get_config().dry_run) {
       cmd->state.rp.force_render_mode_reason = "TU_VKD3D_GMEM";
       return false;
    }
 
    tu_autotune::render_mode optimal_mode =
       cmd->device->autotune->get_optimal_mode(cmd, rp_ctx, rp_key);
+
+   if (vkd3d_gmem && optimal_mode == tu_autotune::render_mode::SYSMEM)
+      cmd->state.rp.force_render_mode_reason = "TU_VKD3D_GMEM_DRYRUN";
 
    return optimal_mode == tu_autotune::render_mode::SYSMEM;
 }
