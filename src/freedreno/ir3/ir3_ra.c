@@ -2828,6 +2828,11 @@ ir3_ra(struct ir3_shader_variant *v)
 
    struct ir3_pressure limit_pressure = ir3_ra_get_reg_file_limits(v);
 
+   if (v->shader_options.target_full_regs) {
+      limit_pressure.full = MIN2(limit_pressure.full,
+                                 v->shader_options.target_full_regs * 4 * 2);
+   }
+
    /* If requested, lower the limit so that spilling happens more often. */
    if (ir3_shader_debug & IR3_DBG_SPILLALL)
       calc_min_limit_pressure(v, live, &limit_pressure);
