@@ -167,6 +167,7 @@ can_early_out(const struct lower_atomics_state *state,
               nir_intrinsic_instr *intr)
 {
    if (!state->early_out || !nir_def_is_unused(&intr->def) ||
+       (nir_intrinsic_access(intr) & ACCESS_VOLATILE) ||
        (state->release_modes & atomic_modes(intr)))
       return false;
 
