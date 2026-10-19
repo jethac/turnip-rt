@@ -40,6 +40,11 @@ bvh_shaders = [
     'update',
     []
   ],
+  [
+    'update.comp',
+    'update_batch',
+    ['BATCH']
+  ],
 ]
 
 tu_bvh_include_dir = dir_source_root + '/src/freedreno/vulkan/bvh'

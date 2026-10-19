@@ -5,16 +5,28 @@
 
 #version 460
 
+#ifndef BATCH
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 #include "tu_bvh_defines.h"
 #define VK_USED_BUILD_FLAGS (VK_BUILD_FLAG_ALWAYS_ACTIVE)
 #include "vk_bvh_helpers.h"
 #include "tu_bvh_quantize.h"
 
+#ifdef BATCH
+layout(local_size_x = TU_UPDATE_WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform CONSTS {
+   update_batch_args batch;
+};
+
+update_args args;
+#else
 layout(push_constant) uniform CONSTS {
    update_args args;
 };
+#endif
 
 uint32_t
 fetch_parent(uint32_t node)
@@ -98,7 +110,31 @@ update_aabb_leaf(REF(tu_leaf_node) leaf, uint32_t primitive_index)
 void
 main()
 {
+#ifdef BATCH
+   uint32_t group = gl_WorkGroupID.x;
+   uint32_t lo = 0;
+   uint32_t hi = batch.task_count - 1;
+   while (lo < hi) {
+      uint32_t mid = (lo + hi + 1) >> 1;
+      if (DEREF(INDEX(update_batch_task, batch.tasks, mid)).first_group <= group)
+         lo = mid;
+      else
+         hi = mid - 1;
+   }
+
+   update_batch_task task = DEREF(INDEX(update_batch_task, batch.tasks, lo));
+   args.bvh = task.bvh;
+   args.leaf_map = task.leaf_map;
+   args.header = task.header;
+   args.ready_count = task.ready_count;
+   args.bounds = task.bounds;
+   args.geom_data = task.geom_data;
+   args.primitive_count = task.primitive_count;
+
+   uint32_t primitive_index = (group - task.first_group) * TU_UPDATE_WORKGROUP_SIZE + gl_LocalInvocationID.x;
+#else
    uint32_t primitive_index = gl_GlobalInvocationID.x;
+#endif
    if (primitive_index >= args.primitive_count)
       return;
 
