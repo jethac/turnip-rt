@@ -133,6 +133,7 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
       debug_get_bool_option("TU_PUSH_UBO_SPECULATE", false),
       debug_get_bool_option("TU_ATOMIC_EARLY_OUT", false),
       debug_get_bool_option("TU_LANE_SHUFFLE", false),
+      debug_get_bool_option("TU_FOVEATE", false),
    };
    _mesa_blake3_update(&ctx, env_flags, sizeof(env_flags));
    const uint64_t cs_constlen_cap =
