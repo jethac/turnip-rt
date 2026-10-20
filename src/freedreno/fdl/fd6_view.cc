@@ -232,6 +232,7 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
    uint32_t pitch = fdl_pitch(layout, args->base_miplevel);
    uint32_t ubwc_pitch = fdl_ubwc_pitch(layout, args->base_miplevel);
    uint32_t layer_size = fdl_layer_stride(layout, args->base_miplevel);
+   uint64_t ubwc_layer_size = fdl_ubwc_layer_stride(layout, args->base_miplevel);
 
    enum a6xx_format texture_format =
       fd6_texture_format(args->format, (enum a6xx_tile_mode)layout->tile_mode,
@@ -359,7 +360,7 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
          view->descriptor[3] |= A6XX_TEX_MEMOBJ_3_FLAG;
          view->descriptor[7] = base_addr[1];
          view->descriptor[8] = base_addr[1] >> 32;
-         view->descriptor[9] |= A6XX_TEX_MEMOBJ_9_FLAG_BUFFER_ARRAY_PITCH(layout->ubwc_layer_size >> 2);
+         view->descriptor[9] |= A6XX_TEX_MEMOBJ_9_FLAG_BUFFER_ARRAY_PITCH(ubwc_layer_size >> 2);
          view->descriptor[10] |=
             A6XX_TEX_MEMOBJ_10_FLAG_BUFFER_PITCH(ubwc_pitch) |
             A6XX_TEX_MEMOBJ_10_FLAG_BUFFER_LOGW(util_logbase2_ceil(DIV_ROUND_UP(width, block_width))) |
@@ -451,7 +452,7 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
                           A8XX_TEX_MEMOBJ_4_FLAG_LO(base_addr[1]);
          descriptor[5] |= A8XX_TEX_MEMOBJ_5_FLAG_HI(base_addr[1] >> 32) |
                           A8XX_TEX_MEMOBJ_5_FLAG_BUFFER_PITCH(ubwc_pitch);
-         descriptor[8] |= A8XX_TEX_MEMOBJ_8_FLAG_ARRAY_PITCH(layout->ubwc_layer_size) |
+         descriptor[8] |= A8XX_TEX_MEMOBJ_8_FLAG_ARRAY_PITCH(ubwc_layer_size) |
                           A8XX_TEX_MEMOBJ_8_FLAG_BUFFER_LOGW(util_logbase2_ceil(DIV_ROUND_UP(width, block_width))) |
                           A8XX_TEX_MEMOBJ_8_FLAG_BUFFER_LOGH(util_logbase2_ceil(DIV_ROUND_UP(height, block_height)));
       }
@@ -483,7 +484,7 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
    /* note: these have same encoding for MRT and 2D (except 2D PITCH src) */
    view->FLAG_BUFFER_PITCH =
       A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_PITCH(ubwc_pitch) |
-      A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH(layout->ubwc_layer_size >> 2);
+      A6XX_RB_DEPTH_FLAG_BUFFER_PITCH_ARRAY_PITCH(ubwc_layer_size >> 2);
 
    const struct util_format_description *format_desc =
       util_format_description(args->format);
@@ -497,7 +498,7 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
    view->base_addr = base_addr[0];
    view->ubwc_addr = base_addr[1];
    view->layer_size = layer_size;
-   view->ubwc_layer_size = layout->ubwc_layer_size;
+   view->ubwc_layer_size = ubwc_layer_size;
 
    enum a3xx_color_swap color_swap =
       fd6_color_swap(args->format, (enum a6xx_tile_mode)layout->tile_mode,

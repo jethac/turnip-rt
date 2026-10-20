@@ -75,6 +75,12 @@ struct fdl_explicit_layout {
    uint32_t pitch;
 };
 
+enum fdl_ubwc_3d_mips {
+   FDL_UBWC_3D_MIPS_NONE = 0,
+   FDL_UBWC_3D_MIPS_LAYER_MAJOR = 1,
+   FDL_UBWC_3D_MIPS_LEVEL_MAJOR = 2,
+};
+
 /**
  * General layout params for images.
  */
@@ -113,6 +119,8 @@ struct fdl_image_params {
    bool force_disable_linear_fallback;
 
    uint32_t plane;
+
+   enum fdl_ubwc_3d_mips ubwc_3d_mips;
 };
 
 /**
@@ -142,6 +150,7 @@ struct fdl_layout {
    bool layer_first : 1; /* see above description */
    bool tile_all : 1;
    bool is_mutable : 1;
+   bool ubwc_level_major : 1;
 
    /* Note that for tiled textures, beyond a certain mipmap level (ie.
     * when width is less than block size) things switch to linear.  In
@@ -237,11 +246,19 @@ fdl_surface_offset(const struct fdl_layout *layout, unsigned level,
    return slice->offset + fdl_layer_stride(layout, level) * layer;
 }
 
+static inline uint64_t
+fdl_ubwc_layer_stride(const struct fdl_layout *layout, unsigned level)
+{
+   if (layout->ubwc_level_major)
+      return layout->ubwc_slices[level].size0;
+   return layout->ubwc_layer_size;
+}
+
 static inline uint32_t
 fdl_ubwc_offset(const struct fdl_layout *layout, unsigned level, unsigned layer)
 {
    const struct fdl_slice *slice = &layout->ubwc_slices[level];
-   return slice->offset + layer * layout->ubwc_layer_size;
+   return slice->offset + layer * fdl_ubwc_layer_stride(layout, level);
 }
 
 /* Minimum layout width to enable tiling/UBWC, and width below which
