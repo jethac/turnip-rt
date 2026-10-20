@@ -848,14 +848,16 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
 
    if (tu_ubwc_3d_log() && image->vk.image_type == VK_IMAGE_TYPE_3D) {
       mesa_logi("tu-ubwc3d: fmt=%s %ux%ux%u mips=%u usage=0x%x flags=0x%x "
-                "mutable=%d mode=%d ubwc=%d level_major=%d size=%" PRIu64,
+                "mutable=%d mode=%d ubwc=%d level_major=%d tile=%u "
+                "tile_all=%d size=%" PRIu64,
                 util_format_short_name(vk_format_to_pipe_format(image->vk.format)),
                 image->vk.extent.width, image->vk.extent.height,
                 image->vk.extent.depth, image->vk.mip_levels,
                 (unsigned) image->vk.usage, (unsigned) image->vk.create_flags,
                 image->layout[0].is_mutable, (int) tu_ubwc_3d_mips(),
                 image->layout[0].ubwc, image->layout[0].ubwc_level_major,
-                image->total_size);
+                (unsigned) image->layout[0].tile_mode,
+                image->layout[0].tile_all, image->total_size);
    }
 
    image->max_tile_w_constraint_fdm = ~0;
