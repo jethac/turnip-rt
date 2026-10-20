@@ -14,6 +14,7 @@
 
 #include "tu_cmd_buffer.h"
 #include "tu_device.h"
+#include "tu_foveate.h"
 #include "tu_image.h"
 
 #define XXH_INLINE_ALL
@@ -1814,7 +1815,8 @@ tu_setup_dynamic_render_pass(struct tu_cmd_buffer *cmd_buffer,
       resolve_subpass->stencil_used = subpass->stencil_used;
    }
 
-   if (TU_DEBUG(FDM) && !tu_render_pass_disable_fdm(device, pass))
+   if (TU_DEBUG(FDM) && !tu_render_pass_disable_fdm(device, pass) &&
+       tu_foveate_dynamic_wanted(info))
       pass->has_fdm = true;
 
    pass->user_attachment_count = a;

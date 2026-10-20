@@ -359,6 +359,8 @@ struct tu_render_pass_state
     */
    bool read_only_input_attachments;
 
+   bool foveate_veto;
+
    uint32_t drawcall_count;
 
    /* A calculated "draw cost" value for renderpass, which tries to
