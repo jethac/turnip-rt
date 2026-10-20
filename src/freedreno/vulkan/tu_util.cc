@@ -230,6 +230,22 @@ __vk_startup_errorf(struct tu_instance *instance,
    return error;
 }
 
+static bool
+tu_force_bin_size(VkExtent2D *size)
+{
+   static VkExtent2D forced = { 0, 0 };
+   static bool parsed = false;
+   if (!parsed) {
+      const char *str = os_get_option("TU_FORCE_BIN");
+      unsigned w, h;
+      if (str && sscanf(str, "%ux%u", &w, &h) == 2 && w && h)
+         forced = (VkExtent2D) { w, h };
+      parsed = true;
+   }
+   *size = forced;
+   return forced.width != 0;
+}
+
 static void
 tu_tiling_config_update_tile_layout(struct tu_framebuffer *fb,
                                     const struct tu_device *dev,
@@ -349,6 +365,19 @@ tu_tiling_config_update_tile_layout(struct tu_framebuffer *fb,
          tiling->vsc.tile_count = tile_count;
          best_tile_count = total_tiles;
       }
+   }
+
+   VkExtent2D forced;
+   if (tiling->possible && !pass->has_fdm && tu_force_bin_size(&forced) &&
+       forced.width % tile_align_w == 0 && forced.height % tile_align_h == 0 &&
+       forced.width <= dev->physical_device->info->tile_max_w &&
+       forced.height <= dev->physical_device->info->tile_max_h &&
+       forced.width * forced.height * layers <= pass->gmem_pixels[gmem_layout]) {
+      tiling->tile0 = forced;
+      tiling->vsc.tile_count = (VkExtent2D) {
+         DIV_ROUND_UP(fb->width, forced.width),
+         DIV_ROUND_UP(fb->height, forced.height),
+      };
    }
 
    /* If forcing binning, try to get at least 2 tiles in each direction. */
