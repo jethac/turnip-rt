@@ -5094,7 +5094,9 @@ tu_compute_pipeline_create(VkDevice device,
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
       .requiredSubgroupSize = 32,
    };
-   if (!subgroup_info &&
+   static const bool sg32_marker =
+      debug_get_bool_option("TU_SG32_MARKER", false);
+   if (!subgroup_info && sg32_marker &&
        tu_stage_has_module_processed(stage_info,
                                      "turnip.required_subgroup_size=32"))
       subgroup_info = &marker_subgroup_info;
