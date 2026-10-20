@@ -1563,9 +1563,13 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
       return false;
    }
 
-   if (tu_foveate_pass_eligible(cmd)) {
-      cmd->state.rp.force_render_mode_reason = "TU_FOVEATE";
-      return false;
+   if (tu_foveate_enabled() && cmd->state.pass->has_fdm) {
+      if (tu_foveate_wants_gmem(cmd)) {
+         cmd->state.rp.force_render_mode_reason = "TU_FOVEATE";
+         return false;
+      }
+      cmd->state.rp.force_render_mode_reason = "TU_FOVEATE_SYSMEM";
+      return true;
    }
 
    /* This is a case where it's better to avoid GMEM, too many tiles but no HW binning possible. */
@@ -6479,6 +6483,7 @@ tu_render_pass_state_merge(struct tu_cmd_buffer *cmd, const struct tu_render_pas
    dst->shared_viewport |= src->shared_viewport;
    dst->read_only_input_attachments |= src->read_only_input_attachments;
    dst->input_attachment_read_barrier |= src->input_attachment_read_barrier;
+   dst->foveate_veto |= src->foveate_veto;
 
    dst->drawcall_bandwidth_per_sample_sum +=
       src->drawcall_bandwidth_per_sample_sum;
@@ -8806,6 +8811,10 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
    rp->drawcall_count++;
    if (program->uses_ray_intersection)
       rp->uses_ray_intersection = true;
+   if (cmd->state.shaders[MESA_SHADER_FRAGMENT] &&
+       cmd->state.shaders[MESA_SHADER_FRAGMENT]->variant &&
+       cmd->state.shaders[MESA_SHADER_FRAGMENT]->variant->no_earlyz)
+      rp->foveate_veto = true;
 
    rp->drawcall_bandwidth_per_sample_sum +=
       cmd->state.bandwidth.color_bandwidth_per_sample;

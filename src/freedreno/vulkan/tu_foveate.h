@@ -24,7 +24,11 @@ struct tu_frag_area;
 
 bool tu_foveate_enabled(void);
 
+bool tu_foveate_dynamic_wanted(const VkRenderingInfo *info);
+
 bool tu_foveate_pass_eligible(struct tu_cmd_buffer *cmd);
+
+bool tu_foveate_wants_gmem(struct tu_cmd_buffer *cmd);
 
 bool tu_foveate_fb_eligible(const struct tu_render_pass *pass,
                             const struct tu_framebuffer *fb);
