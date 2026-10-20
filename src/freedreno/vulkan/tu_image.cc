@@ -316,6 +316,24 @@ tiling_possible(VkFormat format)
    return true;
 }
 
+static enum fdl_ubwc_3d_mips
+tu_ubwc_3d_mips(void)
+{
+   static int value = -1;
+   if (value < 0)
+      value = CLAMP(debug_get_num_option("TU_UBWC_3D", 0), 0, 2);
+   return (enum fdl_ubwc_3d_mips) value;
+}
+
+static bool
+tu_ubwc_3d_log(void)
+{
+   static int value = -1;
+   if (value < 0)
+      value = debug_get_bool_option("TU_UBWC_3D_LOG", false);
+   return value;
+}
+
 /* Checks if we should advertise UBWC support for the given usage.
  *
  * Used by both vkCreateImage and vkGetPhysicalDeviceFormatProperties2, so the
@@ -365,7 +383,8 @@ ubwc_possible(struct tu_device *device,
        vk_format_get_plane_count(format) == 1)
       return false;
 
-   if (type == VK_IMAGE_TYPE_3D && mip_levels > 1) {
+   if (type == VK_IMAGE_TYPE_3D && mip_levels > 1 &&
+       tu_ubwc_3d_mips() == FDL_UBWC_3D_MIPS_NONE) {
       if (device) {
          perf_debug(
             device,
@@ -799,6 +818,8 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
             VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
          .force_disable_linear_fallback = force_disable_linear_fallback,
          .plane = i,
+         .ubwc_3d_mips = image->vk.image_type == VK_IMAGE_TYPE_3D ?
+            tu_ubwc_3d_mips() : FDL_UBWC_3D_MIPS_NONE,
       };
 
       if (!fdl6_layout_image(layout, &device->physical_device->dev_info,
@@ -823,6 +844,18 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       }
 
       image->total_size = MAX2(image->total_size, layout->size);
+   }
+
+   if (tu_ubwc_3d_log() && image->vk.image_type == VK_IMAGE_TYPE_3D) {
+      mesa_logi("tu-ubwc3d: fmt=%s %ux%ux%u mips=%u usage=0x%x flags=0x%x "
+                "mutable=%d mode=%d ubwc=%d level_major=%d size=%" PRIu64,
+                util_format_short_name(vk_format_to_pipe_format(image->vk.format)),
+                image->vk.extent.width, image->vk.extent.height,
+                image->vk.extent.depth, image->vk.mip_levels,
+                (unsigned) image->vk.usage, (unsigned) image->vk.create_flags,
+                image->layout[0].is_mutable, (int) tu_ubwc_3d_mips(),
+                image->layout[0].ubwc, image->layout[0].ubwc_level_major,
+                image->total_size);
    }
 
    image->max_tile_w_constraint_fdm = ~0;

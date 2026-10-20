@@ -140,7 +140,8 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
       /* For simplicity support UBWC only for 3D images without mipmaps,
        * most d3d11 games don't use mipmaps for 3D images.
        */
-      if (params->depth0 > 1 && params->mip_levels > 1)
+      if (params->depth0 > 1 && params->mip_levels > 1 &&
+          params->ubwc_3d_mips == FDL_UBWC_3D_MIPS_NONE)
          layout->ubwc = false;
 
       if (ubwc_blockwidth == 0)
@@ -171,6 +172,10 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
        params->force_disable_linear_fallback) {
       layout->tile_all = true;
    }
+
+   layout->ubwc_level_major = layout->ubwc && params->is_3d &&
+      params->depth0 > 1 && params->mip_levels > 1 &&
+      params->ubwc_3d_mips == FDL_UBWC_3D_MIPS_LEVEL_MAJOR;
 
    /* in layer_first layout, the level (slice) contains just one
     * layer (since in fact the layer contains the slices)
@@ -248,6 +253,7 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
    }
 
    uint32_t min_3d_layer_size = 0;
+   uint64_t ubwc_level_major_size = 0;
    bool in_sparse_miptail = false;
 
    for (uint32_t level = 0; level < params->mip_levels; level++) {
@@ -334,8 +340,15 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
 
          ubwc_slice->size0 =
             align(meta_pitch * meta_height, UBWC_PLANE_SIZE_ALIGNMENT);
-         ubwc_slice->offset = offset + layout->ubwc_layer_size;
-         layout->ubwc_layer_size += ubwc_slice->size0;
+         if (layout->ubwc_level_major) {
+            ubwc_slice->offset = offset + ubwc_level_major_size;
+            ubwc_level_major_size += (uint64_t)ubwc_slice->size0 * depth;
+            if (level == 0)
+               layout->ubwc_layer_size = ubwc_slice->size0;
+         } else {
+            ubwc_slice->offset = offset + layout->ubwc_layer_size;
+            layout->ubwc_layer_size += ubwc_slice->size0;
+         }
       }
    }
 
@@ -383,12 +396,15 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
     * independently.
     */
    if (layout->ubwc) {
-      assert(!(params->depth0 > 1 && params->mip_levels > 1));
+      assert(!(params->depth0 > 1 && params->mip_levels > 1) ||
+             params->ubwc_3d_mips != FDL_UBWC_3D_MIPS_NONE);
+      uint64_t ubwc_size = layout->ubwc_level_major ?
+         ubwc_level_major_size :
+         layout->ubwc_layer_size * params->array_size * params->depth0;
       for (uint32_t level = 0; level < params->mip_levels; level++) {
-         layout->slices[level].offset +=
-            layout->ubwc_layer_size * params->array_size * params->depth0;
+         layout->slices[level].offset += ubwc_size;
       }
-      layout->size += layout->ubwc_layer_size * params->array_size * params->depth0;
+      layout->size += ubwc_size;
    }
 
    /* include explicit offset in size */
