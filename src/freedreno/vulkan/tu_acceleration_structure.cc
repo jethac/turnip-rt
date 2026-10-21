@@ -24,6 +24,9 @@
 
 #include "tu_acceleration_structure.h"
 
+#include "util/hash_table.h"
+#include "util/simple_mtx.h"
+#include "util/stack_array.h"
 #include "util/u_hexdump.h"
 #include "vk_acceleration_structure.h"
 
@@ -168,6 +171,238 @@ tu_rt_batch_refit(void)
    if (value < 0)
       value = CLAMP(debug_get_num_option("TU_RT_BATCH_REFIT", 0), 0, 2);
    return value;
+}
+
+static uint32_t
+tu_rt_refit_every(void)
+{
+   static int value = -1;
+   if (value < 0)
+      value = CLAMP(debug_get_num_option("TU_RT_REFIT_EVERY", 0), 0, 64);
+   return value;
+}
+
+struct tu_refit_every {
+   simple_mtx_t lock;
+   struct hash_table_u64 *countdown;
+   uint32_t every;
+   uint64_t calls, performed, skipped, assigned, empty, out_of_place, builds;
+   uint64_t leaves_performed, leaves_skipped;
+   uint64_t next_log;
+};
+
+struct tu_refit_every_fresh {
+   uint32_t index;
+   uint64_t leaves;
+};
+
+void
+tu_refit_every_init(struct tu_device *device)
+{
+   device->refit_every = NULL;
+
+   uint32_t every = tu_rt_refit_every();
+   if (every < 2)
+      return;
+
+   struct tu_refit_every *re =
+      static_cast<struct tu_refit_every *>(calloc(1, sizeof(struct tu_refit_every)));
+   if (!re)
+      return;
+
+   re->countdown = _mesa_hash_table_u64_create(NULL);
+   if (!re->countdown) {
+      free(re);
+      return;
+   }
+
+   simple_mtx_init(&re->lock, mtx_plain);
+   re->every = every;
+   re->next_log = 4096;
+   device->refit_every = re;
+   mesa_logi("tu-refit-every: every=%u", every);
+}
+
+static void
+tu_refit_every_log(struct tu_refit_every *re, const char *what)
+{
+   mesa_logi("tu-refit-every: %s calls=%" PRIu64 " performed=%" PRIu64 " skipped=%" PRIu64
+             " assigned=%" PRIu64 " empty=%" PRIu64 " out_of_place=%" PRIu64 " builds=%" PRIu64
+             " leaves_performed=%" PRIu64 " leaves_skipped=%" PRIu64 " tracked=%u",
+             what, re->calls, re->performed, re->skipped, re->assigned, re->empty, re->out_of_place,
+             re->builds, re->leaves_performed, re->leaves_skipped,
+             _mesa_hash_table_u64_num_entries(re->countdown));
+}
+
+void
+tu_refit_every_finish(struct tu_device *device)
+{
+   struct tu_refit_every *re = device->refit_every;
+   if (!re)
+      return;
+
+   tu_refit_every_log(re, "final");
+   _mesa_hash_table_u64_destroy(re->countdown);
+   simple_mtx_destroy(&re->lock);
+   free(re);
+   device->refit_every = NULL;
+}
+
+static bool
+tu_refit_every_get(struct tu_refit_every *re, uint64_t va, uint32_t *countdown)
+{
+   void *data = _mesa_hash_table_u64_search(re->countdown, va);
+   if (!data)
+      return false;
+   *countdown = (uint32_t) (uintptr_t) data - 1;
+   return true;
+}
+
+static void
+tu_refit_every_set(struct tu_refit_every *re, uint64_t va, uint32_t countdown)
+{
+   if (_mesa_hash_table_u64_num_entries(re->countdown) >= 65536 &&
+       !_mesa_hash_table_u64_search(re->countdown, va)) {
+      tu_refit_every_log(re, "reset");
+      _mesa_hash_table_u64_clear(re->countdown);
+   }
+
+   _mesa_hash_table_u64_insert(re->countdown, va, (void *) (uintptr_t) (countdown + 1));
+}
+
+static int
+tu_refit_every_fresh_cmp(const void *a, const void *b)
+{
+   const struct tu_refit_every_fresh *fa = static_cast<const struct tu_refit_every_fresh *>(a);
+   const struct tu_refit_every_fresh *fb = static_cast<const struct tu_refit_every_fresh *>(b);
+   if (fa->leaves != fb->leaves)
+      return fa->leaves > fb->leaves ? -1 : 1;
+   return fa->index < fb->index ? -1 : (fa->index > fb->index ? 1 : 0);
+}
+
+static void
+tu_refit_every_copy(struct tu_device *device, uint64_t src_va, uint64_t dst_va)
+{
+   struct tu_refit_every *re = device->refit_every;
+   if (!re || src_va == dst_va)
+      return;
+
+   simple_mtx_lock(&re->lock);
+   uint32_t countdown;
+   if (src_va && tu_refit_every_get(re, src_va, &countdown))
+      tu_refit_every_set(re, dst_va, countdown);
+   else
+      _mesa_hash_table_u64_remove(re->countdown, dst_va);
+   simple_mtx_unlock(&re->lock);
+}
+
+static void
+tu_refit_every_decide(struct tu_refit_every *re, uint64_t va, uint64_t leaves,
+                      uint32_t countdown, bool *keep)
+{
+   if (countdown == 0) {
+      *keep = true;
+      re->performed++;
+      re->leaves_performed += leaves;
+      tu_refit_every_set(re, va, re->every - 1);
+   } else {
+      *keep = false;
+      re->skipped++;
+      re->leaves_skipped += leaves;
+      tu_refit_every_set(re, va, countdown - 1);
+   }
+}
+
+static uint32_t
+tu_refit_every_filter(struct tu_refit_every *re, uint32_t info_count,
+                      const VkAccelerationStructureBuildGeometryInfoKHR *infos,
+                      const VkAccelerationStructureBuildRangeInfoKHR *const *ranges,
+                      bool *keep)
+{
+   const uint32_t every = re->every;
+   uint64_t slot_load[64] = {};
+
+   STACK_ARRAY(struct tu_refit_every_fresh, fresh, info_count);
+   uint32_t fresh_count = 0;
+
+   simple_mtx_lock(&re->lock);
+   re->calls++;
+
+   for (uint32_t i = 0; i < info_count; i++) {
+      const VkAccelerationStructureBuildGeometryInfoKHR *info = &infos[i];
+      keep[i] = true;
+
+      if (info->type != VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+         continue;
+
+      VK_FROM_HANDLE(vk_acceleration_structure, dst, info->dstAccelerationStructure);
+      uint64_t dst_va = vk_acceleration_structure_get_va(dst);
+
+      if (info->mode != VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
+         re->builds++;
+         _mesa_hash_table_u64_remove(re->countdown, dst_va);
+         continue;
+      }
+
+      VK_FROM_HANDLE(vk_acceleration_structure, src, info->srcAccelerationStructure);
+      if (!src || vk_acceleration_structure_get_va(src) != dst_va) {
+         re->out_of_place++;
+         _mesa_hash_table_u64_remove(re->countdown, dst_va);
+         continue;
+      }
+
+      uint64_t leaves = 0;
+      for (uint32_t j = 0; j < info->geometryCount; j++)
+         leaves += ranges[i][j].primitiveCount;
+
+      if (!leaves) {
+         re->empty++;
+         keep[i] = false;
+         continue;
+      }
+
+      uint32_t countdown;
+      if (tu_refit_every_get(re, dst_va, &countdown)) {
+         slot_load[MIN2(countdown, every - 1)] += leaves;
+         tu_refit_every_decide(re, dst_va, leaves, countdown, &keep[i]);
+      } else {
+         fresh[fresh_count].index = i;
+         fresh[fresh_count].leaves = leaves;
+         fresh_count++;
+      }
+   }
+
+   if (fresh_count) {
+      qsort(fresh, fresh_count, sizeof(fresh[0]), tu_refit_every_fresh_cmp);
+
+      for (uint32_t f = 0; f < fresh_count; f++) {
+         uint32_t slot = 0;
+         for (uint32_t j = 1; j < every; j++) {
+            if (slot_load[j] < slot_load[slot])
+               slot = j;
+         }
+         slot_load[slot] += fresh[f].leaves;
+
+         uint32_t i = fresh[f].index;
+         VK_FROM_HANDLE(vk_acceleration_structure, dst, infos[i].dstAccelerationStructure);
+         re->assigned++;
+         tu_refit_every_decide(re, vk_acceleration_structure_get_va(dst), fresh[f].leaves, slot, &keep[i]);
+      }
+   }
+
+   uint64_t decided = re->performed + re->skipped + re->empty;
+   if (decided >= re->next_log) {
+      re->next_log = decided + MIN2(decided, 65536);
+      tu_refit_every_log(re, "stats");
+   }
+
+   simple_mtx_unlock(&re->lock);
+   STACK_ARRAY_FINISH(fresh);
+
+   uint32_t kept = 0;
+   for (uint32_t i = 0; i < info_count; i++)
+      kept += keep[i];
+   return kept;
 }
 
 struct bvh_layout {
@@ -726,26 +961,55 @@ tu_CmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t inf
    struct tu_device *device = cmd->device;
    struct tu_saved_compute_state state;
 
-   tu_save_compute_state(cmd, &state);
+   STACK_ARRAY(VkAccelerationStructureBuildGeometryInfoKHR, kept_infos, device->refit_every ? infoCount : 0);
+   STACK_ARRAY(const VkAccelerationStructureBuildRangeInfoKHR *, kept_ranges, device->refit_every ? infoCount : 0);
+   STACK_ARRAY(bool, keep, device->refit_every ? infoCount : 0);
 
-   struct vk_acceleration_structure_build_args args = {
-      .subgroup_size = tu_as_subgroup_size(device->physical_device),
-      .bvh_bounds_offset = offsetof(tu_accel_struct_header, aabb),
-      .morton_sort_workgroup_size = tu_morton_sort_workgroup_size(),
-      .morton_sort_kvs_per_thread = tu_morton_sort_kvs_per_thread(),
-      .emit_markers = false,
-      .has_update = true,
-   };
+   bool run = true;
+   if (device->refit_every) {
+      uint32_t kept = tu_refit_every_filter(device->refit_every, infoCount, pInfos, ppBuildRangeInfos, keep);
+      if (kept < infoCount) {
+         uint32_t n = 0;
+         for (uint32_t i = 0; i < infoCount; i++) {
+            if (!keep[i])
+               continue;
+            kept_infos[n] = pInfos[i];
+            kept_ranges[n] = ppBuildRangeInfos[i];
+            n++;
+         }
+         infoCount = n;
+         pInfos = kept_infos;
+         ppBuildRangeInfos = kept_ranges;
+      }
+      run = infoCount > 0;
+   }
 
-   vk_cmd_build_acceleration_structures(commandBuffer,
-                                        &device->vk,
-                                        &device->meta,
-                                        infoCount,
-                                        pInfos,
-                                        ppBuildRangeInfos,
-                                        &args);
+   if (run) {
+      tu_save_compute_state(cmd, &state);
 
-   tu_restore_compute_state(cmd, &state);
+      struct vk_acceleration_structure_build_args args = {
+         .subgroup_size = tu_as_subgroup_size(device->physical_device),
+         .bvh_bounds_offset = offsetof(tu_accel_struct_header, aabb),
+         .morton_sort_workgroup_size = tu_morton_sort_workgroup_size(),
+         .morton_sort_kvs_per_thread = tu_morton_sort_kvs_per_thread(),
+         .emit_markers = false,
+         .has_update = true,
+      };
+
+      vk_cmd_build_acceleration_structures(commandBuffer,
+                                           &device->vk,
+                                           &device->meta,
+                                           infoCount,
+                                           pInfos,
+                                           ppBuildRangeInfos,
+                                           &args);
+
+      tu_restore_compute_state(cmd, &state);
+   }
+
+   STACK_ARRAY_FINISH(keep);
+   STACK_ARRAY_FINISH(kept_ranges);
+   STACK_ARRAY_FINISH(kept_infos);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -785,6 +1049,9 @@ tu_CmdCopyAccelerationStructureKHR(VkCommandBuffer commandBuffer, const VkCopyAc
       src->offset + offsetof(struct tu_accel_struct_header, copy_dispatch_size));
 
    tu_restore_compute_state(cmd, &state);
+
+   tu_refit_every_copy(cmd->device, vk_acceleration_structure_get_va(src),
+                       vk_acceleration_structure_get_va(dst));
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -822,6 +1089,7 @@ tu_CmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer,
    vk_common_CmdDispatch(commandBuffer, 256, 1, 1);
 
    tu_restore_compute_state(cmd, &state);
+   tu_refit_every_copy(cmd->device, 0, vk_acceleration_structure_get_va(dst));
 }
 
 VKAPI_ATTR void VKAPI_CALL

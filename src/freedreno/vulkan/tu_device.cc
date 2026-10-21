@@ -3172,6 +3172,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       }
    }
 
+   tu_refit_every_init(device);
+
    result = tu_init_empty_shaders(device);
    if (result != VK_SUCCESS) {
       vk_startup_errorf(device->instance, result, "empty shaders");
@@ -3366,6 +3368,7 @@ fail_pipeline_cache:
 fail_dynamic_rendering:
    tu_destroy_empty_shaders(device);
 fail_empty_shaders:
+   tu_refit_every_finish(device);
    if (device->null_accel_struct_bo)
       tu_bo_finish(device, device->null_accel_struct_bo);
 fail_null_accel_struct:
@@ -3477,6 +3480,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (device->null_accel_struct_bo)
       tu_bo_finish(device, device->null_accel_struct_bo);
+
+   tu_refit_every_finish(device);
 
    list_for_each_entry_safe(struct tu_copy_timestamp_data, data,
                             &device->copy_timestamp_cs_pool, node)

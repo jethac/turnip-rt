@@ -13,6 +13,9 @@ struct tu_device;
 
 VkResult tu_init_null_accel_struct(struct tu_device *device);
 
+void tu_refit_every_init(struct tu_device *device);
+void tu_refit_every_finish(struct tu_device *device);
+
 extern const vk_acceleration_structure_build_ops tu_as_build_ops;
 
 #endif

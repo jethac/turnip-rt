@@ -350,6 +350,8 @@ struct tu_device
 
    struct tu_bo *null_accel_struct_bo;
 
+   struct tu_refit_every *refit_every;
+
    uint32_t implicit_sync_bo_count;
 
    /* Device-global BO suballocator for reducing BO management overhead for
