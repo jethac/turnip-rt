@@ -2453,7 +2453,8 @@ tu_rt_partset_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
    uint32_t kind = blob_read_uint32(blob);
    uint32_t nparts = blob_read_uint32(blob);
    uint32_t nwords = blob_read_uint32(blob);
-   if (blob->overrun || nparts > 4096)
+   if (blob->overrun || nparts > 4096 ||
+       (uint64_t) nwords * sizeof(uint64_t) > (uint64_t) (blob->end - blob->current))
       return NULL;
    struct tu_rt_partset *ps =
       tu_rt_partset_alloc(cache->base.device, key_data, key_size, nparts, nwords);
@@ -2467,10 +2468,13 @@ tu_rt_partset_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
    ps->used = blob_read_uint32(blob);
    ps->scratch = blob_read_uint32(blob);
    ps->active_desc_sets = blob_read_uint32(blob);
-   for (uint32_t i = 0; i < nparts; i++)
+   uint64_t total = 0;
+   for (uint32_t i = 0; i < nparts; i++) {
       blob_copy_bytes(blob, &ps->parts[i], TU_RT_PART_BIN_HDR);
+      total += ps->parts[i].count;
+   }
    blob_copy_bytes(blob, ps->words, (size_t) nwords * sizeof(uint64_t));
-   if (blob->overrun) {
+   if (blob->overrun || total != nwords) {
       tu_rt_partset_destroy(cache->base.device, &ps->base);
       return NULL;
    }
