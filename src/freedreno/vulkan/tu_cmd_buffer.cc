@@ -10473,7 +10473,7 @@ tu_rt_cmd_alloc(struct tu_cmd_buffer *cmd,
       .height = height,
       .depth = depth,
    };
-   const bool fov = tu_rt_fov_mode(cmd->device) != 0;
+   const bool fov = tu_rt_fov_mode(cmd->device) & TU_RT_FOV_SHARE;
    const uint32_t size = fov ? TU_RT_FOV_CMD_OFFSET + TU_RT_FOV_CMD_SIZE : sizeof(rt_cmd);
    if (writeable)
       tu_cs_set_writeable(&cmd->sub_cs, true);
@@ -10556,7 +10556,7 @@ tu_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
                             VkDeviceAddress indirectDeviceAddress)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
-   if (CHIP >= A7XX && tu_rt_fov_mode(cmd->device)) {
+   if (CHIP >= A7XX && (tu_rt_fov_mode(cmd->device) & TU_RT_FOV_SHARE)) {
       if (!cmd->state.rt_pipeline || !cmd->state.rt_pipeline->shaders[MESA_SHADER_COMPUTE])
          return;
       const VkStridedDeviceAddressRegionKHR none = {};
@@ -10566,7 +10566,8 @@ tu_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
       struct tu_cs *cs = &cmd->cs;
       tu_emit_cache_flush<CHIP>(cmd);
       tu_cs_emit_pkt7(cs, CP_MEMCPY, 5);
-      tu_cs_emit(cs, sizeof(VkTraceRaysIndirectCommand2KHR) / sizeof(uint32_t));
+      tu_cs_emit(cs, (offsetof(VkTraceRaysIndirectCommand2KHR, depth) + sizeof(uint32_t)) /
+                     sizeof(uint32_t));
       tu_cs_emit_qw(cs, indirectDeviceAddress);
       tu_cs_emit_qw(cs, mem.iova);
       tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);

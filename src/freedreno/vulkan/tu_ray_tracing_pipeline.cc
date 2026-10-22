@@ -1020,12 +1020,19 @@ tu_rt_fov_level(nir_builder *b, struct tu_rt_compiler *c)
    nir_def *size = tu_rt_load_cmd(b, offsetof(VkTraceRaysIndirectCommand2KHR, width), 3);
    nir_def *p0 = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET, 4);
    nir_def *gz = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET + 16, 4);
-   nir_def *p2 = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET + 32, 2);
+   nir_def *p2 = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET + 32, 4);
+   nir_def *p3 = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET + 48, 3);
    nir_def *id = tu_rt_fov_launch_id(b, c);
 
    nir_def *w = nir_u2f32(b, nir_channel(b, size, 0));
    nir_def *h = nir_u2f32(b, nir_channel(b, size, 1));
-   nir_def *sbs = nir_fge(b, w, nir_fmul(b, nir_channel(b, p2, 0), h));
+   nir_def *sbs = nir_iand(b, nir_fge(b, w, nir_fmul(b, nir_channel(b, p2, 0), h)),
+                           nir_fge(b, nir_fmul(b, nir_channel(b, p3, 0), h), w));
+   nir_def *eye = nir_iand(b, nir_fge(b, w, nir_fmul(b, nir_channel(b, p3, 1), h)),
+                           nir_fge(b, nir_fmul(b, nir_channel(b, p3, 2), h), w));
+   nir_def *big = nir_iand(b, nir_uge(b, nir_channel(b, size, 0), nir_channel(b, p2, 2)),
+                           nir_uge(b, nir_channel(b, size, 1), nir_channel(b, p2, 3)));
+   nir_def *screen = nir_iand(b, big, nir_ior(b, sbs, eye));
    nir_def *ew = nir_bcsel(b, sbs, nir_fmul_imm(b, w, 0.5), w);
    nir_def *px = nir_fadd_imm(b, nir_u2f32(b, nir_channel(b, id, 0)), 0.5);
    nir_def *py = nir_fadd_imm(b, nir_u2f32(b, nir_channel(b, id, 1)), 0.5);
@@ -1042,7 +1049,7 @@ tu_rt_fov_level(nir_builder *b, struct tu_rt_compiler *c)
       nir_bcsel(b, nir_fge(b, d2, nir_fmul(b, rr1, rr1)), nir_imm_int(b, 4),
                 nir_bcsel(b, nir_fge(b, d2, nir_fmul(b, rr0, rr0)), nir_imm_int(b, 2),
                           nir_imm_int(b, 0)));
-   lvl2d = nir_umin(b, lvl2d, nir_channel(b, p2, 1));
+   lvl2d = nir_bcsel(b, screen, nir_umin(b, lvl2d, nir_channel(b, p2, 1)), nir_imm_int(b, 0));
    nir_def *lvl = nir_bcsel(b, nir_ieq_imm(b, nir_channel(b, size, 1), 1),
                             nir_channel(b, p0, 1), lvl2d);
    return nir_bcsel(b, nir_ine_imm(b, nir_channel(b, p0, 0), 0), lvl, nir_imm_int(b, 0));

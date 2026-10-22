@@ -195,7 +195,7 @@ tu_foveate_init_once(void)
    cfg.min_h = debug_get_num_option("TU_FOVEATE_MIN_H", 768);
    cfg.max_area = debug_get_num_option("TU_FOVEATE_MAX", 4);
    cfg.max_bin = debug_get_num_option("TU_FOVEATE_BIN", 256);
-   cfg.sbs_min = env_f("TU_FOVEATE_SBS_MIN", 1.8f);
+   cfg.sbs_min = env_f("TU_FOVEATE_SBS_MIN", 1.5f);
    cfg.sbs_max = env_f("TU_FOVEATE_SBS_MAX", 2.3f);
    cfg.eye_min = env_f("TU_FOVEATE_EYE_MIN", 0.8f);
    cfg.eye_max = env_f("TU_FOVEATE_EYE_MAX", 1.25f);
@@ -388,6 +388,7 @@ struct tu_rt_fov_cfg {
    uint32_t max_lvl;
    float r0, r1;
    float sbs;
+   uint32_t min_w, min_h;
 };
 
 static struct tu_rt_fov_cfg rt_cfg;
@@ -405,13 +406,16 @@ tu_foveate_rt_init_once(void)
    uint32_t run = debug_get_num_option("TU_FOVEATE_RT_1D", 1);
    rt_cfg.lvl_1d = run >= 16 ? 4 : run >= 8 ? 3 : run >= 4 ? 2 : run >= 2 ? 1 : 0;
    rt_cfg.max_lvl = MIN2(debug_get_num_option("TU_FOVEATE_RT_MAX", 4), 4);
+   rt_cfg.lvl_1d = MIN2(rt_cfg.lvl_1d, rt_cfg.max_lvl);
    rt_cfg.r0 = env_f("TU_FOVEATE_RT_R0", cfg.r0);
    rt_cfg.r1 = env_f("TU_FOVEATE_RT_R1", cfg.r1);
    rt_cfg.sbs = env_f("TU_FOVEATE_RT_SBS", cfg.sbs_min);
+   rt_cfg.min_w = debug_get_num_option("TU_FOVEATE_RT_MIN_W", 256);
+   rt_cfg.min_h = debug_get_num_option("TU_FOVEATE_RT_MIN_H", 128);
    if (mode)
-      mesa_logi("tu-foveate-rt: mode=0x%x r0=%.3f r1=%.3f max_lvl=%u lvl_1d=%u sbs=%.2f gaze=%d fixed=%.3f,%.3f",
-                mode, rt_cfg.r0, rt_cfg.r1, rt_cfg.max_lvl, rt_cfg.lvl_1d, rt_cfg.sbs,
-                cfg.src, cfg.fixed_x, cfg.fixed_y);
+      mesa_logi("tu-foveate-rt: mode=0x%x r0=%.3f r1=%.3f max_lvl=%u lvl_1d=%u sbs=%.2f-%.2f eye=%.2f-%.2f min=%ux%u gaze=%d fixed=%.3f,%.3f",
+                mode, rt_cfg.r0, rt_cfg.r1, rt_cfg.max_lvl, rt_cfg.lvl_1d, rt_cfg.sbs, cfg.sbs_max,
+                cfg.eye_min, cfg.eye_max, rt_cfg.min_w, rt_cfg.min_h, cfg.src, cfg.fixed_x, cfg.fixed_y);
 }
 
 static void
@@ -439,6 +443,11 @@ tu_foveate_rt_fill(struct tu_device *dev, struct tu_rt_fov_block *blk)
    blk->r1 = rt_cfg.r1;
    blk->sbs = rt_cfg.sbs;
    blk->max_lvl = rt_cfg.max_lvl;
+   blk->min_w = rt_cfg.min_w;
+   blk->min_h = rt_cfg.min_h;
+   blk->sbs_max = cfg.sbs_max;
+   blk->eye_min = cfg.eye_min;
+   blk->eye_max = cfg.eye_max;
    for (unsigned e = 0; e < 2; e++)
       tu_foveate_gaze_dev(dev, e, &blk->gaze[e][0], &blk->gaze[e][1]);
 }
