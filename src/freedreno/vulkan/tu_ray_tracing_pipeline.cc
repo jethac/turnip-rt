@@ -544,6 +544,8 @@ struct tu_rt_compiler {
    unsigned part_nclasses;
    uint32_t part_classes[TU_RT_MAX_CLASSES];
    nir_variable *part_dummy;
+   bool part_has_chit;
+   bool part_has_miss;
 
    struct hash_table *fn_ctx;
    nir_function **fn_cache;
@@ -1370,6 +1372,10 @@ tu_rt_fload_vec(nir_builder *b, unsigned off, unsigned comps)
 static void
 tu_rt_traversal_miss(nir_builder *b, struct tu_rt_compiler *c, nir_def *miss_index)
 {
+   if (!c->part_has_miss) {
+      tu_rt_fstore(b, TU_RT_FRAME_SEL, tu_rt_fload(b, TU_RT_FRAME_RET, 1));
+      return;
+   }
    struct tu_rt_sbt_entry miss = tu_rt_load_sbt_entry(
       b, miss_index,
       offsetof(VkTraceRaysIndirectCommand2KHR, missShaderBindingTableAddress));
@@ -1390,7 +1396,9 @@ tu_rt_traversal_tail(nir_builder *b, struct tu_rt_compiler *c, nir_def *rq,
    const uint32_t u = c->part_hit_used;
 
    nir_push_if(b, nir_ine_imm(b, committed_type, 0));
-   {
+   if (!c->part_has_chit) {
+      tu_rt_fstore(b, TU_RT_FRAME_SEL, tu_rt_fload(b, TU_RT_FRAME_RET, 1));
+   } else {
       nir_push_if(b, nir_test_mask(b, r->flags, SpvRayFlagsSkipClosestHitShaderKHRMask));
       {
          tu_rt_fstore(b, TU_RT_FRAME_SEL, tu_rt_fload(b, TU_RT_FRAME_RET, 1));
@@ -3006,6 +3014,8 @@ struct tu_rt_trav_desc {
    uint32_t used_chit;
    bool has_ahit;
    bool has_isec;
+   bool has_chit;
+   bool has_miss;
 };
 
 static const char *
@@ -3021,6 +3031,8 @@ tu_rt_build_traversal_part(const struct tu_rt_part_env *env,
    tu_rt_part_compiler_init(&c, b->shader, pipeline, env->flags, TU_RT_PART_TRAVERSAL);
    c.part_payload_size = d->cls;
    c.part_hit_used = d->used_chit;
+   c.part_has_chit = d->has_chit;
+   c.part_has_miss = d->has_miss;
    c.used = d->used;
    c.has_ahit = d->has_ahit;
    c.has_isec = d->has_isec;
@@ -3476,7 +3488,8 @@ tu_rt_link_callee_job(void *data, uint32_t i)
          (VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR |
           VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR);
       _mesa_blake3_update(&h, &hflags, sizeof(hflags));
-      uint32_t desc[5] = { d->cls, d->used, d->used_chit, d->has_ahit, d->has_isec };
+      uint32_t desc[7] = { d->cls, d->used, d->used_chit, d->has_ahit, d->has_isec,
+                           d->has_chit, d->has_miss };
       _mesa_blake3_update(&h, desc, sizeof(desc));
       struct tu_ray_tracing_pipeline *p = lc->pipeline;
       struct tu_rt_case *cases = (struct tu_rt_case *)
@@ -3849,6 +3862,8 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
             d->has_isec = has_isec;
             d->used = 0;
             d->used_chit = 0;
+            d->has_chit = false;
+            d->has_miss = false;
             struct tu_rt_compiler tmp = {};
             tmp.pipeline = pipeline;
             tmp.part = TU_RT_PART_TRAVERSAL;
@@ -3861,8 +3876,14 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
                   d->used |= tu_rt_scan_used(pipeline->stages[grp->isec_index]);
                if (grp->recursive_index != VK_SHADER_UNUSED_KHR &&
                    pipeline->stage_types[grp->recursive_index] == MESA_SHADER_CLOSEST_HIT &&
-                   tu_rt_compat(&tmp, pipeline->stages[grp->recursive_index], NULL))
+                   tu_rt_compat(&tmp, pipeline->stages[grp->recursive_index], NULL)) {
                   d->used_chit |= tu_rt_scan_used(pipeline->stages[grp->recursive_index]);
+                  d->has_chit = true;
+               }
+               if (grp->recursive_index != VK_SHADER_UNUSED_KHR &&
+                   pipeline->stage_types[grp->recursive_index] == MESA_SHADER_MISS &&
+                   tu_rt_compat(&tmp, pipeline->stages[grp->recursive_index], NULL))
+                  d->has_miss = true;
             }
             d->used |= d->used_chit;
          }
@@ -4373,25 +4394,37 @@ tu_rt_pipeline_create(struct tu_device *dev,
 
       struct tu_shader *shader = NULL;
       nir_shader *nir = NULL;
-      if (rg_count > 1 && !debug_get_bool_option("TU_RT_NO_VARIANTS", false)) {
-         result = VK_ERROR_FEATURE_NOT_PRESENT;
-         const unsigned link_mode = tu_rt_link_mode();
-         if (link_mode != TU_RT_LINK_OFF && dev->physical_device->info->chip >= 7 &&
-             !(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR) &&
-             (link_mode != TU_RT_LINK_AUTO || pipeline->stage_count >= 50)) {
-            result = tu_rt_link_variants(dev, cache, pipeline, create_info, flags,
-                                         layout, &key, blake3, rg_groups, rg_count,
-                                         link_mode == TU_RT_LINK_WHOLE);
+      const unsigned link_mode = tu_rt_link_mode();
+      bool linked = false;
+      if (link_mode != TU_RT_LINK_OFF && dev->physical_device->info->chip >= 7 &&
+          rg_count >= 1 &&
+          !(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR) &&
+          (link_mode != TU_RT_LINK_AUTO || pipeline->stage_count >= 50)) {
+         result = tu_rt_link_variants(dev, cache, pipeline, create_info, flags,
+                                      layout, &key, blake3, rg_groups, rg_count,
+                                      link_mode == TU_RT_LINK_WHOLE);
+         if (result == VK_SUCCESS) {
+            linked = true;
+            shader = pipeline->variants[0].shader;
+            vk_pipeline_cache_object_ref(&shader->base);
+         } else if (result != VK_ERROR_FEATURE_NOT_PRESENT) {
+            goto fail;
+         } else {
+            pipeline->variant_count = 0;
+            pipeline->variants = NULL;
          }
-         if (result == VK_ERROR_FEATURE_NOT_PRESENT)
-            result = tu_rt_build_variants(dev, cache, pipeline, create_info, flags,
-                                          layout, &key, blake3, rg_groups, rg_count);
+      }
+      if (!linked && rg_count > 1 && !debug_get_bool_option("TU_RT_NO_VARIANTS", false)) {
+         result = tu_rt_build_variants(dev, cache, pipeline, create_info, flags,
+                                       layout, &key, blake3, rg_groups, rg_count);
          if (result != VK_SUCCESS)
             goto fail;
          shader = pipeline->variants[0].shader;
          vk_pipeline_cache_object_ref(&shader->base);
-      } else if (!(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR))
+      } else if (!linked &&
+                 !(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR)) {
          shader = tu_compute_pipeline_cache_lookup(dev, cache, blake3);
+      }
       if (!shader) {
          if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
             result = VK_PIPELINE_COMPILE_REQUIRED;
