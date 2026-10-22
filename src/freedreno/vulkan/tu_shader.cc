@@ -3980,7 +3980,9 @@ tu_shader_create(struct tu_device *dev,
    struct ir3_shader_nir_options nir_options;
    init_ir3_nir_options(&nir_options, key);
 
+   int64_t rt_t0 = rt ? os_time_get_nano() : 0;
    ir3_finalize_nir(dev->compiler, &nir_options, nir);
+   int64_t rt_t1 = rt ? os_time_get_nano() : 0;
 
    /* This has to happen after finalizing, so that we know the final bitsize
     * after vectorizing.
@@ -4041,6 +4043,7 @@ tu_shader_create(struct tu_device *dev,
 
    struct ir3_shader *ir3_shader =
       ir3_shader_from_nir(dev->compiler, nir, &options);
+   int64_t rt_t2 = rt ? os_time_get_nano() : 0;
 
    if (lane_linear)
       ir3_shader->cs.force_linear_dispatch = true;
@@ -4050,6 +4053,7 @@ tu_shader_create(struct tu_device *dev,
    if (variant && !rt)
       variant = tu_skytrace_variant(ir3_shader, ir3_key, executable_info,
                                     variant);
+   int64_t rt_t3 = rt ? os_time_get_nano() : 0;
    if (variant && rt) {
       variant->shader_options.rt_blobs = NULL;
       if (rt->fixup)
@@ -4151,6 +4155,14 @@ tu_shader_create(struct tu_device *dev,
    if (result != VK_SUCCESS) {
       vk_free(&dev->vk.alloc, shader);
       return result;
+   }
+
+   if (rt && debug_get_bool_option("TU_RT_LINK_TIMING", false)) {
+      int64_t rt_t4 = os_time_get_nano();
+      mesa_logi("tu-rt-link-timing: finalize %.1f ms, from_nir %.1f ms, variant %.1f ms, "
+                "upload %.1f ms, size %u",
+                (rt_t1 - rt_t0) / 1e6, (rt_t2 - rt_t1) / 1e6, (rt_t3 - rt_t2) / 1e6,
+                (rt_t4 - rt_t3) / 1e6, shader->variant->info.size / 8);
    }
 
    *shader_out = shader;
