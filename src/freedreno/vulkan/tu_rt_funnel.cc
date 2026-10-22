@@ -17,8 +17,9 @@
 
 struct tu_rt_funnel_class {
    const struct glsl_type *ptype;
-   bool flags_const;
-   uint32_t flags;
+   unsigned first_site;
+   uint32_t flags_known_mask;
+   uint32_t flags_known_val;
    unsigned sites;
    bool seen;
    bool arg_const[TU_RT_FUNNEL_ARGS];
@@ -26,7 +27,6 @@ struct tu_rt_funnel_class {
    unsigned arg_comps[TU_RT_FUNNEL_ARGS];
    unsigned arg_bits[TU_RT_FUNNEL_ARGS];
    nir_variable *payload;
-   nir_variable *payload_undef;
    nir_variable *arg_var[TU_RT_FUNNEL_ARGS];
 };
 
@@ -101,6 +101,53 @@ tu_rt_funnel_const_eq(nir_src src, const nir_const_value *vals, unsigned comps,
          return false;
    }
    return true;
+}
+
+static void
+tu_rt_funnel_known_bits(nir_scalar s, uint32_t *mask, uint32_t *val, unsigned depth)
+{
+   *mask = 0;
+   *val = 0;
+   if (s.def->bit_size != 32)
+      return;
+   if (nir_scalar_is_const(s)) {
+      *mask = ~0u;
+      *val = nir_scalar_as_uint(s);
+      return;
+   }
+   if (!depth || !nir_scalar_is_alu(s))
+      return;
+   nir_op op = nir_scalar_alu_op(s);
+   uint32_t ma, va, mb, vb;
+   switch (op) {
+   case nir_op_mov:
+      tu_rt_funnel_known_bits(nir_scalar_chase_alu_src(s, 0), mask, val, depth - 1);
+      return;
+   case nir_op_ior:
+   case nir_op_iand: {
+      tu_rt_funnel_known_bits(nir_scalar_chase_alu_src(s, 0), &ma, &va, depth - 1);
+      tu_rt_funnel_known_bits(nir_scalar_chase_alu_src(s, 1), &mb, &vb, depth - 1);
+      uint32_t ones, zeros;
+      if (op == nir_op_ior) {
+         ones = (ma & va) | (mb & vb);
+         zeros = (ma & ~va) & (mb & ~vb);
+      } else {
+         ones = (ma & va) & (mb & vb);
+         zeros = (ma & ~va) | (mb & ~vb);
+      }
+      *mask = ones | zeros;
+      *val = ones;
+      return;
+   }
+   case nir_op_bcsel:
+      tu_rt_funnel_known_bits(nir_scalar_chase_alu_src(s, 1), &ma, &va, depth - 1);
+      tu_rt_funnel_known_bits(nir_scalar_chase_alu_src(s, 2), &mb, &vb, depth - 1);
+      *mask = ma & mb & ~(va ^ vb);
+      *val = va & *mask;
+      return;
+   default:
+      return;
+   }
 }
 
 static nir_variable *
@@ -612,7 +659,9 @@ struct tu_rt_funnel_field {
    bool dynamic;
    unsigned comps;
    unsigned bits;
-   nir_const_value val[NIR_MAX_VEC_COMPONENTS];
+   uint32_t mask[NIR_MAX_VEC_COMPONENTS];
+   uint32_t val[NIR_MAX_VEC_COMPONENTS];
+   nir_const_value cval[NIR_MAX_VEC_COMPONENTS];
 };
 
 static bool
@@ -675,20 +724,39 @@ tu_rt_funnel_pin_payloads(struct tu_rt_funnel_state *st, nir_function_impl *gi)
             nir_src v = intr->src[1];
             if (nir_src_is_undef(v))
                continue;
-            auto it = fields.find(key);
             bool full = nir_intrinsic_write_mask(intr) == nir_component_mask(v.ssa->num_components);
+            auto it = fields.find(key);
             if (it == fields.end()) {
                struct tu_rt_funnel_field f = {};
                f.comps = v.ssa->num_components;
                f.bits = v.ssa->bit_size;
-               f.dynamic = !full || !nir_src_is_const(v);
-               if (!f.dynamic)
-                  memcpy(f.val, nir_src_as_const_value(v), sizeof(nir_const_value) * f.comps);
+               f.dynamic = !full;
+               for (unsigned i = 0; i < f.comps && f.bits == 32; i++) {
+                  tu_rt_funnel_known_bits(nir_get_scalar(v.ssa, i), &f.mask[i], &f.val[i], 8);
+                  f.val[i] &= f.mask[i];
+               }
+               if (f.bits != 32) {
+                  f.dynamic |= !nir_src_is_const(v);
+                  if (!f.dynamic)
+                     memcpy(f.cval, nir_src_as_const_value(v), sizeof(nir_const_value) * f.comps);
+               }
                fields[key] = f;
-            } else if (!it->second.dynamic &&
-                       (!full || !tu_rt_funnel_const_eq(v, it->second.val, it->second.comps,
-                                                        it->second.bits))) {
-               it->second.dynamic = true;
+               continue;
+            }
+            struct tu_rt_funnel_field &f = it->second;
+            if (!full || v.ssa->num_components != f.comps || v.ssa->bit_size != f.bits) {
+               f.dynamic = true;
+               continue;
+            }
+            if (f.bits == 32) {
+               for (unsigned i = 0; i < f.comps; i++) {
+                  uint32_t m, vv;
+                  tu_rt_funnel_known_bits(nir_get_scalar(v.ssa, i), &m, &vv, 8);
+                  f.mask[i] &= m & ~(f.val[i] ^ vv);
+                  f.val[i] &= f.mask[i];
+               }
+            } else if (!f.dynamic && !tu_rt_funnel_const_eq(v, f.cval, f.comps, f.bits)) {
+               f.dynamic = true;
             }
          }
       }
@@ -697,11 +765,35 @@ tu_rt_funnel_pin_payloads(struct tu_rt_funnel_state *st, nir_function_impl *gi)
       for (nir_intrinsic_instr *intr : traces) {
          nir_builder b = nir_builder_at(nir_before_instr(&intr->instr));
          for (auto &f : fields) {
-            if (f.second.dynamic)
+            const struct tu_rt_funnel_field &fd = f.second;
+            if (fd.dynamic)
                continue;
-            nir_store_deref(&b, tu_rt_funnel_build_path(&b, var, f.first),
-                            nir_build_imm(&b, f.second.comps, f.second.bits, f.second.val),
-                            nir_component_mask(f.second.comps));
+            if (fd.bits != 32) {
+               nir_store_deref(&b, tu_rt_funnel_build_path(&b, var, f.first),
+                               nir_build_imm(&b, fd.comps, fd.bits, fd.cval),
+                               nir_component_mask(fd.comps));
+               continue;
+            }
+            bool any = false, all = true;
+            for (unsigned i = 0; i < fd.comps; i++) {
+               any |= fd.mask[i] != 0;
+               all &= fd.mask[i] == ~0u;
+            }
+            if (!any)
+               continue;
+            nir_deref_instr *d = tu_rt_funnel_build_path(&b, var, f.first);
+            nir_def *cur = all ? NULL : nir_load_deref(&b, d);
+            nir_def *comp[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned i = 0; i < fd.comps; i++) {
+               if (fd.mask[i] == ~0u)
+                  comp[i] = nir_imm_int(&b, fd.val[i]);
+               else if (fd.mask[i])
+                  comp[i] = nir_ior_imm(&b, nir_iand_imm(&b, nir_channel(&b, cur, i), ~fd.mask[i]),
+                                        fd.val[i]);
+               else
+                  comp[i] = nir_channel(&b, cur, i);
+            }
+            nir_store_deref(&b, d, nir_vec(&b, comp, fd.comps), nir_component_mask(fd.comps));
          }
       }
       nir_progress(true, gi, nir_metadata_control_flow);
@@ -804,27 +896,125 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
       }
    }
 
+   nir_variable **site_var = ralloc_array(mem_ctx, nir_variable *, nsites);
+   std::map<const struct glsl_type *, nir_variable *> undef_vars;
+   {
+      nir_builder b = nir_builder_create(impl);
+      for (unsigned j = 0; j < nsites; j++) {
+         nir_intrinsic_instr *intr = sites[j];
+         nir_deref_instr *pd = nir_src_as_deref(intr->src[10]);
+         if (!pd || !nir_deref_mode_is_one_of(pd, nir_var_function_temp | nir_var_shader_temp))
+            return tu_rt_funnel_fail(info, "payload");
+         site_var[j] = nir_local_variable_create(impl, pd->type, "tu_rt_funnel_payload");
+         nir_variable *&undef = undef_vars[pd->type];
+         if (!undef)
+            undef = nir_local_variable_create(impl, pd->type, "tu_rt_funnel_undef");
+         b.cursor = nir_before_instr(&intr->instr);
+         nir_deref_instr *cd = nir_build_deref_var(&b, site_var[j]);
+         nir_copy_deref(&b, cd, pd);
+         nir_src_rewrite(&intr->src[10], &cd->def);
+         b.cursor = nir_after_instr(&intr->instr);
+         nir_copy_deref(&b, pd, nir_build_deref_var(&b, site_var[j]));
+         nir_copy_deref(&b, nir_build_deref_var(&b, site_var[j]),
+                        nir_build_deref_var(&b, undef));
+      }
+      nir_progress(true, impl, nir_metadata_none);
+      NIR_PASS(_, r, nir_split_var_copies);
+      NIR_PASS(_, r, nir_lower_var_copies);
+      NIR_PASS(_, r, nir_lower_vars_to_ssa);
+      NIR_PASS(_, r, nir_opt_copy_prop);
+   }
+
+   struct tu_rt_funnel_sig {
+      const struct glsl_type *ptype;
+      uint32_t flags_mask;
+      uint32_t flags_val;
+      bool unique;
+      std::map<std::vector<uint32_t>, std::vector<uint64_t>> fields;
+   };
+   std::vector<struct tu_rt_funnel_sig> sigs(nsites);
+   {
+      std::vector<uint32_t> key;
+      for (unsigned j = 0; j < nsites; j++) {
+         sigs[j].ptype = site_var[j]->type;
+         tu_rt_funnel_known_bits(nir_get_scalar(sites[j]->src[1].ssa, 0), &sigs[j].flags_mask,
+                                 &sigs[j].flags_val, 8);
+         sigs[j].unique = false;
+      }
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic != nir_intrinsic_store_deref)
+               continue;
+            nir_intrinsic_instr *st_intr = nir_instr_as_intrinsic(instr);
+            nir_deref_instr *d = nir_src_as_deref(st_intr->src[0]);
+            nir_variable *var = nir_deref_instr_get_variable(d);
+            unsigned j = 0;
+            while (j < nsites && site_var[j] != var)
+               j++;
+            if (j == nsites)
+               continue;
+            nir_src v = st_intr->src[1];
+            if (nir_src_is_undef(v))
+               continue;
+            if (!tu_rt_funnel_path(d, var, key) ||
+                nir_intrinsic_write_mask(st_intr) != nir_component_mask(v.ssa->num_components)) {
+               sigs[j].unique = true;
+               continue;
+            }
+            std::vector<uint64_t> val;
+            val.push_back(v.ssa->num_components | (v.ssa->bit_size << 8));
+            if (nir_src_is_const(v)) {
+               const nir_const_value *cv = nir_src_as_const_value(v);
+               for (unsigned c = 0; c < v.ssa->num_components; c++)
+                  val.push_back(nir_const_value_as_uint(cv[c], v.ssa->bit_size));
+            } else {
+               val.push_back(~0ull);
+               val.push_back(~0ull);
+            }
+            if (sigs[j].fields.count(key))
+               sigs[j].unique = true;
+            sigs[j].fields[key] = val;
+         }
+      }
+   }
+
    for (unsigned j = 0; j < nsites; j++) {
-      nir_intrinsic_instr *intr = sites[j];
-      nir_deref_instr *pd = nir_src_as_deref(intr->src[10]);
-      if (!pd || !nir_deref_mode_is_one_of(pd, nir_var_function_temp | nir_var_shader_temp))
-         return tu_rt_funnel_fail(info, "payload");
-      bool fc = options->split_flags && nir_src_is_const(intr->src[1]);
-      uint32_t fv = fc ? nir_src_as_uint(intr->src[1]) : 0;
       unsigned c = 0;
-      while (c < nclasses &&
-             !(classes[c].ptype == pd->type && classes[c].flags_const == fc &&
-               classes[c].flags == fv))
-         c++;
+      if (!sigs[j].unique) {
+         while (c < nclasses) {
+            const struct tu_rt_funnel_sig &o = sigs[classes[c].first_site];
+            bool same_flags = o.flags_mask == sigs[j].flags_mask &&
+                              o.flags_val == sigs[j].flags_val;
+            bool same_fields = o.fields == sigs[j].fields;
+            if (!o.unique && o.ptype == sigs[j].ptype &&
+                ((options->merge_mode == 0 && same_flags && same_fields) ||
+                 options->merge_mode == 1 ||
+                 (options->merge_mode == 2 && same_fields) ||
+                 (options->merge_mode == 3 && same_flags)))
+               break;
+            c++;
+         }
+      } else {
+         c = nclasses;
+      }
       if (c == nclasses) {
-         classes[c].ptype = pd->type;
-         classes[c].flags_const = fc;
-         classes[c].flags = fv;
+         classes[c].ptype = sigs[j].ptype;
+         classes[c].first_site = j;
+         classes[c].payload = site_var[j];
+         classes[c].flags_known_mask = sigs[j].flags_mask;
+         classes[c].flags_known_val = sigs[j].flags_val & sigs[j].flags_mask;
          nclasses++;
+      } else {
+         struct tu_rt_funnel_class *cls = classes + c;
+         cls->flags_known_mask &= sigs[j].flags_mask &
+                                  ~(cls->flags_known_val ^ sigs[j].flags_val);
+         cls->flags_known_val &= cls->flags_known_mask;
       }
       site_cls[j] = c;
       struct tu_rt_funnel_class *cls = classes + c;
       cls->sites++;
+      nir_intrinsic_instr *intr = sites[j];
       for (unsigned k = 0; k < TU_RT_FUNNEL_ARGS; k++) {
          nir_src s = intr->src[k];
          if (!cls->seen) {
@@ -847,11 +1037,37 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
    }
 
    unsigned max_sites = 0;
-   for (unsigned c = 0; c < nclasses; c++)
+   unsigned desc_len = 0;
+   for (unsigned c = 0; c < nclasses; c++) {
       max_sites = MAX2(max_sites, classes[c].sites);
+      unsigned size, align;
+      glsl_get_natural_size_align_bytes(classes[c].ptype, &size, &align);
+      if (desc_len < sizeof(info->classes_desc)) {
+         int n = snprintf(info->classes_desc + desc_len, sizeof(info->classes_desc) - desc_len,
+                          "%s%ux%uB/%x:%x", c ? "," : "", classes[c].sites, size,
+                          classes[c].flags_known_mask, classes[c].flags_known_val);
+         desc_len += MAX2(n, 0);
+      }
+   }
    info->classes = nclasses;
    if (max_sites < 2)
       return tu_rt_funnel_fail(info, "no-shared-class");
+
+   for (unsigned j = 0; j < nsites; j++) {
+      nir_variable *rep = classes[site_cls[j]].payload;
+      if (site_var[j] == rep)
+         continue;
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *d = nir_instr_as_deref(instr);
+            if (d->deref_type == nir_deref_type_var && d->var == site_var[j])
+               d->var = rep;
+         }
+      }
+      exec_node_remove(&site_var[j]->node);
+   }
 
    struct tu_rt_funnel_state st = {};
    st.s = r;
@@ -868,45 +1084,24 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
    st.cls_var = nir_variable_create(r, nir_var_shader_temp, glsl_uint_type(),
                                     "tu_rt_funnel_class");
 
-   {
-      nir_builder b = nir_builder_create(impl);
-      for (unsigned c = 0; c < nclasses; c++) {
-         classes[c].payload = nir_variable_create(r, nir_var_shader_temp, classes[c].ptype,
-                                                  "tu_rt_funnel_payload");
-         classes[c].payload_undef = nir_variable_create(r, nir_var_shader_temp,
-                                                        classes[c].ptype,
-                                                        "tu_rt_funnel_undef");
-         for (unsigned k = 0; k < TU_RT_FUNNEL_ARGS; k++) {
-            if (!classes[c].arg_const[k])
-               classes[c].arg_var[k] =
-                  nir_variable_create(r, nir_var_shader_temp,
-                                      tu_rt_funnel_type(classes[c].arg_bits[k],
-                                                        classes[c].arg_comps[k]),
-                                      "tu_rt_funnel_arg");
-         }
+   for (unsigned c = 0; c < nclasses; c++) {
+      for (unsigned k = 0; k < TU_RT_FUNNEL_ARGS; k++) {
+         if (!classes[c].arg_const[k])
+            classes[c].arg_var[k] =
+               nir_variable_create(r, nir_var_shader_temp,
+                                   tu_rt_funnel_type(classes[c].arg_bits[k],
+                                                     classes[c].arg_comps[k]),
+                                   "tu_rt_funnel_arg");
       }
-      for (unsigned j = 0; j < nsites; j++) {
-         nir_intrinsic_instr *intr = sites[j];
-         nir_deref_instr *pd = nir_src_as_deref(intr->src[10]);
-         struct tu_rt_funnel_class *cls = classes + site_cls[j];
-         b.cursor = nir_before_instr(&intr->instr);
-         nir_deref_instr *cd = nir_build_deref_var(&b, cls->payload);
-         nir_copy_deref(&b, cd, pd);
-         nir_src_rewrite(&intr->src[10], &cd->def);
-         b.cursor = nir_after_instr(&intr->instr);
-         nir_copy_deref(&b, pd, nir_build_deref_var(&b, cls->payload));
-         nir_copy_deref(&b, nir_build_deref_var(&b, cls->payload),
-                        nir_build_deref_var(&b, cls->payload_undef));
-      }
-      nir_foreach_function_temp_variable_safe (var, impl) {
-         exec_node_remove(&var->node);
-         var->data.mode = nir_var_shader_temp;
-         nir_shader_add_variable(r, var);
-      }
-      nir_progress(true, impl, nir_metadata_none);
-      NIR_PASS(_, r, nir_fixup_deref_modes);
-      NIR_PASS(_, r, nir_lower_continue_constructs);
    }
+   nir_foreach_function_temp_variable_safe (var, impl) {
+      exec_node_remove(&var->node);
+      var->data.mode = nir_var_shader_temp;
+      nir_shader_add_variable(r, var);
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, r, nir_fixup_deref_modes);
+   NIR_PASS(_, r, nir_lower_continue_constructs);
 
    nir_lower_shader_calls_options lsc = {};
    lsc.address_format = nir_address_format_32bit_offset;
@@ -972,6 +1167,9 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
                   nir_build_imm(&b, cls->arg_comps[k], cls->arg_bits[k], cls->arg_val[k]) :
                   nir_load_var(&b, cls->arg_var[k]);
             }
+            if (!cls->arg_const[1] && cls->flags_known_mask)
+               src[1] = nir_ior_imm(&b, nir_iand_imm(&b, src[1], ~cls->flags_known_mask),
+                                    cls->flags_known_val & cls->flags_known_mask);
             src[TU_RT_FUNNEL_ARGS] = &nir_build_deref_var(&b, cls->payload)->def;
             nir_trace_ray(&b, src[0], src[1], src[2], src[3], src[4], src[5], src[6],
                           src[7], src[8], src[9], src[10]);
@@ -1001,7 +1199,6 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
    tu_rt_funnel_pin_payloads(&st, nir_shader_get_entrypoint(r));
    NIR_PASS(_, r, nir_opt_dce);
 
-   info->funneled_sites = nsites;
    info->instrs_after = tu_rt_funnel_count(r);
    return r;
 }

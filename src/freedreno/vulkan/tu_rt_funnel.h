@@ -11,16 +11,16 @@
 struct tu_rt_funnel_info {
    unsigned sites;
    unsigned classes;
-   unsigned funneled_sites;
    unsigned stack_bytes;
    unsigned instrs_before;
    unsigned instrs_after;
    const char *fallback;
+   char classes_desc[128];
 };
 
 struct tu_rt_funnel_options {
    unsigned max_stack_bytes;
-   bool split_flags;
+   unsigned merge_mode;
    bool slots_in_regs;
 };
 
