@@ -7,6 +7,9 @@
 
 #include "nir_builder.h"
 #include "nir_control_flow.h"
+extern "C" {
+#include "nir_phi_builder.h"
+}
 #include "util/hash_table.h"
 
 #include <map>
@@ -287,55 +290,82 @@ struct tu_rt_funnel_repair {
    nir_cf_node *region;
    nir_block *merge;
    nir_block *skip_pred;
-   bool dom_check;
    std::map<nir_def *, nir_def *> phis;
+   std::map<nir_def *, struct nir_phi_builder_value *> vals;
+   struct nir_phi_builder *pb;
+   BITSET_WORD *def_set;
 };
 
 static nir_def *
-tu_rt_funnel_outside(struct tu_rt_funnel_repair *rp, nir_def *def)
+tu_rt_funnel_outside(struct tu_rt_funnel_repair *rp, nir_def *def, nir_block *use)
 {
-   if (!tu_rt_funnel_inside(nir_def_block(def), rp->region))
+   nir_block *db = nir_def_block(def);
+   if (!tu_rt_funnel_inside(db, rp->region) || nir_block_dominates(db, use))
       return def;
-   auto it = rp->phis.find(def);
-   if (it != rp->phis.end())
-      return it->second;
-   nir_builder ub = nir_builder_at(nir_before_impl(rp->impl));
-   nir_def *undef = nir_undef(&ub, def->num_components, def->bit_size);
-   nir_phi_instr *phi = nir_phi_instr_create(rp->impl->function->shader);
-   nir_def_init(&phi->instr, &phi->def, def->num_components, def->bit_size);
-   nir_foreach_pred (pred, rp->merge)
-      nir_phi_instr_add_src(phi, pred, pred == rp->skip_pred ? undef : def);
-   nir_instr_insert(nir_before_block(rp->merge), &phi->instr);
-   rp->phis[def] = &phi->def;
-   return &phi->def;
+   bool merge_ok = nir_block_dominates(rp->merge, use);
+   nir_foreach_pred (pred, rp->merge) {
+      if (pred != rp->skip_pred && !nir_block_dominates(db, pred))
+         merge_ok = false;
+   }
+   if (merge_ok) {
+      auto it = rp->phis.find(def);
+      if (it != rp->phis.end())
+         return it->second;
+      nir_builder ub = nir_builder_at(nir_before_impl(rp->impl));
+      nir_def *undef = nir_undef(&ub, def->num_components, def->bit_size);
+      nir_phi_instr *phi = nir_phi_instr_create(rp->impl->function->shader);
+      nir_def_init(&phi->instr, &phi->def, def->num_components, def->bit_size);
+      nir_foreach_pred (pred, rp->merge)
+         nir_phi_instr_add_src(phi, pred, pred == rp->skip_pred ? undef : def);
+      nir_instr_insert(nir_before_block(rp->merge), &phi->instr);
+      rp->phis[def] = &phi->def;
+      return &phi->def;
+   }
+   struct nir_phi_builder_value *val;
+   auto it = rp->vals.find(def);
+   if (it != rp->vals.end()) {
+      val = it->second;
+   } else {
+      if (!rp->pb) {
+         rp->pb = nir_phi_builder_create(rp->impl);
+         rp->def_set = rzalloc_array(rp->pb, BITSET_WORD, BITSET_WORDS(rp->impl->num_blocks));
+      }
+      memset(rp->def_set, 0, BITSET_WORDS(rp->impl->num_blocks) * sizeof(BITSET_WORD));
+      BITSET_SET(rp->def_set, db->index);
+      val = nir_phi_builder_add_value(rp->pb, def->num_components, def->bit_size, rp->def_set);
+      nir_phi_builder_value_set_block_def(val, db, def);
+      rp->vals[def] = val;
+   }
+   return nir_phi_builder_value_get_block_def(val, use);
 }
 
 static nir_deref_instr *
-tu_rt_funnel_clone_deref(nir_builder *b, struct tu_rt_funnel_repair *rp, nir_deref_instr *d)
+tu_rt_funnel_clone_deref(nir_builder *b, struct tu_rt_funnel_repair *rp, nir_deref_instr *d,
+                         nir_block *use)
 {
    switch (d->deref_type) {
    case nir_deref_type_var:
       return nir_build_deref_var(b, d->var);
    case nir_deref_type_cast: {
       nir_deref_instr *parent = nir_src_as_deref(d->parent);
-      nir_def *p = parent ? &tu_rt_funnel_clone_deref(b, rp, parent)->def :
-                            tu_rt_funnel_outside(rp, d->parent.ssa);
+      nir_def *p = parent ? &tu_rt_funnel_clone_deref(b, rp, parent, use)->def :
+                            tu_rt_funnel_outside(rp, d->parent.ssa, use);
       return nir_build_deref_cast_with_alignment(b, p, d->modes, d->type, d->cast.ptr_stride,
                                                  d->cast.align_mul, d->cast.align_offset);
    }
    case nir_deref_type_struct:
-      return nir_build_deref_struct(b, tu_rt_funnel_clone_deref(b, rp, nir_deref_instr_parent(d)),
+      return nir_build_deref_struct(b, tu_rt_funnel_clone_deref(b, rp, nir_deref_instr_parent(d), use),
                                     d->strct.index);
    case nir_deref_type_array:
-      return nir_build_deref_array(b, tu_rt_funnel_clone_deref(b, rp, nir_deref_instr_parent(d)),
-                                   tu_rt_funnel_outside(rp, d->arr.index.ssa));
+      return nir_build_deref_array(b, tu_rt_funnel_clone_deref(b, rp, nir_deref_instr_parent(d), use),
+                                   tu_rt_funnel_outside(rp, d->arr.index.ssa, use));
    case nir_deref_type_ptr_as_array:
       return nir_build_deref_ptr_as_array(b,
-                                          tu_rt_funnel_clone_deref(b, rp, nir_deref_instr_parent(d)),
-                                          tu_rt_funnel_outside(rp, d->arr.index.ssa));
+                                          tu_rt_funnel_clone_deref(b, rp, nir_deref_instr_parent(d), use),
+                                          tu_rt_funnel_outside(rp, d->arr.index.ssa, use));
    case nir_deref_type_array_wildcard:
       return nir_build_deref_array_wildcard(b,
-                                            tu_rt_funnel_clone_deref(b, rp, nir_deref_instr_parent(d)));
+                                            tu_rt_funnel_clone_deref(b, rp, nir_deref_instr_parent(d), use));
    default:
       UNREACHABLE("unexpected deref");
    }
@@ -352,15 +382,14 @@ tu_rt_funnel_repair_region(struct tu_rt_funnel_repair *rp)
             defs.push_back(def);
       }
    }
-   if (rp->dom_check)
-      nir_metadata_require(rp->impl, nir_metadata_dominance);
+   nir_progress(true, rp->impl, nir_metadata_none);
+   nir_metadata_require(rp->impl, nir_metadata_block_index | nir_metadata_dominance);
+   rp->pb = NULL;
    for (nir_def *def : defs) {
-      if (rp->dom_check && nir_block_dominates(nir_def_block(def), rp->skip_pred))
-         continue;
       std::vector<nir_src *> outside;
       nir_foreach_use_including_if (src, def) {
          nir_block *ub = tu_rt_funnel_use_block(src);
-         if (tu_rt_funnel_inside(ub, rp->region))
+         if (tu_rt_funnel_inside(ub, rp->region) || nir_block_dominates(nir_def_block(def), ub))
             continue;
          if (!nir_src_is_if(src) && nir_src_use_instr(src)->type == nir_instr_type_phi &&
              nir_src_use_instr(src)->block == rp->merge)
@@ -373,18 +402,21 @@ tu_rt_funnel_repair_region(struct tu_rt_funnel_repair *rp)
       if (dinstr->type == nir_instr_type_deref) {
          for (nir_src *src : outside) {
             nir_builder b;
+            nir_block *ub = tu_rt_funnel_use_block(src);
             if (nir_src_is_if(src) || nir_src_use_instr(src)->type == nir_instr_type_phi)
-               b = nir_builder_at(nir_after_block_before_jump(tu_rt_funnel_use_block(src)));
+               b = nir_builder_at(nir_after_block_before_jump(ub));
             else
                b = nir_builder_at(nir_before_instr(nir_src_use_instr(src)));
-            nir_src_rewrite(src, &tu_rt_funnel_clone_deref(&b, rp, nir_instr_as_deref(dinstr))->def);
+            nir_src_rewrite(src, &tu_rt_funnel_clone_deref(&b, rp, nir_instr_as_deref(dinstr), ub)->def);
          }
          continue;
       }
-      nir_def *phi = tu_rt_funnel_outside(rp, def);
       for (nir_src *src : outside)
-         nir_src_rewrite(src, phi);
+         nir_src_rewrite(src, tu_rt_funnel_outside(rp, def, tu_rt_funnel_use_block(src)));
    }
+   if (rp->pb)
+      nir_phi_builder_finish(rp->pb);
+   rp->pb = NULL;
 }
 
 static void
@@ -409,12 +441,11 @@ tu_rt_funnel_guard_run(nir_builder *b, struct tu_rt_funnel_state *st,
    nir_cf_extract(&list, begin, end);
    nir_cf_reinsert(&list, nir_before_block(nir_if_first_then_block(nif)));
 
-   struct tu_rt_funnel_repair rp;
+   struct tu_rt_funnel_repair rp = {};
    rp.impl = b->impl;
    rp.region = &nif->cf_node;
    rp.merge = nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
    rp.skip_pred = nir_if_last_else_block(nif);
-   rp.dom_check = false;
    tu_rt_funnel_repair_region(&rp);
 }
 
@@ -523,18 +554,20 @@ tu_rt_funnel_inplace(struct tu_rt_funnel_state *st, nir_function_impl *impl,
       nir_block *exit = nir_cf_node_as_block(nir_cf_node_next(&loop->cf_node));
       tu_rt_funnel_fix_phis(impl);
       nir_progress(true, impl, nir_metadata_none);
-      struct tu_rt_funnel_repair rp;
+      struct tu_rt_funnel_repair rp = {};
       rp.impl = impl;
       rp.region = &loop->cf_node;
       rp.merge = exit;
       rp.skip_pred = brk;
-      rp.dom_check = true;
       tu_rt_funnel_repair_region(&rp);
    }
 
    tu_rt_funnel_fix_phis(impl);
    nir_progress(true, impl, nir_metadata_none);
-   nir_repair_ssa_impl(impl);
+   if (nir_repair_ssa_impl(impl)) {
+      st->fail = "repair";
+      return false;
+   }
    return true;
 }
 
@@ -1140,7 +1173,7 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
 
    std::vector<nir_jump_instr *> returns;
    if (!tu_rt_funnel_inplace(&st, impl, returns))
-      return tu_rt_funnel_fail(info, "inplace");
+      return tu_rt_funnel_fail(info, st.fail ? st.fail : "inplace");
    if (!tu_rt_funnel_lower(&st, impl, returns))
       return tu_rt_funnel_fail(info, st.fail);
    NIR_PASS(_, r, nir_opt_remove_phis);
