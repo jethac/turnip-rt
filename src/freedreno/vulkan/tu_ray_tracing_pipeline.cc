@@ -2150,7 +2150,7 @@ tu_rt_pipeline_create(struct tu_device *dev,
       uint32_t depth = MIN2(create_info->maxPipelineRayRecursionDepth, 1);
       _mesa_blake3_update(&ctx, &depth, sizeof(depth));
       if (tu_rt_funnel_enabled(pipeline)) {
-         static const char funnel_tag[] = "tu-rt-funnel-3";
+         static const char funnel_tag[] = "tu-rt-funnel-4";
          const struct tu_rt_funnel_options *fo = tu_rt_funnel_options();
          _mesa_blake3_update(&ctx, funnel_tag, sizeof(funnel_tag));
          _mesa_blake3_update(&ctx, &fo->max_stack_bytes, sizeof(fo->max_stack_bytes));

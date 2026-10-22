@@ -13,6 +13,7 @@ extern "C" {
 #include "util/hash_table.h"
 
 #include <map>
+#include <set>
 #include <vector>
 
 #define TU_RT_FUNNEL_ARGS 10
@@ -31,6 +32,9 @@ struct tu_rt_funnel_class {
    unsigned arg_bits[TU_RT_FUNNEL_ARGS];
    nir_variable *payload;
    nir_variable *arg_var[TU_RT_FUNNEL_ARGS];
+   bool as_desc;
+   int as_idx[2][NIR_INTRINSIC_MAX_CONST_INDEX];
+   unsigned as_shape[2][3];
 };
 
 struct tu_rt_funnel_item {
@@ -857,6 +861,79 @@ tu_rt_funnel_ladder(nir_builder *b, nir_def *sel, unsigned lo, unsigned hi, F &e
    nir_pop_if(b, NULL);
 }
 
+static bool
+tu_rt_funnel_is_desc(nir_def *def)
+{
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+   case nir_intrinsic_vulkan_resource_index:
+   case nir_intrinsic_vulkan_resource_reindex:
+   case nir_intrinsic_load_vulkan_descriptor:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+tu_rt_funnel_from_desc(nir_def *def, std::set<nir_def *> &seen)
+{
+   if (!seen.insert(def).second)
+      return false;
+   if (tu_rt_funnel_is_desc(def))
+      return true;
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_phi) {
+      nir_foreach_phi_src (src, nir_instr_as_phi(instr)) {
+         if (tu_rt_funnel_from_desc(src->src.ssa, seen))
+            return true;
+      }
+   } else if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+         if (tu_rt_funnel_from_desc(alu->src[i].src.ssa, seen))
+            return true;
+      }
+   }
+   return false;
+}
+
+static nir_intrinsic_instr *
+tu_rt_funnel_as_chain(nir_def *def)
+{
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type != nir_instr_type_intrinsic ||
+       nir_instr_as_intrinsic(instr)->intrinsic != nir_intrinsic_load_vulkan_descriptor)
+      return NULL;
+   nir_instr *ri = nir_def_instr(nir_instr_as_intrinsic(instr)->src[0].ssa);
+   if (ri->type != nir_instr_type_intrinsic ||
+       nir_instr_as_intrinsic(ri)->intrinsic != nir_intrinsic_vulkan_resource_index)
+      return NULL;
+   return nir_instr_as_intrinsic(instr);
+}
+
+static bool
+tu_rt_funnel_as_phi(nir_function_impl *impl)
+{
+   nir_foreach_block (block, impl) {
+      nir_foreach_phi (phi, block) {
+         nir_foreach_phi_src (src, phi) {
+            nir_instr *p = nir_def_instr(src->src.ssa);
+            if (p->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(p);
+            if ((i->intrinsic == nir_intrinsic_vulkan_resource_index ||
+                 i->intrinsic == nir_intrinsic_load_vulkan_descriptor) &&
+                nir_intrinsic_desc_type(i) == nir_descriptor_type_acceleration_structure)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static nir_shader *
 tu_rt_funnel_fail(struct tu_rt_funnel_info *info, const char *why)
 {
@@ -964,8 +1041,34 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
       uint32_t flags_val;
       bool unique;
       std::map<std::vector<uint32_t>, std::vector<uint64_t>> fields;
+      std::vector<int> as_key;
    };
    std::vector<struct tu_rt_funnel_sig> sigs(nsites);
+   std::vector<nir_intrinsic_instr *> as_ld(nsites);
+   {
+      for (unsigned j = 0; j < nsites; j++) {
+         as_ld[j] = tu_rt_funnel_as_chain(sites[j]->src[0].ssa);
+         for (unsigned k = as_ld[j] ? 1 : 0; k < TU_RT_FUNNEL_ARGS; k++) {
+            std::set<nir_def *> seen;
+            if (tu_rt_funnel_from_desc(sites[j]->src[k].ssa, seen))
+               return tu_rt_funnel_fail(info, "as-desc");
+         }
+         if (!as_ld[j])
+            continue;
+         nir_intrinsic_instr *ri = nir_def_as_intrinsic(as_ld[j]->src[0].ssa);
+         if (!nir_src_is_const(ri->src[0]))
+            return tu_rt_funnel_fail(info, "as-desc");
+         sigs[j].as_key.push_back(1);
+         sigs[j].as_key.push_back(nir_src_as_uint(ri->src[0]));
+         for (nir_intrinsic_instr *i : { ri, as_ld[j] }) {
+            sigs[j].as_key.push_back(i->num_components);
+            sigs[j].as_key.push_back(i->def.num_components);
+            sigs[j].as_key.push_back(i->def.bit_size);
+            for (unsigned n = 0; n < nir_intrinsic_infos[i->intrinsic].num_indices; n++)
+               sigs[j].as_key.push_back(i->const_index[n]);
+         }
+      }
+   }
    {
       std::vector<uint32_t> key;
       for (unsigned j = 0; j < nsites; j++) {
@@ -1020,7 +1123,7 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
             bool same_flags = o.flags_mask == sigs[j].flags_mask &&
                               o.flags_val == sigs[j].flags_val;
             bool same_fields = o.fields == sigs[j].fields;
-            if (!o.unique && o.ptype == sigs[j].ptype &&
+            if (!o.unique && o.ptype == sigs[j].ptype && o.as_key == sigs[j].as_key &&
                 ((options->merge_mode == 0 && same_flags && same_fields) ||
                  options->merge_mode == 1 ||
                  (options->merge_mode == 2 && same_fields) ||
@@ -1037,6 +1140,17 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
          classes[c].payload = site_var[j];
          classes[c].flags_known_mask = sigs[j].flags_mask;
          classes[c].flags_known_val = sigs[j].flags_val & sigs[j].flags_mask;
+         if (as_ld[j]) {
+            nir_intrinsic_instr *ri = nir_def_as_intrinsic(as_ld[j]->src[0].ssa);
+            classes[c].as_desc = true;
+            for (unsigned n = 0; n < 2; n++) {
+               nir_intrinsic_instr *i = n ? as_ld[j] : ri;
+               memcpy(classes[c].as_idx[n], i->const_index, sizeof(i->const_index));
+               classes[c].as_shape[n][0] = i->num_components;
+               classes[c].as_shape[n][1] = i->def.num_components;
+               classes[c].as_shape[n][2] = i->def.bit_size;
+            }
+         }
          nclasses++;
       } else {
          struct tu_rt_funnel_class *cls = classes + c;
@@ -1048,6 +1162,8 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
       struct tu_rt_funnel_class *cls = classes + c;
       cls->sites++;
       nir_intrinsic_instr *intr = sites[j];
+      if (as_ld[j])
+         nir_src_rewrite(&intr->src[0], nir_def_as_intrinsic(as_ld[j]->src[0].ssa)->src[0].ssa);
       for (unsigned k = 0; k < TU_RT_FUNNEL_ARGS; k++) {
          nir_src s = intr->src[k];
          if (!cls->seen) {
@@ -1203,6 +1319,19 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
             if (!cls->arg_const[1] && cls->flags_known_mask)
                src[1] = nir_ior_imm(&b, nir_iand_imm(&b, src[1], ~cls->flags_known_mask),
                                     cls->flags_known_val & cls->flags_known_mask);
+            if (cls->as_desc) {
+               for (unsigned n = 0; n < 2; n++) {
+                  nir_intrinsic_instr *i =
+                     nir_intrinsic_instr_create(r, n ? nir_intrinsic_load_vulkan_descriptor :
+                                                       nir_intrinsic_vulkan_resource_index);
+                  i->src[0] = nir_src_for_ssa(src[0]);
+                  memcpy(i->const_index, cls->as_idx[n], sizeof(i->const_index));
+                  i->num_components = cls->as_shape[n][0];
+                  nir_def_init(&i->instr, &i->def, cls->as_shape[n][1], cls->as_shape[n][2]);
+                  nir_builder_instr_insert(&b, &i->instr);
+                  src[0] = &i->def;
+               }
+            }
             src[TU_RT_FUNNEL_ARGS] = &nir_build_deref_var(&b, cls->payload)->def;
             nir_trace_ray(&b, src[0], src[1], src[2], src[3], src[4], src[5], src[6],
                           src[7], src[8], src[9], src[10]);
@@ -1231,6 +1360,8 @@ tu_rt_funnel_raygen(const nir_shader *raygen, void *mem_ctx,
    NIR_PASS(_, r, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_temp, NULL);
    tu_rt_funnel_pin_payloads(&st, nir_shader_get_entrypoint(r));
    NIR_PASS(_, r, nir_opt_dce);
+   if (tu_rt_funnel_as_phi(nir_shader_get_entrypoint(r)))
+      return tu_rt_funnel_fail(info, "as-desc");
 
    info->instrs_after = tu_rt_funnel_count(r);
    return r;
