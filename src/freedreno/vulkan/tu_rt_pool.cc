@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <cstring>
+#include <iterator>
 #include <malloc.h>
 #include <mutex>
 #include <pthread.h>
@@ -18,6 +19,7 @@
 
 #include "util/mesa-blake3.h"
 #include "util/os_time.h"
+#include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include "vk_pipeline_cache.h"
 
@@ -58,6 +60,8 @@ struct tu_rt_pool {
    size_t heap_budget;
    size_t heap_base;
    uint64_t throttled;
+   size_t done_count;
+   size_t done_pruned_at;
 };
 
 static bool
@@ -323,6 +327,7 @@ tu_rt_pool_complete_locked(struct tu_device *dev, struct tu_rt_pool *pool,
       vk_pipeline_cache_object_ref(&t->shader->base);
       rec.shader = t->shader;
       pool->done_by_rg[tu_rt_ckey(t)].push_back(std::move(rec));
+      pool->done_count++;
    }
    struct tu_rt_pool_entry *e = (struct tu_rt_pool_entry *) t->entry;
    if (e) {
@@ -418,6 +423,8 @@ tu_rt_pool_get(struct tu_device *dev)
    pool->heap_budget = (size_t) debug_get_num_option("TU_RT_HEAP_MB", 2048) << 20;
    pool->heap_base = 0;
    pool->throttled = 0;
+   pool->done_count = 0;
+   pool->done_pruned_at = 0;
 
    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
    int64_t n = debug_get_num_option("TU_RT_POOL_THREADS",
@@ -582,11 +589,31 @@ tu_rt_pool_retarget_locked(struct tu_rt_pool *pool, struct tu_rt_task *sup)
            }), v.end());
 }
 
+static void
+tu_rt_pool_prune_locked(struct tu_device *dev, struct tu_rt_pool *pool)
+{
+   if (pool->done_count < pool->done_pruned_at + 64)
+      return;
+   for (auto it = pool->done_by_rg.begin(); it != pool->done_by_rg.end();) {
+      auto &v = it->second;
+      v.erase(std::remove_if(v.begin(), v.end(), [&](struct tu_rt_done_rec &rec) {
+                 if (p_atomic_read(&rec.shader->base.ref_cnt) > 1)
+                    return false;
+                 vk_pipeline_cache_object_unref(&dev->vk, &rec.shader->base);
+                 pool->done_count--;
+                 return true;
+              }), v.end());
+      it = v.empty() ? pool->done_by_rg.erase(it) : std::next(it);
+   }
+   pool->done_pruned_at = pool->done_count;
+}
+
 void
 tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
 {
    struct tu_rt_pool *pool = tu_rt_pool_get(dev);
    std::unique_lock<std::mutex> lk(pool->lock);
+   tu_rt_pool_prune_locked(dev, pool);
 
    batch->remaining = batch->count;
    batch->running = 0;

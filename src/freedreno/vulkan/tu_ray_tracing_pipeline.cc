@@ -17,6 +17,9 @@
 #include "nir/nir_serialize.h"
 #include <pthread.h>
 #include <atomic>
+#include <chrono>
+#include <mutex>
+#include <thread>
 #include <algorithm>
 #include <vector>
 #include <malloc.h>
@@ -176,21 +179,24 @@ tu_rt_stats_finish(struct tu_device *dev, struct tu_ray_tracing_pipeline *pipeli
    pipeline->stats_bo = NULL;
 }
 
+static void
+tu_rt_stats_thread(void)
+{
+   const int64_t ms = MAX2(debug_get_num_option("TU_RT_STATS_PERIOD", 10) * 1000, 100);
+   for (;;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      simple_mtx_lock(&tu_rt_stats_mtx);
+      list_for_each_entry (struct tu_ray_tracing_pipeline, p, &tu_rt_stats_list, stats_link)
+         tu_rt_stats_dump_locked(p, "periodic");
+      simple_mtx_unlock(&tu_rt_stats_mtx);
+   }
+}
+
 void
 tu_rt_stats_tick(void)
 {
-   static std::atomic<int64_t> last;
-   static const int64_t period =
-      debug_get_num_option("TU_RT_STATS_PERIOD", 10) * 1000000000ll;
-   int64_t now = os_time_get_nano(), prev = last.load();
-   if (prev && now - prev < period)
-      return;
-   if (!last.compare_exchange_strong(prev, now) || !prev)
-      return;
-   simple_mtx_lock(&tu_rt_stats_mtx);
-   list_for_each_entry (struct tu_ray_tracing_pipeline, p, &tu_rt_stats_list, stats_link)
-      tu_rt_stats_dump_locked(p, "periodic");
-   simple_mtx_unlock(&tu_rt_stats_mtx);
+   static std::once_flag once;
+   std::call_once(once, [] { std::thread(tu_rt_stats_thread).detach(); });
 }
 
 static bool
@@ -2911,8 +2917,9 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          instrs += pipeline->variants[v].shader->variant->info.instrs_count;
          max_regs = MAX2(max_regs, pipeline->variants[v].shader->variant->info.max_reg + 1u);
       }
-      mesa_logi("tu-rt: %u raygen variants (%u compiled) total instrs=%" PRIu64 " max regs=%u ca=%u missed=%u ss_hits=%u",
-                count, pipeline->compiled, instrs, max_regs, pipeline->ca_variants, missing, ss_hits);
+      mesa_logi("tu-rt: %u raygen variants (%u compiled) total instrs=%" PRIu64 " max regs=%u ca=%u missed=%u ss_hits=%u pipe=%u",
+                count, pipeline->compiled, instrs, max_regs, pipeline->ca_variants, missing, ss_hits,
+                pipeline->id);
    }
    return VK_SUCCESS;
 }
