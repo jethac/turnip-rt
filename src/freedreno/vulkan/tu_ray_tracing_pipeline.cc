@@ -19,6 +19,7 @@
 #include <atomic>
 #include <malloc.h>
 #include "vk_pipeline.h"
+#include "vk_shader_module.h"
 
 #include "tu_device.h"
 #include "tu_shader.h"
@@ -32,6 +33,48 @@ tu_rt_compile_stages(struct tu_device *dev,
                      const VkRayTracingPipelineCreateInfoKHR *create_info,
                      VkPipelineCreateFlags2KHR flags,
                      const struct tu_shader_key *key);
+
+static void
+tu_keylog_hex(char *out, const unsigned char *p, unsigned n)
+{
+   static const char d[] = "0123456789abcdef";
+   for (unsigned i = 0; i < n; i++) {
+      out[2 * i] = d[p[i] >> 4];
+      out[2 * i + 1] = d[p[i] & 15];
+   }
+   out[2 * n] = 0;
+}
+
+static int
+tu_rt_group_key_cmp(const void *a, const void *b, void *data)
+{
+   const struct tu_ray_tracing_pipeline *pipeline = (const struct tu_ray_tracing_pipeline *) data;
+   const struct tu_rt_group *ga = pipeline->groups + *(const uint32_t *) a;
+   const struct tu_rt_group *gb = pipeline->groups + *(const uint32_t *) b;
+   if (ga->handle != gb->handle)
+      return ga->handle < gb->handle ? -1 : 1;
+   uint32_t ia[3] = { ga->recursive_index, ga->ahit_index, ga->isec_index };
+   uint32_t ib[3] = { gb->recursive_index, gb->ahit_index, gb->isec_index };
+   for (unsigned k = 0; k < 3; k++) {
+      bool ua = ia[k] == VK_SHADER_UNUSED_KHR, ub = ib[k] == VK_SHADER_UNUSED_KHR;
+      if (ua != ub)
+         return ua ? -1 : 1;
+      if (!ua) {
+         int c = memcmp(pipeline->stage_hashes + ia[k] * BLAKE3_KEY_LEN,
+                        pipeline->stage_hashes + ib[k] * BLAKE3_KEY_LEN, BLAKE3_KEY_LEN);
+         if (c)
+            return c;
+      }
+   }
+   return 0;
+}
+
+static bool
+tu_keylog_enabled(void)
+{
+   static const bool on = debug_get_bool_option("TU_KEYLOG", false);
+   return on;
+}
 
 static void
 tu_rt_init_groups(struct tu_device *dev,
@@ -1961,6 +2004,47 @@ tu_rt_pipeline_create(struct tu_device *dev,
 
    tu_rt_init_groups(dev, pipeline, create_info);
 
+   if (tu_keylog_enabled()) {
+      mesa_logi("tu-key: rt %s stages=%u groups=%u own_stages=%u libs=%d",
+                (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ? "library" : "final",
+                pipeline->stage_count, pipeline->group_count, create_info->stageCount,
+                create_info->pLibraryInfo ? (int) create_info->pLibraryInfo->libraryCount : 0);
+      for (uint32_t s = 0; s < create_info->stageCount; s++) {
+         const VkPipelineShaderStageCreateInfo *st = create_info->pStages + s;
+         VK_FROM_HANDLE(vk_shader_module, module, st->module);
+         const VkShaderModuleCreateInfo *minfo =
+            (const VkShaderModuleCreateInfo *) vk_find_struct_const(st->pNext, SHADER_MODULE_CREATE_INFO);
+         blake3_hash mh = {};
+         if (module)
+            memcpy(mh, module->hash, sizeof(mh));
+         else if (minfo)
+            vk_shader_module_hash(minfo, mh);
+         blake3_hash sp = {};
+         uint32_t sp_n = 0, sp_sz = 0;
+         if (st->pSpecializationInfo) {
+            struct mesa_blake3 sc;
+            _mesa_blake3_init(&sc);
+            _mesa_blake3_update(&sc, st->pSpecializationInfo->pMapEntries,
+                                st->pSpecializationInfo->mapEntryCount *
+                                sizeof(*st->pSpecializationInfo->pMapEntries));
+            _mesa_blake3_update(&sc, st->pSpecializationInfo->pData,
+                                st->pSpecializationInfo->dataSize);
+            _mesa_blake3_final(&sc, sp);
+            sp_n = st->pSpecializationInfo->mapEntryCount;
+            sp_sz = (uint32_t) st->pSpecializationInfo->dataSize;
+         }
+         char hs[17], hm[17], hp[17];
+         tu_keylog_hex(hs, pipeline->stage_hashes + s * BLAKE3_KEY_LEN, 8);
+         tu_keylog_hex(hm, mh, 8);
+         tu_keylog_hex(hp, sp, 8);
+         mesa_logi("tu-key:  s%u %s name=%s sh=%s mod=%s%s sflags=0x%x spec=%u/%u/%s",
+                   s, _mesa_shader_stage_to_abbrev(vk_to_mesa_shader_stage(st->stage)),
+                   st->pName ? st->pName : "?", hs, hm,
+                   module ? "" : (minfo ? "(code)" : "(ident)"),
+                   (unsigned) st->flags, sp_n, sp_sz, hp);
+      }
+   }
+
    if (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) {
       pipeline->stage_set = tu_rt_stage_set_create(pipeline->mem_ctx, pipeline->stage_count);
       if (!pipeline->stage_set) {
@@ -1987,7 +2071,28 @@ tu_rt_pipeline_create(struct tu_device *dev,
       _mesa_blake3_update(&ctx, &hflags, sizeof(hflags));
       uint32_t depth = MIN2(create_info->maxPipelineRayRecursionDepth, 1);
       _mesa_blake3_update(&ctx, &depth, sizeof(depth));
-      for (uint32_t g = 0; g < pipeline->group_count; g++) {
+      static const bool key_sort = debug_get_bool_option("TU_RT_KEY_SORT", false) && tu_rt_use_case_tree();
+      uint32_t *key_order = (uint32_t *) malloc(MAX2(pipeline->group_count, 1) * sizeof(uint32_t));
+      if (!key_order) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail;
+      }
+      for (uint32_t g = 0; g < pipeline->group_count; g++)
+         key_order[g] = g;
+      if (key_sort)
+         qsort_r(key_order, pipeline->group_count, sizeof(uint32_t), tu_rt_group_key_cmp, pipeline);
+      if (tu_keylog_enabled()) {
+         uint32_t hsum = 0;
+         for (uint32_t g = 0; g < pipeline->group_count; g++)
+            hsum = hsum * 31u + pipeline->groups[g].handle;
+         char line[1024];
+         unsigned len = 0;
+         for (uint32_t g = 0; g < pipeline->group_count && len + 12 < sizeof(line); g++)
+            len += snprintf(line + len, sizeof(line) - len, "%08x ", pipeline->groups[g].handle);
+         mesa_logi("tu-key:  groups api-order-sum=%08x sorted=%d first: %s", hsum, (int) key_sort, line);
+      }
+      for (uint32_t gi = 0; gi < pipeline->group_count; gi++) {
+         const uint32_t g = key_order[gi];
          const struct tu_rt_group *grp = pipeline->groups + g;
          _mesa_blake3_update(&ctx, &grp->handle, sizeof(grp->handle));
          uint32_t idx[3] = { grp->recursive_index, grp->ahit_index, grp->isec_index };
@@ -2001,7 +2106,23 @@ tu_rt_pipeline_create(struct tu_device *dev,
             }
          }
       }
+      free(key_order);
       _mesa_blake3_final(&ctx, blake3);
+
+      if (tu_keylog_enabled()) {
+         blake3_hash kh;
+         _mesa_blake3_compute(&key, sizeof(key), kh);
+         char hb[17], hl[17], hk[17], kb[2 * sizeof(key) + 1];
+         tu_keylog_hex(hb, blake3, 8);
+         if (layout)
+            tu_keylog_hex(hl, layout->blake3, 8);
+         else
+            strcpy(hl, "none");
+         tu_keylog_hex(hk, kh, 8);
+         tu_keylog_hex(kb, (const unsigned char *) &key, sizeof(key));
+         mesa_logi("tu-key:  final b3=%s layout=%s keyh=%s dbg=0x%x hflags=0x%llx depth=%u key=%s",
+                   hb, hl, hk, (unsigned) ir3_debug_key, (unsigned long long) hflags, depth, kb);
+      }
 
       uint32_t *rg_groups = rzalloc_array(pipeline->mem_ctx, uint32_t,
                                           MAX2(pipeline->group_count, 1));
