@@ -31,6 +31,7 @@
 #include "tu_device.h"
 #include "tu_shader.h"
 #include "tu_rt_prof.h"
+#include "tu_rt_pool.h"
 #include "ir3/ir3_nir.h"
 
 static VkResult
@@ -2189,6 +2190,9 @@ struct tu_rt_variant_job {
    std::atomic<int64_t> phase_ns[TU_RT_PH_COUNT];
    std::atomic<int64_t> cpu_ns[2];
    std::atomic<int64_t> first_idle;
+   std::atomic<uint32_t> late_hits;
+   const uint32_t *pool_map;
+   bool recheck_cache;
 };
 
 static int64_t
@@ -2210,11 +2214,76 @@ tu_rt_count_instrs(nir_shader *nir)
    return n;
 }
 
+static VkResult
+tu_rt_compile_variant(struct tu_rt_variant_job *job, uint32_t v, struct tu_shader **out)
+{
+   const bool timed = tu_rt_log_level() >= 1;
+   struct tu_rt_variant *var = job->pipeline->variants + v;
+   *out = NULL;
+   if (job->recheck_cache) {
+      *out = tu_compute_pipeline_cache_lookup(job->dev, job->cache,
+                                              job->hashes + v * BLAKE3_KEY_LEN);
+      if (*out) {
+         job->late_hits++;
+         return VK_SUCCESS;
+      }
+   }
+   struct tu_rt_times times = {};
+   int64_t t0 = 0, c0 = 0;
+   if (timed) {
+      c0 = tu_rt_thread_cpu_ns();
+      t0 = times.last = os_time_get_nano();
+      tu_rt_tls_times = &times;
+   }
+   nir_shader *nir = tu_rt_build_shader(job->dev, job->pipeline, job->create_info,
+                                        job->flags, (int) job->groups[v],
+                                        job->classes ? job->classes + v : NULL);
+   if (!nir) {
+      tu_rt_tls_times = NULL;
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   int64_t t1 = timed ? os_time_get_nano() : 0;
+   int64_t c1 = timed ? tu_rt_thread_cpu_ns() : 0;
+   uint32_t nir_instrs = timed ? tu_rt_count_instrs(nir) : 0;
+   if (timed)
+      times.last = os_time_get_nano();
+   struct tu_shader *shader = NULL;
+   VkResult r = tu_compute_shader_compile(job->dev, job->layout, job->cache, nir,
+                                          job->key, job->hashes + v * BLAKE3_KEY_LEN,
+                                          &shader);
+   tu_rt_times_mark(TU_RT_PH_TAIL);
+   tu_rt_tls_times = NULL;
+   if (r != VK_SUCCESS || !shader)
+      return r != VK_SUCCESS ? r : VK_ERROR_OUT_OF_HOST_MEMORY;
+   *out = shader;
+   if (timed) {
+      int64_t t2 = os_time_get_nano();
+      int64_t c2 = tu_rt_thread_cpu_ns();
+      job->cpu_ns[0] += c1 - c0;
+      job->cpu_ns[1] += c2 - c1;
+      char ph[256];
+      unsigned len = 0;
+      for (unsigned k = 0; k < TU_RT_PH_COUNT; k++) {
+         job->phase_ns[k] += times.ns[k];
+         len += snprintf(ph + len, sizeof(ph) - len, " %s=%.1f",
+                         tu_rt_phase_name((enum tu_rt_phase) k), times.ns[k] / 1e6);
+      }
+      struct mallinfo2 mi = mallinfo2();
+      mesa_logi("tu-rt: vtime pipe=%u v=%u/%u handle=%08x ms=%.1f build=%.1f compile=%.1f "
+                "cpu=%.1f/%.1f%s pred=%" PRIu64 " nir=%u instrs=%u heap=%zuM tid=%d",
+                job->pipeline->id, v, job->count, var->handle, (t2 - t0) / 1e6,
+                (t1 - t0) / 1e6, (t2 - t1) / 1e6, (c1 - c0) / 1e6, (c2 - c1) / 1e6,
+                ph, job->predicted ? job->predicted[v] : 0, nir_instrs,
+                shader->variant->info.instrs_count, (mi.uordblks + mi.hblkhd) >> 20,
+                (int) syscall(SYS_gettid));
+   }
+   return VK_SUCCESS;
+}
+
 static void *
 tu_rt_variant_worker(void *data)
 {
    struct tu_rt_variant_job *job = (struct tu_rt_variant_job *) data;
-   const bool timed = tu_rt_log_level() >= 1;
    for (;;) {
       uint32_t v = job->next.fetch_add(1);
       if (v >= job->count)
@@ -2224,63 +2293,25 @@ tu_rt_variant_worker(void *data)
       struct tu_rt_variant *var = job->pipeline->variants + v;
       if (var->shader)
          continue;
-      struct tu_rt_times times = {};
-      int64_t t0 = 0, c0 = 0;
-      if (timed) {
-         c0 = tu_rt_thread_cpu_ns();
-         t0 = times.last = os_time_get_nano();
-         tu_rt_tls_times = &times;
-      }
-      nir_shader *nir = tu_rt_build_shader(job->dev, job->pipeline, job->create_info,
-                                           job->flags, (int) job->groups[v],
-                                           job->classes ? job->classes + v : NULL);
-      if (!nir) {
-         tu_rt_tls_times = NULL;
-         job->result.store(VK_ERROR_OUT_OF_HOST_MEMORY);
-         continue;
-      }
-      int64_t t1 = timed ? os_time_get_nano() : 0;
-      int64_t c1 = timed ? tu_rt_thread_cpu_ns() : 0;
-      uint32_t nir_instrs = timed ? tu_rt_count_instrs(nir) : 0;
-      if (timed)
-         times.last = os_time_get_nano();
       struct tu_shader *shader = NULL;
-      VkResult r = tu_compute_shader_compile(job->dev, job->layout, job->cache, nir,
-                                             job->key, job->hashes + v * BLAKE3_KEY_LEN,
-                                             &shader);
-      tu_rt_times_mark(TU_RT_PH_TAIL);
-      tu_rt_tls_times = NULL;
+      VkResult r = tu_rt_compile_variant(job, v, &shader);
       if (r != VK_SUCCESS || !shader) {
          job->result.store(r != VK_SUCCESS ? r : VK_ERROR_OUT_OF_HOST_MEMORY);
          continue;
       }
       var->shader = shader;
-      if (timed) {
-         int64_t t2 = os_time_get_nano();
-         int64_t c2 = tu_rt_thread_cpu_ns();
-         job->cpu_ns[0] += c1 - c0;
-         job->cpu_ns[1] += c2 - c1;
-         char ph[256];
-         unsigned len = 0;
-         for (unsigned k = 0; k < TU_RT_PH_COUNT; k++) {
-            job->phase_ns[k] += times.ns[k];
-            len += snprintf(ph + len, sizeof(ph) - len, " %s=%.1f",
-                            tu_rt_phase_name((enum tu_rt_phase) k), times.ns[k] / 1e6);
-         }
-         struct mallinfo2 mi = mallinfo2();
-         mesa_logi("tu-rt: vtime pipe=%u v=%u/%u handle=%08x ms=%.1f build=%.1f compile=%.1f "
-                   "cpu=%.1f/%.1f%s pred=%" PRIu64 " nir=%u instrs=%u heap=%zuM tid=%d",
-                   job->pipeline->id, v, job->count, var->handle, (t2 - t0) / 1e6,
-                   (t1 - t0) / 1e6, (t2 - t1) / 1e6, (c1 - c0) / 1e6, (c2 - c1) / 1e6,
-                   ph, job->predicted ? job->predicted[v] : 0, nir_instrs,
-                   shader->variant->info.instrs_count, (mi.uordblks + mi.hblkhd) >> 20,
-                   (int) syscall(SYS_gettid));
-      }
    }
    int64_t idle = os_time_get_nano(), cur = job->first_idle.load();
    while ((!cur || idle < cur) && !job->first_idle.compare_exchange_weak(cur, idle))
       ;
    return NULL;
+}
+
+static VkResult
+tu_rt_pool_run_variant(struct tu_rt_batch *batch, uint32_t index, struct tu_shader **out)
+{
+   struct tu_rt_variant_job *job = (struct tu_rt_variant_job *) batch->data;
+   return tu_rt_compile_variant(job, job->pool_map[index], out);
 }
 
 static bool
@@ -2557,9 +2588,13 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       job.order = NULL;
       job.predicted = NULL;
       job.classes = classes;
+      job.late_hits.store(0);
+      job.pool_map = NULL;
+      job.recheck_cache = false;
+      const bool use_pool = tu_rt_pool_enabled();
       uint32_t *order = NULL;
       uint64_t *predicted = NULL;
-      if (tu_rt_largest_first() || tu_rt_log_level() >= 1) {
+      if (use_pool || tu_rt_largest_first() || tu_rt_log_level() >= 1) {
          struct tu_rt_stage_sum *sums = pipeline->stage_sums;
          if (!sums) {
             sums = rzalloc_array(nir_ctx, struct tu_rt_stage_sum,
@@ -2593,23 +2628,71 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       if (tu_rt_log_level() >= 1)
          tu_rt_times_install_hook();
 
-      static const unsigned max_jobs = debug_get_num_option("TU_RT_JOBS", 4);
-      unsigned nthreads = MIN2(MAX2(max_jobs, 1u), missing);
-      pthread_t threads[16];
       unsigned started = 0;
-      for (unsigned t = 1; t < MIN2(nthreads, 16u); t++) {
-         pthread_attr_t attr;
-         pthread_attr_init(&attr);
-         pthread_attr_setstacksize(&attr, 256u << 20);
-         if (pthread_create(&threads[started], &attr, tu_rt_variant_worker, &job) == 0)
-            started++;
-         pthread_attr_destroy(&attr);
+      struct tu_rt_batch batch = {};
+      if (use_pool) {
+         const bool can_cache =
+            !(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+         uint32_t *pool_map = rzalloc_array(nir_ctx, uint32_t, missing);
+         struct tu_rt_task *tasks = rzalloc_array(nir_ctx, struct tu_rt_task, missing);
+         uint32_t n = 0;
+         for (uint32_t v = 0; v < count; v++) {
+            if (pipeline->variants[v].shader)
+               continue;
+            pool_map[n] = v;
+            tasks[n].key = can_cache ? hashes + v * BLAKE3_KEY_LEN : NULL;
+            tasks[n].cost = predicted ? predicted[v] : 0;
+            n++;
+         }
+         job.pool_map = pool_map;
+         job.recheck_cache = can_cache;
+         batch.run = tu_rt_pool_run_variant;
+         batch.data = &job;
+         batch.cache = cache ? cache : dev->mem_cache;
+         batch.count = n;
+         batch.tasks = tasks;
+         tu_rt_pool_run(dev, &batch);
+         for (uint32_t i = 0; i < n; i++) {
+            if (tasks[i].result != VK_SUCCESS || !tasks[i].shader) {
+               job.result.store(tasks[i].result != VK_SUCCESS ? tasks[i].result
+                                                              : VK_ERROR_OUT_OF_HOST_MEMORY);
+               if (tasks[i].shader)
+                  vk_pipeline_cache_object_unref(&dev->vk, &tasks[i].shader->base);
+               continue;
+            }
+            pipeline->variants[pool_map[i]].shader = tasks[i].shader;
+         }
+         pipeline->compiled = missing - batch.deduped - job.late_hits.load();
+      } else {
+         static const unsigned max_jobs = debug_get_num_option("TU_RT_JOBS", 4);
+         unsigned nthreads = MIN2(MAX2(max_jobs, 1u), missing);
+         pthread_t threads[16];
+         for (unsigned t = 1; t < MIN2(nthreads, 16u); t++) {
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 256u << 20);
+            if (pthread_create(&threads[started], &attr, tu_rt_variant_worker, &job) == 0)
+               started++;
+            pthread_attr_destroy(&attr);
+         }
+         tu_rt_variant_worker(&job);
+         for (unsigned t = 0; t < started; t++)
+            pthread_join(threads[t], NULL);
       }
-      tu_rt_variant_worker(&job);
-      for (unsigned t = 0; t < started; t++)
-         pthread_join(threads[t], NULL);
 
-      if (tu_rt_log_level() >= 1) {
+      if (use_pool && tu_rt_log_level() >= 1) {
+         int64_t t_end = os_time_get_nano();
+         char ph[256];
+         unsigned len = 0;
+         for (unsigned k = 0; k < TU_RT_PH_COUNT; k++)
+            len += snprintf(ph + len, sizeof(ph) - len, " %s=%.2f",
+                            tu_rt_phase_name((enum tu_rt_phase) k), job.phase_ns[k].load() / 1e9);
+         mesa_logi("tu-rt: vtime-sum pipe=%u compiled=%u pool deduped=%u helped=%u late_hits=%u "
+                   "wait=%.1fms wall=%.1fms cpu=%.2f/%.2fs thread-s:%s",
+                   pipeline->id, missing, batch.deduped, batch.helped, job.late_hits.load(),
+                   batch.wait_ns / 1e6, (t_end - t_pool) / 1e6,
+                   job.cpu_ns[0].load() / 1e9, job.cpu_ns[1].load() / 1e9, ph);
+      } else if (tu_rt_log_level() >= 1) {
          int64_t t_end = os_time_get_nano();
          char ph[256];
          unsigned len = 0;
@@ -2629,7 +2712,8 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          return (VkResult) job.result.load();
    }
 
-   pipeline->compiled = missing;
+   if (!tu_rt_pool_enabled() || !missing)
+      pipeline->compiled = missing;
    if (tu_rt_log_level() >= 1) {
       uint64_t instrs = 0;
       unsigned max_regs = 0;
@@ -2637,8 +2721,8 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          instrs += pipeline->variants[v].shader->variant->info.instrs_count;
          max_regs = MAX2(max_regs, pipeline->variants[v].shader->variant->info.max_reg + 1u);
       }
-      mesa_logi("tu-rt: %u raygen variants (%u compiled) total instrs=%" PRIu64 " max regs=%u ca=%u",
-                count, missing, instrs, max_regs, pipeline->ca_variants);
+      mesa_logi("tu-rt: %u raygen variants (%u compiled) total instrs=%" PRIu64 " max regs=%u ca=%u missed=%u",
+                count, pipeline->compiled, instrs, max_regs, pipeline->ca_variants, missing);
    }
    return VK_SUCCESS;
 }

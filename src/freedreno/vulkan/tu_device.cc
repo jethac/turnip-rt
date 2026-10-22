@@ -8,6 +8,7 @@
  */
 
 #include "tu_device.h"
+#include "tu_rt_pool.h"
 
 #include "drm-uapi/drm_fourcc.h"
 #include "git_sha1.h"
@@ -3412,6 +3413,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (!device)
       return;
+
+   tu_rt_pool_finish(device);
 
    tu_memory_trace_finish(device);
 

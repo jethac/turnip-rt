@@ -325,6 +325,7 @@ struct tu_device
 
    /* Backup in-memory cache to be used if the app doesn't provide one */
    struct vk_pipeline_cache *mem_cache;
+   struct tu_rt_pool *rt_pool;
 
    struct vk_meta_device meta;
 

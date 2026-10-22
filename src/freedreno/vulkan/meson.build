@@ -66,6 +66,7 @@ libtu_files = files(
   'tu_tile_config.cc',
   'tu_foveate.cc',
   'tu_rt_prof.cc',
+  'tu_rt_pool.cc',
   'tu_util.cc',
 )
 
