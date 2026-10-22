@@ -811,6 +811,20 @@ tu_rt_use_case_tree(void)
    return enabled;
 }
 
+static uint64_t
+tu_rt_hit_budget(void)
+{
+   static const uint64_t budget = debug_get_num_option("TU_RT_HIT_BUDGET", 250000);
+   return budget;
+}
+
+static uint64_t
+tu_rt_max_preinline(void)
+{
+   static const uint64_t max_instrs = debug_get_num_option("TU_RT_MAX_PREINLINE", 400000);
+   return max_instrs;
+}
+
 template <typename F>
 static void
 tu_rt_emit_case_chain(nir_builder *b, nir_def *handle, const struct tu_rt_case *cases,
@@ -1622,8 +1636,7 @@ tu_rt_build_shader(struct tu_device *dev,
             nir_foreach_block (block, impl)
                nir_foreach_instr (instr, block)
                   total++;
-      static const uint64_t budget =
-         debug_get_num_option("TU_RT_HIT_BUDGET", 250000);
+      const uint64_t budget = tu_rt_hit_budget();
       if (total > budget || debug_get_bool_option("TU_RT_LOG", false)) {
          uint64_t by_stage[32] = {};
          unsigned n_by_stage[32] = {};
@@ -1737,8 +1750,7 @@ tu_rt_build_shader(struct tu_device *dev,
          nir_foreach_block (block, impl)
             nir_foreach_instr (instr, block)
                instrs++;
-      static const uint64_t max_instrs =
-         debug_get_num_option("TU_RT_MAX_PREINLINE", 400000);
+      const uint64_t max_instrs = tu_rt_max_preinline();
       if (instrs > max_instrs) {
          mesa_loge("tu-rt: pipeline too large to inline (%" PRIu64 " > %" PRIu64
                    " instrs, %u stages, %u groups)", instrs, max_instrs,
@@ -2071,7 +2083,14 @@ tu_rt_pipeline_create(struct tu_device *dev,
       _mesa_blake3_update(&ctx, &hflags, sizeof(hflags));
       uint32_t depth = MIN2(create_info->maxPipelineRayRecursionDepth, 1);
       _mesa_blake3_update(&ctx, &depth, sizeof(depth));
-      static const bool key_sort = debug_get_bool_option("TU_RT_KEY_SORT", false) && tu_rt_use_case_tree();
+      const uint64_t knobs[] = {
+         tu_rt_hit_budget(),
+         tu_rt_max_preinline(),
+         tu_rt_use_case_tree(),
+         TU_RT_MAX_CALL_DEPTH,
+      };
+      _mesa_blake3_update(&ctx, knobs, sizeof(knobs));
+      static const bool key_sort = debug_get_bool_option("TU_RT_KEY_SORT", true) && tu_rt_use_case_tree();
       uint32_t *key_order = (uint32_t *) malloc(MAX2(pipeline->group_count, 1) * sizeof(uint32_t));
       if (!key_order) {
          result = VK_ERROR_OUT_OF_HOST_MEMORY;
