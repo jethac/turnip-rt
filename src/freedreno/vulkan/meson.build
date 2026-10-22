@@ -46,6 +46,7 @@ libtu_files = files(
   'tu_dynamic_rendering.cc',
   'tu_event.cc',
   'tu_formats.cc',
+  'tu_free_log.cc',
   'tu_image.cc',
   'tu_knl.cc',
   'tu_lrz.cc',

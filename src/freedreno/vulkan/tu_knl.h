@@ -78,6 +78,9 @@ struct tu_bo {
     * inode to provide a consistent ID across imports.
     */
    uint64_t unique_id;
+
+   const char *free_log_name;
+   uint32_t free_log_flags;
 };
 
 enum tu_sparse_vma_flags {

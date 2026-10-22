@@ -34,6 +34,7 @@
 #include "tu_buffer.h"
 #include "tu_cmd_buffer.h"
 #include "tu_device.h"
+#include "tu_free_log.h"
 
 static const uint32_t encode_spv[] = {
 #include "bvh/encode.spv.h"
@@ -1319,6 +1320,25 @@ as_finished(struct tu_device *dev, struct vk_acceleration_structure *as)
    return hdr->self_ptr == vk_buffer_address(&buf->vk, as->offset);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL
+tu_CreateAccelerationStructureKHR(VkDevice _device,
+                                  const VkAccelerationStructureCreateInfoKHR *pCreateInfo,
+                                  const VkAllocationCallbacks *pAllocator,
+                                  VkAccelerationStructureKHR *pAccelerationStructure)
+{
+   VkResult result =
+      vk_common_CreateAccelerationStructureKHR(_device, pCreateInfo, pAllocator,
+                                               pAccelerationStructure);
+
+   if (unlikely(tu_free_log_on) && result == VK_SUCCESS) {
+      VK_FROM_HANDLE(vk_acceleration_structure, as, *pAccelerationStructure);
+      tu_free_log_create_as(as, vk_acceleration_structure_get_va(as), as->size,
+                            pCreateInfo->type);
+   }
+
+   return result;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 tu_DestroyAccelerationStructureKHR(VkDevice _device,
                                    VkAccelerationStructureKHR accelerationStructure,
@@ -1329,6 +1349,11 @@ tu_DestroyAccelerationStructureKHR(VkDevice _device,
       VK_FROM_HANDLE(vk_acceleration_structure, as, accelerationStructure);
       if (as_finished(device, as))
          dump_as(as);
+   }
+
+   if (unlikely(tu_free_log_on) && accelerationStructure) {
+      VK_FROM_HANDLE(vk_acceleration_structure, as, accelerationStructure);
+      tu_free_log_destroy_as(as, as->addr, as->size);
    }
 
    vk_common_DestroyAccelerationStructureKHR(_device, accelerationStructure,
