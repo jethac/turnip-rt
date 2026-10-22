@@ -666,6 +666,7 @@ struct ir3_shader_options {
    uint8_t target_full_regs;
 
    bool rt_part;
+   bool rt_scalar_pvtmem;
    const struct ir3_rt_blobs *rt_blobs;
 };
 

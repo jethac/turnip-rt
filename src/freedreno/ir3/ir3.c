@@ -40,6 +40,7 @@ ir3_create(struct ir3_compiler *compiler, struct ir3_shader_variant *v)
    shader->type = v->type;
    shader->lin_ctx = linear_context(shader);
    shader->rt_blobs = v->shader_options.rt_blobs;
+   shader->scalar_pvtmem = v->shader_options.rt_scalar_pvtmem;
 
    list_inithead(&shader->block_list);
    list_inithead(&shader->array_list);

@@ -697,6 +697,7 @@ struct ir3 {
    unsigned instr_count;
 
    const struct ir3_rt_blobs *rt_blobs;
+   bool scalar_pvtmem;
 };
 
 struct ir3_array {

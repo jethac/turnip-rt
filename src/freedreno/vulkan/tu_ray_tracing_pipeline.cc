@@ -2247,6 +2247,7 @@ tu_rt_hash_abi(struct mesa_blake3 *h)
       TU_RT_FRAME_PAYLOAD, TU_RT_PAYLOAD_MAX, TU_RT_FRAME_STACK,
       TU_RT_STACK_MAX, TU_RT_FRAME_CALLEE, TU_RT_FRAME_WHOLE,
       (uint32_t) tu_rt_use_case_tree(),
+      (uint32_t) debug_get_bool_option("TU_RT_LINK_PERWAVE", false),
    };
    _mesa_blake3_update(h, abi, sizeof(abi));
 }

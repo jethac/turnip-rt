@@ -4017,6 +4017,7 @@ tu_shader_create(struct tu_device *dev,
       .nir_options = nir_options,
       .no_early_preamble = shader->push_ubo_speculated,
       .rt_part = rt && rt->part,
+      .rt_scalar_pvtmem = rt && debug_get_bool_option("TU_RT_LINK_PERWAVE", false),
       .rt_blobs = rt ? rt->blobs : NULL,
    };
 

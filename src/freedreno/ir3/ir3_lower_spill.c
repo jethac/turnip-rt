@@ -97,11 +97,12 @@ static void
 split_spill(struct ir3_instruction *spill)
 {
    unsigned orig_components = spill->srcs[2]->uim_val;
+   unsigned chunk = spill->block->shader->scalar_pvtmem ? 1 : 4;
 
    /* We don't handle splitting dependencies. */
    assert(spill->deps_count == 0);
 
-   if (orig_components <= 4) {
+   if (orig_components <= chunk) {
       if (spill->srcs[1]->flags & IR3_REG_ARRAY) {
          spill->srcs[1]->wrmask = MASK(orig_components);
          spill->srcs[1]->num = spill->srcs[1]->array.base;
@@ -110,8 +111,8 @@ split_spill(struct ir3_instruction *spill)
       return;
    }
 
-   for (unsigned comp = 0; comp < orig_components; comp += 4) {
-      unsigned components = MIN2(orig_components - comp, 4);
+   for (unsigned comp = 0; comp < orig_components; comp += chunk) {
+      unsigned components = MIN2(orig_components - comp, chunk);
       struct ir3_instruction *clone = ir3_instr_clone(spill);
       ir3_instr_move_before(clone, spill);
 
@@ -134,10 +135,11 @@ static void
 split_reload(struct ir3_instruction *reload)
 {
    unsigned orig_components = reload->srcs[2]->uim_val;
+   unsigned chunk = reload->block->shader->scalar_pvtmem ? 1 : 4;
 
    assert(reload->deps_count == 0);
 
-   if (orig_components <= 4) {
+   if (orig_components <= chunk) {
       if (reload->dsts[0]->flags & IR3_REG_ARRAY) {
          reload->dsts[0]->wrmask = MASK(orig_components);
          reload->dsts[0]->num = reload->dsts[0]->array.base;
@@ -146,8 +148,8 @@ split_reload(struct ir3_instruction *reload)
       return;
    }
 
-   for (unsigned comp = 0; comp < orig_components; comp += 4) {
-      unsigned components = MIN2(orig_components - comp, 4);
+   for (unsigned comp = 0; comp < orig_components; comp += chunk) {
+      unsigned components = MIN2(orig_components - comp, chunk);
       struct ir3_instruction *clone = ir3_instr_clone(reload);
       ir3_instr_move_before(clone, reload);
 

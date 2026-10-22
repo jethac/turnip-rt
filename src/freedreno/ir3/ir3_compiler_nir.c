@@ -1579,6 +1579,21 @@ emit_intrinsic_load_scratch(struct ir3_context *ctx, nir_intrinsic_instr *intr,
 
    stp_ldp_offset(ctx, &intr->src[0], &offset, &base);
 
+   unsigned bytes = intr->def.bit_size / 8;
+   if (ctx->ir->scalar_pvtmem && intr->num_components > 1 &&
+       base + (int32_t) (intr->num_components * bytes) < (1 << 12)) {
+      for (unsigned c = 0; c < intr->num_components; c++) {
+         ldp = ir3_LDP(b, offset, 0, create_immed(b, base + c * bytes), 0,
+                       create_immed(b, 1), 0);
+         ldp->cat6.type = utype_def(&intr->def);
+         ldp->dsts[0]->wrmask = 0x1;
+         ldp->barrier_class = IR3_BARRIER_PRIVATE_R;
+         ldp->barrier_conflict = IR3_BARRIER_PRIVATE_W;
+         dst[c] = ldp;
+      }
+      return;
+   }
+
    ldp = ir3_LDP(b, offset, 0, create_immed(b, base), 0,
                  create_immed(b, intr->num_components), 0);
 
@@ -1609,6 +1624,20 @@ emit_intrinsic_store_scratch(struct ir3_context *ctx, nir_intrinsic_instr *intr)
    ncomp = ffs(~wrmask) - 1;
 
    assert(wrmask == BITFIELD_MASK(intr->num_components));
+
+   unsigned bytes = intr->src[0].ssa->bit_size / 8;
+   if (ctx->ir->scalar_pvtmem && ncomp > 1 &&
+       base + (int32_t) (ncomp * bytes) < (1 << 12)) {
+      for (unsigned c = 0; c < ncomp; c++) {
+         stp = ir3_STP(b, offset, 0, value[c], 0, create_immed(b, 1), 0);
+         stp->cat6.dst_offset = base + c * bytes;
+         stp->cat6.type = utype_src(intr->src[0]);
+         stp->barrier_class = IR3_BARRIER_PRIVATE_W;
+         stp->barrier_conflict = IR3_BARRIER_PRIVATE_R | IR3_BARRIER_PRIVATE_W;
+         array_insert(ctx->block, ctx->block->keeps, stp);
+      }
+      return;
+   }
 
    stp = ir3_STP(b, offset, 0, ir3_create_collect(b, value, ncomp), 0,
                  create_immed(b, ncomp), 0);
