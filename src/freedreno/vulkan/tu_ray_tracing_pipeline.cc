@@ -637,6 +637,7 @@ enum {
    TU_RT_FRAME_SEL = 0,
    TU_RT_FRAME_RET = 4,
    TU_RT_FRAME_LAUNCH_ID = 8,
+   TU_RT_FRAME_RGIDX = 20,
    TU_RT_FRAME_CMD = 24,
    TU_RT_FRAME_ACCEL = 32,
    TU_RT_FRAME_FLAGS = 40,
@@ -679,6 +680,12 @@ static inline unsigned
 tu_rt_class_size(uint32_t cls)
 {
    return cls & 0xffff;
+}
+
+static void
+tu_rt_emit_blob(nir_builder *b, uint32_t idx)
+{
+   nir_rt_blob_ir3(b, .base = idx);
 }
 
 static nir_def *
@@ -2230,7 +2237,7 @@ tu_rt_log_enabled(void)
    return on;
 }
 
-static const char tu_rt_abi_tag[] = "tu-rt-abi-2";
+static const char tu_rt_abi_tag[] = "tu-rt-abi-4";
 
 static void
 tu_rt_hash_abi(struct mesa_blake3 *h)
@@ -2920,8 +2927,40 @@ tu_rt_build_raygen_parts(const struct tu_rt_part_env *env, nir_shader *stage,
       ralloc_free(shaders[i]);
    free(shaders);
 
+   struct tu_rt_part_bin cbin = {};
+   uint64_t *cwords = NULL;
    if (!fail) {
-      *out = tu_rt_partset_from_bins(dev, pkey, TU_RT_PART_RAYGEN, nparts, bins, words);
+      struct ir3_rt_blob *blobs =
+         (struct ir3_rt_blob *) calloc(nparts, sizeof(struct ir3_rt_blob));
+      const struct tu_rt_part_bin **pbins =
+         (const struct tu_rt_part_bin **) calloc(nparts, sizeof(void *));
+      struct tu_rt_case *cases =
+         (struct tu_rt_case *) calloc(nparts, sizeof(struct tu_rt_case));
+      for (uint32_t j = 0; j < nparts; j++) {
+         bins[j].instrs = words[j];
+         blobs[j] = (struct ir3_rt_blob) { words[j], bins[j].count };
+         pbins[j] = &bins[j];
+         cases[j] = (struct tu_rt_case) { TU_RT_SEL_RG(j), j };
+      }
+      nir_builder _cb = tu_rt_part_builder(dev, "tu rt raygen dispatch");
+      nir_builder *cb = &_cb;
+      nir_def *sel = tu_rt_fload(cb, TU_RT_FRAME_SEL, 1);
+      tu_rt_fstore(cb, TU_RT_FRAME_SEL, nir_imm_int(cb, TU_RT_SEL_DONE));
+      tu_rt_emit_cases(cb, sel, cases, nparts, [&](const struct tu_rt_case &cs) {
+         tu_rt_emit_blob(cb, cs.group);
+      });
+      nir_shader_gather_info(cb->shader, nir_shader_get_entrypoint(cb->shader));
+      struct ir3_rt_blobs bl = { nparts, blobs };
+      struct tu_rt_link_merge merge = { pbins, nparts, NULL };
+      fail = tu_rt_part_compile(dev, env->layout, env->key, cb->shader, TU_RT_FRAME_CALLEE,
+                                &cbin, &cwords, &sets, &bl, &merge);
+      free(blobs);
+      free(pbins);
+      free(cases);
+   }
+
+   if (!fail) {
+      *out = tu_rt_partset_from_bins(dev, pkey, TU_RT_PART_RAYGEN, 1, &cbin, &cwords);
       if (!*out) {
          fail = "oom";
       } else {
@@ -2929,8 +2968,10 @@ tu_rt_build_raygen_parts(const struct tu_rt_part_env *env, nir_shader *stage,
          memcpy((*out)->classes, classes, sizeof(classes));
          (*out)->scratch = scratch;
          (*out)->active_desc_sets = sets;
+         (*out)->payload_size = nparts;
       }
    }
+   free(cwords);
    for (uint32_t j = 0; j < nparts; j++)
       free(words[j]);
    free(words);
@@ -3192,11 +3233,6 @@ tu_rt_link_fixup(struct ir3_shader_variant *v, void *data)
    ir3_update_max_waves(v);
 }
 
-static void
-tu_rt_emit_blob(nir_builder *b, uint32_t idx)
-{
-   nir_rt_blob_ir3(b, .base = idx);
-}
 
 struct tu_rt_glue_class {
    uint32_t cls;
@@ -3205,9 +3241,9 @@ struct tu_rt_glue_class {
 };
 
 static nir_shader *
-tu_rt_build_glue(struct tu_device *dev, bool whole, uint32_t handle,
-                 uint32_t nrg, struct tu_rt_glue_class *classes,
-                 uint32_t nclasses)
+tu_rt_build_glue(struct tu_device *dev, bool whole, const uint32_t *handles,
+                 const uint32_t *first, uint32_t nraygens, uint32_t nrg,
+                 struct tu_rt_glue_class *classes, uint32_t nclasses)
 {
    nir_builder _b = tu_rt_part_builder(dev, "tu rt link");
    nir_builder *b = &_b;
@@ -3227,42 +3263,59 @@ tu_rt_build_glue(struct tu_device *dev, bool whole, uint32_t handle,
    } else {
       struct tu_rt_sbt_entry raygen = tu_rt_load_sbt_entry(
          b, NULL, offsetof(VkTraceRaysIndirectCommand2KHR, raygenShaderRecordAddress));
-      tu_rt_fstore(b, TU_RT_FRAME_SEL,
-                   nir_bcsel(b, nir_ieq_imm(b, raygen.value, handle),
-                             nir_imm_int(b, TU_RT_SEL_RG(0)),
-                             nir_imm_int(b, TU_RT_SEL_DONE)));
+      tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_DONE));
+      struct tu_rt_case *hcases =
+         (struct tu_rt_case *) calloc(MAX2(nraygens, 1), sizeof(struct tu_rt_case));
+      for (uint32_t i = 0; i < nraygens; i++)
+         hcases[i] = (struct tu_rt_case) { handles[i], i };
+      tu_rt_emit_cases(b, raygen.value, hcases, nraygens, [&](const struct tu_rt_case &cs) {
+         tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_RG(0)));
+         tu_rt_fstore(b, TU_RT_FRAME_RGIDX, nir_imm_int(b, cs.group));
+      });
+      free(hcases);
 
-      uint32_t ncases = nrg + 3 * nclasses;
-      (void) ncases;
+      struct tu_rt_case *rcases =
+         (struct tu_rt_case *) calloc(MAX2(nraygens, 1), sizeof(struct tu_rt_case));
+      for (uint32_t i = 0; i < nraygens; i++)
+         rcases[i] = (struct tu_rt_case) { i, first[i] };
       struct tu_rt_case *cases =
-         (struct tu_rt_case *) calloc(MAX2(ncases, 1), sizeof(struct tu_rt_case));
+         (struct tu_rt_case *) calloc(MAX2(2 * nclasses, 1), sizeof(struct tu_rt_case));
       uint32_t n = 0;
-      for (uint32_t i = 0; i < nrg; i++)
-         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_RG(i), i };
       for (uint32_t i = 0; i < nclasses; i++) {
-         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_TRAV(classes[i].cls), 0x10000 | i };
-         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_CHIT(classes[i].cls), 0x20000 | i };
+         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_TRAV(classes[i].cls), classes[i].trav_blob };
+         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_CHIT(classes[i].cls), classes[i].disp_blob };
       }
 
       nir_loop *loop = nir_push_loop(b);
       {
          nir_def *sel = tu_rt_fload(b, TU_RT_FRAME_SEL, 1);
          nir_break_if(b, nir_ieq_imm(b, sel, TU_RT_SEL_DONE));
-         tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_DONE));
-         sel = nir_bcsel(b, nir_ieq_imm(b, nir_ushr_imm(b, sel, 24), 3),
-                         nir_iand_imm(b, sel, 0x2ffffff), sel);
-         tu_rt_emit_cases(b, sel, cases, n, [&](const struct tu_rt_case &cs) {
-            uint32_t kind = cs.group >> 16, idx = cs.group & 0xffff;
-            if (kind == 0)
-               tu_rt_emit_blob(b, idx);
-            else if (kind == 1)
-               tu_rt_emit_blob(b, classes[idx].trav_blob);
-            else
-               tu_rt_emit_blob(b, classes[idx].disp_blob);
-         });
+         nir_def *kind = nir_ushr_imm(b, sel, 24);
+         nir_push_if(b, nir_ieq_imm(b, kind, 0));
+         {
+            if (nraygens == 1) {
+               tu_rt_emit_blob(b, first[0]);
+            } else {
+               nir_def *r = tu_rt_fload(b, TU_RT_FRAME_RGIDX, 1);
+               tu_rt_emit_cases(b, r, rcases, nraygens, [&](const struct tu_rt_case &cs) {
+                  tu_rt_emit_blob(b, cs.group);
+               });
+            }
+         }
+         nir_push_else(b, NULL);
+         {
+            tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_DONE));
+            sel = nir_bcsel(b, nir_ieq_imm(b, kind, 3),
+                            nir_iand_imm(b, sel, 0x2ffffff), sel);
+            tu_rt_emit_cases(b, sel, cases, n, [&](const struct tu_rt_case &cs) {
+               tu_rt_emit_blob(b, cs.group);
+            });
+         }
+         nir_pop_if(b, NULL);
       }
       nir_pop_loop(b, loop);
       free(cases);
+      free(rcases);
    }
    nir_pop_if(b, NULL);
 
@@ -3441,6 +3494,8 @@ struct tu_rt_link_ctx {
    const uint32_t *groups;
    const unsigned char *link_keys;
    bool whole;
+   bool single;
+   uint32_t nraygens;
 
    struct tu_rt_partset **rg_sets;
    uint32_t *rg_stage;
@@ -3483,7 +3538,7 @@ static void
 tu_rt_link_rg_job(void *data, uint32_t v)
 {
    struct tu_rt_link_ctx *lc = (struct tu_rt_link_ctx *) data;
-   if (lc->fail_count.load() || lc->pipeline->variants[v].shader)
+   if (lc->fail_count.load() || (!lc->single && lc->pipeline->variants[v].shader))
       return;
    uint32_t s = lc->rg_stage[v];
    unsigned char pkey[BLAKE3_KEY_LEN];
@@ -3748,7 +3803,8 @@ tu_rt_link_variant_job(void *data, uint32_t v)
    }
 
    int64_t tg0 = os_time_get_nano();
-   nir_shader *glue = tu_rt_build_glue(lc->env.dev, false, p->variants[v].handle,
+   uint32_t zero = 0;
+   nir_shader *glue = tu_rt_build_glue(lc->env.dev, false, &p->variants[v].handle, &zero, 1,
                                        rg->nparts, gc, rg->nclasses);
    lc->a_glue.fetch_add(os_time_get_nano() - tg0);
    struct ir3_rt_blobs bl = { nblobs, blobs };
@@ -3768,6 +3824,73 @@ tu_rt_link_variant_job(void *data, uint32_t v)
       return;
    }
    p->variants[v].shader = sh;
+}
+
+static void
+tu_rt_link_all_job(void *data, uint32_t unused)
+{
+   struct tu_rt_link_ctx *lc = (struct tu_rt_link_ctx *) data;
+   struct tu_ray_tracing_pipeline *p = lc->pipeline;
+   if (lc->fail_count.load() || p->variants[0].shader)
+      return;
+   int64_t t0 = os_time_get_nano();
+   const uint32_t nrg = lc->nraygens;
+   uint32_t total = 0;
+   for (uint32_t r = 0; r < nrg; r++)
+      total += lc->rg_sets[r]->nparts;
+   uint32_t cap = total + 2 * lc->nclasses;
+   struct ir3_rt_blob *blobs =
+      (struct ir3_rt_blob *) calloc(MAX2(cap, 1), sizeof(struct ir3_rt_blob));
+   const struct tu_rt_part_bin **bins =
+      (const struct tu_rt_part_bin **) calloc(MAX2(cap, 1), sizeof(void *));
+   uint32_t *handles = (uint32_t *) calloc(MAX2(nrg, 1), sizeof(uint32_t));
+   uint32_t *first = (uint32_t *) calloc(MAX2(nrg, 1), sizeof(uint32_t));
+   struct tu_rt_glue_class *gc = (struct tu_rt_glue_class *)
+      calloc(MAX2(lc->nclasses, 1), sizeof(struct tu_rt_glue_class));
+   uint32_t nblobs = 0, sets = 0;
+   for (uint32_t r = 0; r < nrg; r++) {
+      const struct tu_rt_partset *rg = lc->rg_sets[r];
+      handles[r] = p->groups[lc->groups[r]].handle;
+      first[r] = nblobs;
+      sets |= rg->active_desc_sets;
+      for (uint32_t i = 0; i < rg->nparts; i++) {
+         blobs[nblobs] = (struct ir3_rt_blob) { rg->parts[i].instrs, rg->parts[i].count };
+         bins[nblobs++] = &rg->parts[i];
+      }
+   }
+   for (uint32_t k = 0; k < lc->nclasses; k++) {
+      const struct tu_rt_partset *tr = lc->trav_sets[k];
+      gc[k].cls = lc->classes[k];
+      gc[k].trav_blob = nblobs;
+      blobs[nblobs] = (struct ir3_rt_blob) { tr->parts[0].instrs, tr->parts[0].count };
+      bins[nblobs++] = &tr->parts[0];
+      sets |= tr->active_desc_sets;
+      gc[k].disp_blob = nblobs;
+      blobs[nblobs] = (struct ir3_rt_blob) { lc->disp_bin[k].instrs, lc->disp_bin[k].count };
+      bins[nblobs++] = &lc->disp_bin[k];
+      sets |= lc->disp_sets[k];
+   }
+   int64_t tg0 = os_time_get_nano();
+   nir_shader *glue = tu_rt_build_glue(lc->env.dev, false, handles, first, nrg, total,
+                                       gc, lc->nclasses);
+   lc->a_glue.fetch_add(os_time_get_nano() - tg0);
+   struct ir3_rt_blobs bl = { nblobs, blobs };
+   struct tu_shader *sh = NULL;
+   const char *why = tu_rt_link_one(lc->env.dev, lc->env.layout, lc->env.key, glue, &bl,
+                                    bins, nblobs, sets, lc->link_keys, lc->cache, &sh);
+   free(blobs);
+   free(bins);
+   free(handles);
+   free(first);
+   free(gc);
+   int64_t dt = os_time_get_nano() - t0;
+   lc->a_link.fetch_add(dt);
+   lc->a_link_max.store(dt);
+   if (why) {
+      tu_rt_link_note_fail(lc, why);
+      return;
+   }
+   p->variants[0].shader = sh;
 }
 
 static void
@@ -3799,7 +3922,7 @@ tu_rt_link_whole_job(void *data, uint32_t v)
    struct ir3_rt_blob blob = { words, bin.count };
    struct ir3_rt_blobs bl = { 1, &blob };
    const struct tu_rt_part_bin *bins[1] = { &bin };
-   nir_shader *glue = tu_rt_build_glue(lc->env.dev, true, 0, 0, NULL, 0);
+   nir_shader *glue = tu_rt_build_glue(lc->env.dev, true, NULL, NULL, 0, 0, NULL, 0);
    struct tu_shader *sh = NULL;
    why = tu_rt_link_one(lc->env.dev, lc->env.layout, lc->env.key, glue, &bl, bins, 1,
                         sets, lc->link_keys + v * BLAKE3_KEY_LEN, lc->cache, &sh);
@@ -3828,19 +3951,25 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
 {
    int64_t t_start = os_time_get_nano();
    cache = cache ? cache : dev->mem_cache;
-   pipeline->variant_count = count;
-   pipeline->variants = rzalloc_array(pipeline->mem_ctx, struct tu_rt_variant, count);
+   const bool single = !whole && !debug_get_bool_option("TU_RT_LINK_PER_RAYGEN", false);
+   const uint32_t nvar = single ? 1 : count;
+   pipeline->variant_count = nvar;
+   pipeline->variants = rzalloc_array(pipeline->mem_ctx, struct tu_rt_variant, nvar);
    unsigned char *keys = rzalloc_array(pipeline->mem_ctx, unsigned char,
-                                       count * BLAKE3_KEY_LEN);
+                                       nvar * BLAKE3_KEY_LEN);
    uint32_t missing = 0;
-   for (uint32_t v = 0; v < count; v++) {
+   for (uint32_t v = 0; v < nvar; v++) {
       const struct tu_rt_group *g = pipeline->groups + groups[v];
       pipeline->variants[v].handle = g->handle;
       struct mesa_blake3 h;
       _mesa_blake3_init(&h);
       _mesa_blake3_update(&h, base_blake3, BLAKE3_KEY_LEN);
       static const char tag[] = "tu-rt-link-1";
-      _mesa_blake3_update(&h, tag, sizeof(tag));
+      static const char tag_all[] = "tu-rt-link-all-1";
+      if (single)
+         _mesa_blake3_update(&h, tag_all, sizeof(tag_all));
+      else
+         _mesa_blake3_update(&h, tag, sizeof(tag));
       uint64_t mode[3] = { whole ? 1u : 2u,
                            debug_get_num_option("TU_RT_HIT_BUDGET", 250000),
                            debug_get_num_option("TU_RT_MAX_PREINLINE", 400000) };
@@ -3888,6 +4017,8 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       lc->groups = groups;
       lc->link_keys = keys;
       lc->whole = whole;
+      lc->single = single;
+      lc->nraygens = count;
       lc->fail_count.store(0);
       lc->fail = NULL;
       simple_mtx_init(&lc->lock, mtx_plain);
@@ -3994,8 +4125,12 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          if (!lc->fail_count.load())
             tu_rt_par_run(lc->nclasses, tu_rt_link_dispatch_job, lc);
          t2 = os_time_get_nano();
-         if (!lc->fail_count.load())
-            tu_rt_par_run(count, tu_rt_link_variant_job, lc);
+         if (!lc->fail_count.load()) {
+            if (single)
+               tu_rt_par_run(1, tu_rt_link_all_job, lc);
+            else
+               tu_rt_par_run(count, tu_rt_link_variant_job, lc);
+         }
       }
       int64_t t3 = os_time_get_nano();
 
@@ -4047,7 +4182,7 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
 
       if (fail) {
          mesa_logw("tu-rt: link failed (%s), using inline path", fail);
-         for (uint32_t v = 0; v < count; v++) {
+         for (uint32_t v = 0; v < nvar; v++) {
             if (pipeline->variants[v].shader)
                vk_pipeline_cache_object_unref(&dev->vk, &pipeline->variants[v].shader->base);
             pipeline->variants[v].shader = NULL;
@@ -4060,13 +4195,13 @@ done:
    if (tu_rt_log_enabled()) {
       uint64_t instrs = 0;
       unsigned max_regs = 0;
-      for (uint32_t v = 0; v < count; v++) {
+      for (uint32_t v = 0; v < nvar; v++) {
          instrs += pipeline->variants[v].shader->variant->info.instrs_count;
          max_regs = MAX2(max_regs, pipeline->variants[v].shader->variant->info.max_reg + 1u);
       }
       mesa_logi("tu-rt: %u raygen variants (%u linked) total instrs=%" PRIu64
-                " max regs=%u %.1f ms",
-                count, missing, instrs, max_regs, (os_time_get_nano() - t_start) / 1e6);
+                " max regs=%u %.1f ms (%u raygens)",
+                nvar, missing, instrs, max_regs, (os_time_get_nano() - t_start) / 1e6, count);
    }
    return VK_SUCCESS;
 }
