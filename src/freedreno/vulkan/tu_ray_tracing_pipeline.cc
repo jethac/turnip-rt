@@ -2278,7 +2278,7 @@ tu_rt_log_enabled(void)
    return on;
 }
 
-static const char tu_rt_abi_tag[] = "tu-rt-abi-8";
+static const char tu_rt_abi_tag[] = "tu-rt-abi-9";
 
 static void
 tu_rt_hash_abi(struct mesa_blake3 *h)
@@ -2806,6 +2806,37 @@ tu_rt_scratch_end(nir_shader *nir)
 }
 
 static bool
+tu_rt_cmd_derived(nir_def *def, unsigned depth)
+{
+   if (!depth)
+      return false;
+   nir_instr *instr = nir_def_instr(def);
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+      return true;
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+         if (!tu_rt_cmd_derived(alu->src[i].src.ssa, depth - 1))
+            return false;
+      }
+      return true;
+   }
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_load_rt_cmd_addr_ir3)
+         return true;
+      if (intr->intrinsic == nir_intrinsic_load_global &&
+          (nir_intrinsic_access(intr) & ACCESS_NON_WRITEABLE))
+         return tu_rt_cmd_derived(intr->src[0].ssa, depth - 1);
+      return false;
+   }
+   default:
+      return false;
+   }
+}
+
+static bool
 tu_rt_should_remat(nir_instr *instr, void *data)
 {
    if (instr->type != nir_instr_type_intrinsic)
@@ -2816,7 +2847,9 @@ tu_rt_should_remat(nir_instr *instr, void *data)
       return true;
    case nir_intrinsic_load_global:
    case nir_intrinsic_load_global_constant:
-      return (nir_intrinsic_access(intr) & ACCESS_CAN_REORDER) != 0;
+      return (nir_intrinsic_access(intr) & ACCESS_CAN_REORDER) &&
+             (nir_intrinsic_access(intr) & ACCESS_NON_WRITEABLE) &&
+             tu_rt_cmd_derived(intr->src[0].ssa, 8);
    default:
       return false;
    }
