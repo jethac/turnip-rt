@@ -41,6 +41,7 @@ struct tu_rt_batch {
    struct tu_rt_task *tasks;
 
    uint32_t remaining;
+   uint32_t running;
    uint32_t deduped;
    uint32_t coalesced;
    uint32_t retargeted;

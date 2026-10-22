@@ -155,9 +155,32 @@ tu_rt_pool_may_start(struct tu_rt_pool *pool)
    return false;
 }
 
+static bool
+tu_rt_pool_fair(void)
+{
+   static const bool on = debug_get_bool_option("TU_RT_POOL_FAIR", false);
+   return on;
+}
+
+static struct tu_rt_task *
+tu_rt_pool_pop_fair_locked(struct tu_rt_pool *pool)
+{
+   struct tu_rt_task *best = NULL;
+   for (struct tu_rt_task *t : pool->heap) {
+      if (t->state != TU_RT_TASK_PENDING)
+         continue;
+      if (!best || t->batch->running < best->batch->running ||
+          (t->batch->running == best->batch->running && tu_rt_task_less(best, t)))
+         best = t;
+   }
+   return best;
+}
+
 static struct tu_rt_task *
 tu_rt_pool_pop_locked(struct tu_rt_pool *pool)
 {
+   if (tu_rt_pool_fair())
+      return tu_rt_pool_pop_fair_locked(pool);
    while (!pool->heap.empty()) {
       std::pop_heap(pool->heap.begin(), pool->heap.end(), tu_rt_task_less);
       struct tu_rt_task *t = pool->heap.back();
@@ -225,11 +248,13 @@ tu_rt_pool_execute(struct tu_device *dev, struct tu_rt_pool *pool,
 {
    t->state = TU_RT_TASK_RUNNING;
    pool->running++;
+   t->batch->running++;
    lk.unlock();
    struct tu_shader *shader = NULL;
    VkResult r = t->batch->run(t->batch, t->index, &shader);
    lk.lock();
    pool->running--;
+   t->batch->running--;
    t->shader = shader;
    t->result = r == VK_SUCCESS && !shader ? VK_ERROR_OUT_OF_HOST_MEMORY : r;
    tu_rt_pool_complete_locked(dev, pool, t);
@@ -446,6 +471,7 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
    std::unique_lock<std::mutex> lk(pool->lock);
 
    batch->remaining = batch->count;
+   batch->running = 0;
    batch->deduped = 0;
    batch->coalesced = 0;
    batch->retargeted = 0;
