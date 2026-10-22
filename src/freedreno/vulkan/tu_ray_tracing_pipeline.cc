@@ -2278,7 +2278,7 @@ tu_rt_log_enabled(void)
    return on;
 }
 
-static const char tu_rt_abi_tag[] = "tu-rt-abi-7";
+static const char tu_rt_abi_tag[] = "tu-rt-abi-8";
 
 static void
 tu_rt_hash_abi(struct mesa_blake3 *h)
@@ -2299,7 +2299,32 @@ struct tu_rt_link_merge {
    const struct tu_rt_part_bin **parts;
    uint32_t nparts;
    const char *fail;
+   bool final;
+   uint32_t const_offset[IR3_CONST_ALLOC_MAX];
+   uint32_t const_size[IR3_CONST_ALLOC_MAX];
 };
+
+static bool
+tu_rt_merge_const(struct tu_rt_link_merge *m, unsigned k, uint32_t off, uint32_t size)
+{
+   if (!size)
+      return true;
+   if (!m->const_size[k] && !m->final) {
+      m->const_offset[k] = off;
+      m->const_size[k] = size;
+      return true;
+   }
+   if (off != m->const_offset[k])
+      return false;
+   if (k != IR3_CONST_ALLOC_DRIVER_PARAMS)
+      return size == m->const_size[k];
+   if (size <= m->const_size[k])
+      return true;
+   if (m->final)
+      return false;
+   m->const_size[k] = size;
+   return true;
+}
 
 static const char *
 tu_rt_link_merge_fail(const struct tu_rt_link_merge *m)
@@ -2318,8 +2343,8 @@ struct tu_rt_part_bin {
    uint32_t constlen;
    uint32_t num_samp;
    uint32_t num_uavs;
-   uint32_t push_offset;
-   uint32_t push_size;
+   uint32_t const_offset[IR3_CONST_ALLOC_MAX];
+   uint32_t const_size[IR3_CONST_ALLOC_MAX];
    uint32_t instrs_count;
    uint32_t nops_count;
    uint32_t stp_count;
@@ -2612,8 +2637,12 @@ tu_rt_part_compile(struct tu_device *dev, struct tu_pipeline_layout *layout,
       out->constlen = v->constlen;
       out->num_samp = MAX2(v->num_samp, 0);
       out->num_uavs = v->num_uavs;
-      out->push_offset = cs->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS].offset_vec4;
-      out->push_size = cs->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS].size_vec4;
+      for (unsigned k = 0; k < IR3_CONST_ALLOC_MAX; k++) {
+         out->const_offset[k] = merge ? merge->const_offset[k]
+                                      : cs->allocs.consts[k].offset_vec4;
+         out->const_size[k] = merge ? merge->const_size[k]
+                                    : cs->allocs.consts[k].size_vec4;
+      }
       out->instrs_count = v->info.instrs_count;
       out->nops_count = v->info.nops_count;
       out->stp_count = v->info.stp_count;
@@ -3271,8 +3300,6 @@ tu_rt_link_fixup(struct ir3_shader_variant *v, void *data)
    struct tu_rt_link_merge *m = (struct tu_rt_link_merge *) data;
    const struct ir3_compiler *compiler = v->compiler;
    const struct ir3_const_state *cs = ir3_const_state(v);
-   const struct ir3_const_allocation *push =
-      &cs->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS];
 
    if (v->rt_blob_live_fail) {
       m->fail = "live across blob";
@@ -3283,15 +3310,22 @@ tu_rt_link_fixup(struct ir3_shader_variant *v, void *data)
       return;
    }
 
+   for (unsigned k = 0; k < IR3_CONST_ALLOC_MAX; k++) {
+      m->const_offset[k] = cs->allocs.consts[k].offset_vec4;
+      m->const_size[k] = cs->allocs.consts[k].size_vec4;
+   }
+
    int max_reg = v->info.max_reg, max_half_reg = v->info.max_half_reg;
    unsigned bs = 0, pvt = v->pvtmem_size, constlen = v->constlen;
    bool per_wave = v->pvtmem_per_wave;
    for (uint32_t i = 0; i < m->nparts; i++) {
       const struct tu_rt_part_bin *p = m->parts[i];
-      if (p->push_size && (p->push_offset != push->offset_vec4 ||
-                           p->push_size != push->size_vec4)) {
-         m->fail = "push const layout";
-         return;
+      for (unsigned k = 0; k < IR3_CONST_ALLOC_MAX; k++) {
+         if (!tu_rt_merge_const(m, k, p->const_offset[k], p->const_size[k])) {
+            m->fail = k == IR3_CONST_ALLOC_PUSH_CONSTS ? "push const layout"
+                                                       : "const layout";
+            return;
+         }
       }
       max_reg = MAX2(max_reg, p->max_reg);
       max_half_reg = MAX2(max_half_reg, p->max_half_reg);
@@ -3452,7 +3486,7 @@ tu_rt_link_one(struct tu_device *dev, struct tu_pipeline_layout *layout,
                uint32_t desc_sets, const unsigned char *link_key,
                struct vk_pipeline_cache *cache, struct tu_shader **out)
 {
-   struct tu_rt_link_merge merge = { parts, nparts, NULL };
+   struct tu_rt_link_merge merge = { parts, nparts, NULL, true };
    struct tu_rt_shader_opts opts = {};
    opts.blobs = blobs;
    opts.fixup = tu_rt_link_fixup;
