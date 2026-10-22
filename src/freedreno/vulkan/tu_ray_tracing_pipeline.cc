@@ -27,6 +27,7 @@
 #include "tu_shader.h"
 #include "tu_rt_prof.h"
 #include "ir3/ir3_nir.h"
+#include "bvh/tu_bvh_defines.h"
 
 static VkResult
 tu_rt_compile_stages(struct tu_device *dev,
@@ -35,6 +36,13 @@ tu_rt_compile_stages(struct tu_device *dev,
                      const VkRayTracingPipelineCreateInfoKHR *create_info,
                      VkPipelineCreateFlags2KHR flags,
                      const struct tu_shader_key *key);
+
+static void
+tu_rt_prebuild_parts(struct tu_device *dev, struct vk_pipeline_cache *cache,
+                     const VkRayTracingPipelineCreateInfoKHR *create_info,
+                     VkPipelineCreateFlags2KHR flags,
+                     const struct tu_shader_key *key,
+                     const unsigned char *stage_hash, nir_shader *nir);
 
 static void
 tu_keylog_hex(char *out, const unsigned char *p, unsigned n)
@@ -435,6 +443,10 @@ tu_rt_compile_stages(struct tu_device *dev,
             vk_pipeline_cache_add_nir(cache, nir_key, sizeof(nir_key), nir);
       }
 
+      if (!nir_ctx)
+         tu_rt_prebuild_parts(dev, cache, create_info, flags, key,
+                              pipeline->stage_hashes + i * BLAKE3_KEY_LEN, nir);
+
       if (set) {
          set->blobs[i] = tu_rt_blob_from_nir(nir);
          if (!set->blobs[i]) {
@@ -649,7 +661,7 @@ enum {
    TU_RT_FRAME_PAYLOAD = 288,
    TU_RT_PAYLOAD_MAX = 256,
    TU_RT_FRAME_STACK = TU_RT_FRAME_PAYLOAD + TU_RT_PAYLOAD_MAX,
-   TU_RT_STACK_MAX = 4096,
+   TU_RT_STACK_MAX = 1024,
    TU_RT_FRAME_CALLEE = TU_RT_FRAME_STACK + TU_RT_STACK_MAX,
    TU_RT_FRAME_WHOLE = 32,
 };
@@ -1356,6 +1368,17 @@ tu_rt_fload_vec(nir_builder *b, unsigned off, unsigned comps)
 }
 
 static void
+tu_rt_traversal_miss(nir_builder *b, struct tu_rt_compiler *c, nir_def *miss_index)
+{
+   struct tu_rt_sbt_entry miss = tu_rt_load_sbt_entry(
+      b, miss_index,
+      offsetof(VkTraceRaysIndirectCommand2KHR, missShaderBindingTableAddress));
+   tu_rt_fstore(b, TU_RT_FRAME_HANDLE, miss.value);
+   tu_rt_fstore_vec(b, TU_RT_FRAME_RECORD, nir_unpack_64_2x32(b, miss.shader_record_ptr));
+   tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_MISS(c->part_payload_size)));
+}
+
+static void
 tu_rt_traversal_tail(nir_builder *b, struct tu_rt_compiler *c, nir_def *rq,
                      nir_def *committed_type, nir_def *committed_hit_kind,
                      const struct tu_rt_ray *r)
@@ -1431,14 +1454,7 @@ tu_rt_traversal_tail(nir_builder *b, struct tu_rt_compiler *c, nir_def *rq,
       nir_pop_if(b, NULL);
    }
    nir_push_else(b, NULL);
-   {
-      struct tu_rt_sbt_entry miss = tu_rt_load_sbt_entry(
-         b, r->miss_index,
-         offsetof(VkTraceRaysIndirectCommand2KHR, missShaderBindingTableAddress));
-      tu_rt_fstore(b, TU_RT_FRAME_HANDLE, miss.value);
-      tu_rt_fstore_vec(b, TU_RT_FRAME_RECORD, nir_unpack_64_2x32(b, miss.shader_record_ptr));
-      tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_MISS(cls)));
-   }
+   tu_rt_traversal_miss(b, c, r->miss_index);
    nir_pop_if(b, NULL);
 }
 
@@ -2355,21 +2371,42 @@ tu_rt_partset_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
    return &ps->base;
 }
 
+static simple_mtx_t tu_rt_cache_mtx = SIMPLE_MTX_INITIALIZER;
+
 static struct tu_rt_partset *
-tu_rt_partset_lookup(struct vk_pipeline_cache *cache, const unsigned char *key)
+tu_rt_partset_lookup(struct tu_device *dev, struct vk_pipeline_cache *cache,
+                     const unsigned char *key)
 {
+   simple_mtx_lock(&tu_rt_cache_mtx);
    bool hit = false;
    struct vk_pipeline_cache_object *obj =
       vk_pipeline_cache_lookup_object(cache, key, BLAKE3_KEY_LEN,
                                       &tu_rt_partset_ops, &hit);
+   if (!obj && cache != dev->mem_cache)
+      obj = vk_pipeline_cache_lookup_object(dev->mem_cache, key, BLAKE3_KEY_LEN,
+                                            &tu_rt_partset_ops, &hit);
+   if (debug_get_bool_option("TU_RT_LINK_KEYDBG", false)) {
+      char hk[17];
+      tu_keylog_hex(hk, key, 8);
+      mesa_logi("tu-rt-keydbg: lookup %s cache=%p mem=%p -> %p", hk, (void *) cache,
+                (void *) dev->mem_cache, (void *) obj);
+   }
+   simple_mtx_unlock(&tu_rt_cache_mtx);
    return obj ? container_of(obj, struct tu_rt_partset, base) : NULL;
 }
 
 static struct tu_rt_partset *
-tu_rt_partset_insert(struct vk_pipeline_cache *cache, struct tu_rt_partset *ps)
+tu_rt_partset_insert(struct tu_device *dev, struct vk_pipeline_cache *cache,
+                     struct tu_rt_partset *ps)
 {
+   simple_mtx_lock(&tu_rt_cache_mtx);
    struct vk_pipeline_cache_object *obj =
       vk_pipeline_cache_add_object(cache, &ps->base);
+   if (cache != dev->mem_cache)
+      vk_pipeline_cache_object_unref(
+         &dev->vk, vk_pipeline_cache_add_object(dev->mem_cache,
+                                                vk_pipeline_cache_object_ref(obj)));
+   simple_mtx_unlock(&tu_rt_cache_mtx);
    return container_of(obj, struct tu_rt_partset, base);
 }
 
@@ -2640,10 +2677,19 @@ tu_rt_lower_rt_call(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *accel = intr->src[0].ssa;
-   if (accel->bit_size == 64 && accel->num_components == 1)
+   if (nir_src_is_intrinsic(intr->src[0]) &&
+       nir_def_as_intrinsic(accel)->intrinsic == nir_intrinsic_load_vulkan_descriptor) {
+      unsigned off = offsetof(struct tu_accel_struct_header, self_ptr);
+      accel = nir_load_uav_ir3(b, 2, 32, accel,
+                               nir_vec2(b, nir_imm_int(b, 0), nir_imm_int(b, off / 4)),
+                               .access = (gl_access_qualifier) (ACCESS_NON_WRITEABLE |
+                                                                ACCESS_CAN_REORDER),
+                               .align_mul = AS_RECORD_SIZE, .align_offset = off);
+   } else if (accel->bit_size == 64 && accel->num_components == 1) {
       accel = nir_unpack_64_2x32(b, accel);
-   else if (!(accel->bit_size == 32 && accel->num_components == 2))
+   } else {
       *fail = "accel struct form";
+   }
    if (accel->num_components == 2)
       tu_rt_fstore_vec(b, TU_RT_FRAME_ACCEL, accel);
    tu_rt_fstore(b, TU_RT_FRAME_FLAGS, intr->src[1].ssa);
@@ -2977,7 +3023,11 @@ tu_rt_build_traversal_part(const struct tu_rt_part_env *env,
    r.dir = tu_rt_fload_vec(b, TU_RT_FRAME_DIR, 3);
    r.tmax = tu_rt_fload(b, TU_RT_FRAME_TMAX, 1);
    r.payload = &nir_build_deref_var(b, w)->def;
+   nir_push_if(b, nir_ine_imm(b, r.accel, 0));
    tu_rt_trace_ray_emit(b, &c, &r);
+   nir_push_else(b, NULL);
+   tu_rt_traversal_miss(b, &c, nir_iand_imm(b, r.miss_index, 0xFFFF));
+   nir_pop_if(b, NULL);
 
    for (unsigned i = 0; i < DIV_ROUND_UP(d->cls, 4); i++)
       tu_rt_fstore(b, TU_RT_FRAME_PAYLOAD + 4 * i,
@@ -3209,8 +3259,10 @@ tu_rt_link_one(struct tu_device *dev, struct tu_pipeline_layout *layout,
       return merge.fail;
    }
    sh->active_desc_sets |= desc_sets;
+   simple_mtx_lock(&tu_rt_cache_mtx);
    *out = container_of(vk_pipeline_cache_add_object(cache, &sh->base),
                        struct tu_shader, base);
+   simple_mtx_unlock(&tu_rt_cache_mtx);
    return NULL;
 }
 
@@ -3265,6 +3317,15 @@ static void
 tu_rt_part_key(unsigned char *out, const char *tag, const unsigned char *stage_hash,
                const struct tu_shader_key *key, struct tu_pipeline_layout *layout)
 {
+   if (debug_get_bool_option("TU_RT_LINK_KEYDBG", false)) {
+      char hs[17], hl[17], hk[17];
+      blake3_hash kh;
+      _mesa_blake3_compute(key, sizeof(*key), kh);
+      tu_keylog_hex(hs, stage_hash, 8);
+      tu_keylog_hex(hl, layout ? layout->blake3 : (const unsigned char *) "\0\0\0\0\0\0\0\0", 8);
+      tu_keylog_hex(hk, kh, 8);
+      mesa_logi("tu-rt-keydbg: %s stage=%s layout=%s key=%s", tag, hs, hl, hk);
+   }
    struct mesa_blake3 h;
    _mesa_blake3_init(&h);
    _mesa_blake3_update(&h, tag, strlen(tag) + 1);
@@ -3332,7 +3393,7 @@ tu_rt_link_rg_job(void *data, uint32_t v)
    unsigned char pkey[BLAKE3_KEY_LEN];
    tu_rt_part_key(pkey, "tu-rt-part-rg-1", lc->pipeline->stage_hashes + s * BLAKE3_KEY_LEN,
                   lc->env.key, lc->env.layout);
-   struct tu_rt_partset *ps = tu_rt_partset_lookup(lc->cache, pkey);
+   struct tu_rt_partset *ps = tu_rt_partset_lookup(lc->env.dev, lc->cache, pkey);
    if (!ps) {
       int64_t t0 = os_time_get_nano();
       int64_t probe[6] = {};
@@ -3344,7 +3405,7 @@ tu_rt_link_rg_job(void *data, uint32_t v)
          tu_rt_link_note_fail(lc, why);
          return;
       }
-      ps = tu_rt_partset_insert(lc->cache, ps);
+      ps = tu_rt_partset_insert(lc->env.dev, lc->cache, ps);
       lc->n_rg_built.fetch_add(1);
       for (unsigned i = 0; i < 6; i++)
          lc->probe_acc[i].fetch_add(probe[i]);
@@ -3430,7 +3491,7 @@ tu_rt_link_callee_job(void *data, uint32_t i)
       free(cases);
       _mesa_blake3_final(&h, pkey);
 
-      struct tu_rt_partset *ps = tu_rt_partset_lookup(lc->cache, pkey);
+      struct tu_rt_partset *ps = tu_rt_partset_lookup(lc->env.dev, lc->cache, pkey);
       if (!ps) {
          int64_t t0 = os_time_get_nano();
          const char *why = tu_rt_build_traversal_part(&lc->env, p, d, pkey, &ps);
@@ -3440,7 +3501,7 @@ tu_rt_link_callee_job(void *data, uint32_t i)
             tu_rt_link_note_fail(lc, why);
             return;
          }
-         ps = tu_rt_partset_insert(lc->cache, ps);
+         ps = tu_rt_partset_insert(lc->env.dev, lc->cache, ps);
          lc->n_trav_built.fetch_add(1);
          if (tu_rt_log_enabled())
             mesa_logi("tu-rt-probe: traversal class=%u ahit=%d isec=%d used=0x%x ir3=%u regs=%u "
@@ -3457,7 +3518,7 @@ tu_rt_link_callee_job(void *data, uint32_t i)
    unsigned char pkey[BLAKE3_KEY_LEN];
    tu_rt_part_key(pkey, "tu-rt-part-callee-1", lc->pipeline->stage_hashes + s * BLAKE3_KEY_LEN,
                   lc->env.key, lc->env.layout);
-   struct tu_rt_partset *ps = tu_rt_partset_lookup(lc->cache, pkey);
+   struct tu_rt_partset *ps = tu_rt_partset_lookup(lc->env.dev, lc->cache, pkey);
    if (!ps) {
       int64_t t0 = os_time_get_nano();
       const char *why = tu_rt_build_callee_part(&lc->env, lc->pipeline->stages[s], pkey, &ps);
@@ -3466,7 +3527,7 @@ tu_rt_link_callee_job(void *data, uint32_t i)
          tu_rt_link_note_fail(lc, why);
          return;
       }
-      ps = tu_rt_partset_insert(lc->cache, ps);
+      ps = tu_rt_partset_insert(lc->env.dev, lc->cache, ps);
       lc->n_callee_built.fetch_add(1);
    }
    lc->callee_sets[i] = ps;
@@ -3854,6 +3915,67 @@ done:
                 count, missing, instrs, max_regs, (os_time_get_nano() - t_start) / 1e6);
    }
    return VK_SUCCESS;
+}
+
+static std::atomic<int64_t> tu_rt_prebuild_ns;
+static std::atomic<uint32_t> tu_rt_prebuild_count;
+
+static void
+tu_rt_prebuild_parts(struct tu_device *dev, struct vk_pipeline_cache *cache,
+                     const VkRayTracingPipelineCreateInfoKHR *create_info,
+                     VkPipelineCreateFlags2KHR flags,
+                     const struct tu_shader_key *key,
+                     const unsigned char *stage_hash, nir_shader *nir)
+{
+   const unsigned mode = tu_rt_link_mode();
+   if (mode != TU_RT_LINK_FORCE && mode != TU_RT_LINK_AUTO)
+      return;
+   if (!debug_get_bool_option("TU_RT_LINK_PREBUILD", true))
+      return;
+   if (dev->physical_device->info->chip < 7 ||
+       (flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR))
+      return;
+   mesa_shader_stage st = nir->info.stage;
+   if (st != MESA_SHADER_RAYGEN && st != MESA_SHADER_CLOSEST_HIT &&
+       st != MESA_SHADER_MISS)
+      return;
+
+   VK_FROM_HANDLE(tu_pipeline_layout, layout, create_info->layout);
+   if (!layout)
+      return;
+   struct tu_rt_part_env env = { dev, layout, key, flags };
+   unsigned char pkey[BLAKE3_KEY_LEN];
+   tu_rt_part_key(pkey, st == MESA_SHADER_RAYGEN ? "tu-rt-part-rg-1" : "tu-rt-part-callee-1",
+                  stage_hash, key, layout);
+   struct tu_rt_partset *ps = tu_rt_partset_lookup(dev, cache, pkey);
+   if (ps) {
+      tu_rt_partset_unref(dev, ps);
+      return;
+   }
+
+   int64_t t0 = os_time_get_nano();
+   const char *why;
+   if (st == MESA_SHADER_RAYGEN)
+      why = tu_rt_build_raygen_parts(&env, nir, pkey, &ps, NULL);
+   else
+      why = tu_rt_build_callee_part(&env, nir, pkey, &ps);
+   int64_t dt = os_time_get_nano() - t0;
+   uint32_t n = tu_rt_prebuild_count.fetch_add(1) + 1;
+   int64_t total = tu_rt_prebuild_ns.fetch_add(dt) + dt;
+   if (!why) {
+      struct tu_rt_partset *ins = tu_rt_partset_insert(dev, cache, ps);
+      if (debug_get_bool_option("TU_RT_LINK_KEYDBG", false)) {
+         char hk[17];
+         tu_keylog_hex(hk, pkey, 8);
+         mesa_logi("tu-rt-keydbg: insert %s cache=%p obj=%p ref=%d", hk, (void *) cache,
+                   (void *) ins, (int) ins->base.ref_cnt);
+      }
+      tu_rt_partset_unref(dev, ins);
+   }
+   if (tu_rt_log_enabled())
+      mesa_logi("tu-rt-prebuild: %s %.1f ms%s%s (total %u parts %.1f ms)",
+                _mesa_shader_stage_to_abbrev(st), dt / 1e6, why ? " FAIL: " : "",
+                why ? why : "", n, total / 1e6);
 }
 
 struct tu_rt_variant_job {
