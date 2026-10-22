@@ -2233,6 +2233,20 @@ tu_rt_hash_abi(struct mesa_blake3 *h)
    _mesa_blake3_update(h, abi, sizeof(abi));
 }
 
+struct tu_rt_part_bin;
+
+struct tu_rt_link_merge {
+   const struct tu_rt_part_bin **parts;
+   uint32_t nparts;
+   const char *fail;
+};
+
+static const char *
+tu_rt_link_merge_fail(const struct tu_rt_link_merge *m)
+{
+   return m->fail;
+}
+
 struct tu_rt_part_bin {
    uint32_t count;
    int32_t max_reg;
@@ -2474,11 +2488,15 @@ tu_rt_part_check(const struct tu_shader *sh)
    return NULL;
 }
 
+static void tu_rt_link_fixup(struct ir3_shader_variant *v, void *data);
+
 static const char *
 tu_rt_part_compile(struct tu_device *dev, struct tu_pipeline_layout *layout,
                    const struct tu_shader_key *key, nir_shader *nir,
                    unsigned scratch_base, struct tu_rt_part_bin *out,
-                   uint64_t **words, uint32_t *desc_sets)
+                   uint64_t **words, uint32_t *desc_sets,
+                   const struct ir3_rt_blobs *blobs = NULL,
+                   struct tu_rt_link_merge *merge = NULL)
 {
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, tu_rt_lower_part_abi_instr,
             nir_metadata_control_flow, NULL);
@@ -2492,6 +2510,11 @@ tu_rt_part_compile(struct tu_device *dev, struct tu_pipeline_layout *layout,
    static const char part_key[] = "tu-rt-part";
    struct tu_rt_shader_opts opts = {};
    opts.part = true;
+   opts.blobs = blobs;
+   if (merge) {
+      opts.fixup = tu_rt_link_fixup;
+      opts.fixup_data = merge;
+   }
    struct tu_shader *sh = NULL;
    tu_shader_create(dev, &sh, nir, key, &info, &ir3_key, part_key,
                     sizeof(part_key), layout, false, &opts);
@@ -2502,6 +2525,8 @@ tu_rt_part_compile(struct tu_device *dev, struct tu_pipeline_layout *layout,
    }
 
    const char *reason = tu_rt_part_check(sh);
+   if (!reason && merge)
+      reason = tu_rt_link_merge_fail(merge);
    if (!reason) {
       const struct ir3_shader_variant *v = sh->variant;
       const uint64_t *bin = (const uint64_t *) v->bin;
@@ -3099,11 +3124,6 @@ tu_rt_build_traversal_part(const struct tu_rt_part_env *env,
    return fail;
 }
 
-struct tu_rt_link_merge {
-   const struct tu_rt_part_bin **parts;
-   uint32_t nparts;
-   const char *fail;
-};
 
 static void
 tu_rt_link_fixup(struct ir3_shader_variant *v, void *data)
@@ -3169,10 +3189,7 @@ tu_rt_emit_blob(nir_builder *b, uint32_t idx)
 struct tu_rt_glue_class {
    uint32_t cls;
    uint32_t trav_blob;
-   struct tu_rt_case *chit;
-   uint32_t nchit;
-   struct tu_rt_case *miss;
-   uint32_t nmiss;
+   uint32_t disp_blob;
 };
 
 static nir_shader *
@@ -3204,6 +3221,7 @@ tu_rt_build_glue(struct tu_device *dev, bool whole, uint32_t handle,
                              nir_imm_int(b, TU_RT_SEL_DONE)));
 
       uint32_t ncases = nrg + 3 * nclasses;
+      (void) ncases;
       struct tu_rt_case *cases =
          (struct tu_rt_case *) calloc(MAX2(ncases, 1), sizeof(struct tu_rt_case));
       uint32_t n = 0;
@@ -3212,7 +3230,6 @@ tu_rt_build_glue(struct tu_device *dev, bool whole, uint32_t handle,
       for (uint32_t i = 0; i < nclasses; i++) {
          cases[n++] = (struct tu_rt_case) { TU_RT_SEL_TRAV(classes[i].cls), 0x10000 | i };
          cases[n++] = (struct tu_rt_case) { TU_RT_SEL_CHIT(classes[i].cls), 0x20000 | i };
-         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_MISS(classes[i].cls), 0x30000 | i };
       }
 
       nir_loop *loop = nir_push_loop(b);
@@ -3220,21 +3237,16 @@ tu_rt_build_glue(struct tu_device *dev, bool whole, uint32_t handle,
          nir_def *sel = tu_rt_fload(b, TU_RT_FRAME_SEL, 1);
          nir_break_if(b, nir_ieq_imm(b, sel, TU_RT_SEL_DONE));
          tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_DONE));
+         sel = nir_bcsel(b, nir_ieq_imm(b, nir_ushr_imm(b, sel, 24), 3),
+                         nir_iand_imm(b, sel, 0x2ffffff), sel);
          tu_rt_emit_cases(b, sel, cases, n, [&](const struct tu_rt_case &cs) {
             uint32_t kind = cs.group >> 16, idx = cs.group & 0xffff;
-            if (kind == 0) {
+            if (kind == 0)
                tu_rt_emit_blob(b, idx);
-            } else if (kind == 1) {
+            else if (kind == 1)
                tu_rt_emit_blob(b, classes[idx].trav_blob);
-            } else {
-               struct tu_rt_case *hc = kind == 2 ? classes[idx].chit : classes[idx].miss;
-               uint32_t hn = kind == 2 ? classes[idx].nchit : classes[idx].nmiss;
-               tu_rt_fstore(b, TU_RT_FRAME_SEL, tu_rt_fload(b, TU_RT_FRAME_RET, 1));
-               nir_def *h = tu_rt_fload(b, TU_RT_FRAME_HANDLE, 1);
-               tu_rt_emit_cases(b, h, hc, hn, [&](const struct tu_rt_case &hcs) {
-                  tu_rt_emit_blob(b, hcs.group);
-               });
-            }
+            else
+               tu_rt_emit_blob(b, classes[idx].disp_blob);
          });
       }
       nir_pop_loop(b, loop);
@@ -3245,6 +3257,34 @@ tu_rt_build_glue(struct tu_device *dev, bool whole, uint32_t handle,
    nir_shader *nir = b->shader;
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    nir->scratch_size = TU_RT_FRAME_CALLEE;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   struct ir3_optimize_options optimize_options = {};
+   ir3_optimize_loop(dev->compiler, &optimize_options, nir);
+   return nir;
+}
+
+static std::atomic<int64_t> tu_rt_link_lower_ns, tu_rt_link_create_ns;
+
+static nir_shader *
+tu_rt_build_dispatch(struct tu_device *dev, uint32_t cls,
+                     struct tu_rt_case *chit, uint32_t nchit,
+                     struct tu_rt_case *miss, uint32_t nmiss)
+{
+   nir_builder _b = tu_rt_part_builder(dev, "tu rt callee dispatch");
+   nir_builder *b = &_b;
+   nir_def *sel = tu_rt_fload(b, TU_RT_FRAME_SEL, 1);
+   tu_rt_fstore(b, TU_RT_FRAME_SEL, tu_rt_fload(b, TU_RT_FRAME_RET, 1));
+   nir_def *h = tu_rt_fload(b, TU_RT_FRAME_HANDLE, 1);
+   nir_push_if(b, nir_ieq_imm(b, sel, TU_RT_SEL_CHIT(cls)));
+   tu_rt_emit_cases(b, h, chit, nchit, [&](const struct tu_rt_case &cs) {
+      tu_rt_emit_blob(b, cs.group);
+   });
+   nir_push_else(b, NULL);
+   tu_rt_emit_cases(b, h, miss, nmiss, [&](const struct tu_rt_case &cs) {
+      tu_rt_emit_blob(b, cs.group);
+   });
+   nir_pop_if(b, NULL);
+   nir_shader *nir = b->shader;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    struct ir3_optimize_options optimize_options = {};
    ir3_optimize_loop(dev->compiler, &optimize_options, nir);
@@ -3267,10 +3307,15 @@ tu_rt_link_one(struct tu_device *dev, struct tu_pipeline_layout *layout,
 
    struct ir3_shader_key ir3_key = {};
    struct tu_shader_info info = {};
+   int64_t t0 = os_time_get_nano();
    tu_lower_nir(dev, glue, key, &ir3_key, &info);
+   int64_t t1 = os_time_get_nano();
    struct tu_shader *sh = NULL;
    tu_shader_create(dev, &sh, glue, key, &info, &ir3_key, link_key,
                     BLAKE3_KEY_LEN, layout, false, &opts);
+   int64_t t2 = os_time_get_nano();
+   tu_rt_link_lower_ns.fetch_add(t1 - t0);
+   tu_rt_link_create_ns.fetch_add(t2 - t1);
    if (!sh)
       return "host compile";
    static const char *dump_dir = os_get_option("TU_RT_LINK_DISASM");
@@ -3397,13 +3442,16 @@ struct tu_rt_link_ctx {
    uint32_t nclasses;
    struct tu_rt_trav_desc trav[64];
    struct tu_rt_partset *trav_sets[64];
+   struct tu_rt_part_bin disp_bin[64];
+   uint64_t *disp_words[64];
+   uint32_t disp_sets[64];
 
    std::atomic<int> fail_count;
    const char *fail;
    simple_mtx_t lock;
 
    int64_t t_rg, t_callee, t_trav, t_link, t_link_max;
-   std::atomic<int64_t> a_rg, a_callee, a_trav, a_link, a_link_max;
+   std::atomic<int64_t> a_rg, a_callee, a_trav, a_link, a_link_max, a_glue;
    std::atomic<uint32_t> n_rg_built, n_callee_built, n_trav_built;
    int64_t probe[6];
    std::atomic<int64_t> probe_acc[8];
@@ -3577,6 +3625,73 @@ tu_rt_callee_compat(const struct tu_rt_partset *ps, uint32_t cls)
 }
 
 static void
+tu_rt_link_dispatch_job(void *data, uint32_t k)
+{
+   struct tu_rt_link_ctx *lc = (struct tu_rt_link_ctx *) data;
+   struct tu_ray_tracing_pipeline *p = lc->pipeline;
+   if (lc->fail_count.load())
+      return;
+   int64_t t0 = os_time_get_nano();
+   uint32_t cls = lc->classes[k];
+   struct ir3_rt_blob *blobs =
+      (struct ir3_rt_blob *) calloc(MAX2(lc->ncallee, 1), sizeof(struct ir3_rt_blob));
+   const struct tu_rt_part_bin **bins =
+      (const struct tu_rt_part_bin **) calloc(MAX2(lc->ncallee, 1), sizeof(void *));
+   int32_t *callee_blob = (int32_t *) malloc(MAX2(lc->ncallee, 1) * sizeof(int32_t));
+   struct tu_rt_case *chit = (struct tu_rt_case *)
+      calloc(MAX2(p->group_count, 1), sizeof(struct tu_rt_case));
+   struct tu_rt_case *miss = (struct tu_rt_case *)
+      calloc(MAX2(p->group_count, 1), sizeof(struct tu_rt_case));
+   uint32_t nblobs = 0, nchit = 0, nmiss = 0, sets = 0;
+   for (uint32_t i = 0; i < lc->ncallee; i++)
+      callee_blob[i] = -1;
+   struct tu_rt_compiler tmp = {};
+   tmp.pipeline = p;
+   for (uint32_t g = 0; g < p->group_count; g++) {
+      const struct tu_rt_group *grp = p->groups + g;
+      if (grp->recursive_index == VK_SHADER_UNUSED_KHR)
+         continue;
+      uint8_t st = p->stage_types[grp->recursive_index];
+      if (st != MESA_SHADER_CLOSEST_HIT && st != MESA_SHADER_MISS)
+         continue;
+      if (tu_rt_handle_seen(&tmp, g, grp->handle, 0))
+         continue;
+      int32_t ce = lc->stage_to_callee[grp->recursive_index];
+      const struct tu_rt_partset *ps = lc->callee_sets[ce];
+      if (!tu_rt_callee_compat(ps, cls))
+         continue;
+      if (callee_blob[ce] < 0) {
+         callee_blob[ce] = nblobs;
+         blobs[nblobs] = (struct ir3_rt_blob) { ps->parts[0].instrs, ps->parts[0].count };
+         bins[nblobs++] = &ps->parts[0];
+         sets |= ps->active_desc_sets;
+      }
+      struct tu_rt_case cs = { grp->handle, (uint32_t) callee_blob[ce] };
+      if (st == MESA_SHADER_CLOSEST_HIT)
+         chit[nchit++] = cs;
+      else
+         miss[nmiss++] = cs;
+   }
+   nir_shader *nir = tu_rt_build_dispatch(lc->env.dev, cls, chit, nchit, miss, nmiss);
+   struct ir3_rt_blobs bl = { nblobs, blobs };
+   struct tu_rt_link_merge merge = { bins, nblobs, NULL };
+   lc->disp_words[k] = NULL;
+   const char *why = tu_rt_part_compile(lc->env.dev, lc->env.layout, lc->env.key, nir,
+                                        TU_RT_FRAME_CALLEE, &lc->disp_bin[k],
+                                        &lc->disp_words[k], &sets, &bl, &merge);
+   lc->disp_bin[k].instrs = lc->disp_words[k];
+   lc->disp_sets[k] = sets;
+   free(blobs);
+   free(bins);
+   free(callee_blob);
+   free(chit);
+   free(miss);
+   lc->a_trav.fetch_add(os_time_get_nano() - t0);
+   if (why)
+      tu_rt_link_note_fail(lc, why);
+}
+
+static void
 tu_rt_link_variant_job(void *data, uint32_t v)
 {
    struct tu_rt_link_ctx *lc = (struct tu_rt_link_ctx *) data;
@@ -3587,14 +3702,11 @@ tu_rt_link_variant_job(void *data, uint32_t v)
 
    const struct tu_rt_partset *rg = lc->rg_sets[v];
    uint32_t nblobs = rg->nparts;
-   uint32_t cap = rg->nparts + lc->nclasses + lc->ncallee;
+   uint32_t cap = rg->nparts + 2 * TU_RT_MAX_CLASSES;
    struct ir3_rt_blob *blobs =
       (struct ir3_rt_blob *) calloc(cap, sizeof(struct ir3_rt_blob));
    const struct tu_rt_part_bin **bins =
       (const struct tu_rt_part_bin **) calloc(cap, sizeof(void *));
-   int32_t *callee_blob = (int32_t *) malloc(MAX2(lc->ncallee, 1) * sizeof(int32_t));
-   for (uint32_t i = 0; i < lc->ncallee; i++)
-      callee_blob[i] = -1;
    uint32_t sets = rg->active_desc_sets;
    for (uint32_t i = 0; i < rg->nparts; i++) {
       blobs[i] = (struct ir3_rt_blob) { rg->parts[i].instrs, rg->parts[i].count };
@@ -3602,8 +3714,6 @@ tu_rt_link_variant_job(void *data, uint32_t v)
    }
 
    struct tu_rt_glue_class gc[TU_RT_MAX_CLASSES] = {};
-   struct tu_rt_compiler tmp = {};
-   tmp.pipeline = p;
    for (uint32_t ci = 0; ci < rg->nclasses; ci++) {
       uint32_t cls = rg->classes[ci];
       uint32_t k = 0;
@@ -3616,41 +3726,16 @@ tu_rt_link_variant_job(void *data, uint32_t v)
       blobs[nblobs] = (struct ir3_rt_blob) { tr->parts[0].instrs, tr->parts[0].count };
       bins[nblobs++] = &tr->parts[0];
       sets |= tr->active_desc_sets;
-      gc[ci].chit = (struct tu_rt_case *) calloc(MAX2(p->group_count, 1), sizeof(struct tu_rt_case));
-      gc[ci].miss = (struct tu_rt_case *) calloc(MAX2(p->group_count, 1), sizeof(struct tu_rt_case));
-      for (uint32_t g = 0; g < p->group_count; g++) {
-         const struct tu_rt_group *grp = p->groups + g;
-         if (grp->recursive_index == VK_SHADER_UNUSED_KHR)
-            continue;
-         uint8_t st = p->stage_types[grp->recursive_index];
-         if (st != MESA_SHADER_CLOSEST_HIT && st != MESA_SHADER_MISS)
-            continue;
-         if (tu_rt_handle_seen(&tmp, g, grp->handle, 0))
-            continue;
-         int32_t ce = lc->stage_to_callee[grp->recursive_index];
-         const struct tu_rt_partset *ps = lc->callee_sets[ce];
-         if (!tu_rt_callee_compat(ps, cls))
-            continue;
-         if (callee_blob[ce] < 0) {
-            callee_blob[ce] = nblobs;
-            blobs[nblobs] = (struct ir3_rt_blob) { ps->parts[0].instrs, ps->parts[0].count };
-            bins[nblobs++] = &ps->parts[0];
-            sets |= ps->active_desc_sets;
-         }
-         struct tu_rt_case cs = { grp->handle, (uint32_t) callee_blob[ce] };
-         if (st == MESA_SHADER_CLOSEST_HIT)
-            gc[ci].chit[gc[ci].nchit++] = cs;
-         else
-            gc[ci].miss[gc[ci].nmiss++] = cs;
-      }
+      gc[ci].disp_blob = nblobs;
+      blobs[nblobs] = (struct ir3_rt_blob) { lc->disp_bin[k].instrs, lc->disp_bin[k].count };
+      bins[nblobs++] = &lc->disp_bin[k];
+      sets |= lc->disp_sets[k];
    }
 
+   int64_t tg0 = os_time_get_nano();
    nir_shader *glue = tu_rt_build_glue(lc->env.dev, false, p->variants[v].handle,
                                        rg->nparts, gc, rg->nclasses);
-   for (uint32_t ci = 0; ci < rg->nclasses; ci++) {
-      free(gc[ci].chit);
-      free(gc[ci].miss);
-   }
+   lc->a_glue.fetch_add(os_time_get_nano() - tg0);
    struct ir3_rt_blobs bl = { nblobs, blobs };
    struct tu_shader *sh = NULL;
    const char *why = tu_rt_link_one(lc->env.dev, lc->env.layout, lc->env.key, glue, &bl,
@@ -3658,7 +3743,6 @@ tu_rt_link_variant_job(void *data, uint32_t v)
                                     lc->link_keys + v * BLAKE3_KEY_LEN, lc->cache, &sh);
    free(blobs);
    free(bins);
-   free(callee_blob);
    int64_t dt = os_time_get_nano() - t0;
    lc->a_link.fetch_add(dt);
    int64_t prev = lc->a_link_max.load();
@@ -3799,6 +3883,7 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       lc->a_trav.store(0);
       lc->a_link.store(0);
       lc->a_link_max.store(0);
+      lc->a_glue.store(0);
       lc->n_rg_built.store(0);
       lc->n_callee_built.store(0);
       lc->n_trav_built.store(0);
@@ -3890,6 +3975,8 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
 
          if (!lc->fail_count.load())
             tu_rt_par_run(lc->ncallee + lc->nclasses, tu_rt_link_callee_job, lc);
+         if (!lc->fail_count.load())
+            tu_rt_par_run(lc->nclasses, tu_rt_link_dispatch_job, lc);
          t2 = os_time_get_nano();
          if (!lc->fail_count.load())
             tu_rt_par_run(count, tu_rt_link_variant_job, lc);
@@ -3903,16 +3990,18 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       if (tu_rt_log_enabled()) {
          mesa_logi("tu-rt-link: %s %u variants (%u to link) stages=%u groups=%u classes=%u "
                    "callees=%u | rg parts built=%u %.1f ms cpu, callee built=%u %.1f ms cpu, "
-                   "trav built=%u %.1f ms cpu, link %.1f ms cpu (max %.2f ms) | wall rg=%.1f "
+                   "trav built=%u %.1f ms cpu, link %.1f ms cpu (glue nir %.1f, max %.2f ms) | wall rg=%.1f "
                    "callee+trav=%.1f link=%.1f ms%s%s",
                    whole ? "whole" : "force", count, missing, pipeline->stage_count,
                    pipeline->group_count, lc->nclasses, lc->ncallee,
                    lc->n_rg_built.load(), lc->a_rg.load() / 1e6,
                    lc->n_callee_built.load(), lc->a_callee.load() / 1e6,
                    lc->n_trav_built.load(), lc->a_trav.load() / 1e6,
-                   lc->a_link.load() / 1e6, lc->a_link_max.load() / 1e6,
+                   lc->a_link.load() / 1e6, lc->a_glue.load() / 1e6, lc->a_link_max.load() / 1e6,
                    (t1 - t0) / 1e6, (t2 - t1) / 1e6, (t3 - t2) / 1e6,
                    fail ? " FAIL: " : "", fail ? fail : "");
+         mesa_logi("tu-rt-link: cumulative host lower %.1f ms, host create %.1f ms",
+                   tu_rt_link_lower_ns.load() / 1e6, tu_rt_link_create_ns.load() / 1e6);
          if (!whole && lc->n_rg_built.load()) {
             mesa_logi("tu-rt-probe: raygens built=%u parts=%" PRId64 " stack_bytes=%" PRId64
                       " locals=%" PRId64 " nir_pre=%" PRId64 " nir_post=%" PRId64,
@@ -3929,6 +4018,8 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
             tu_rt_partset_unref(dev, lc->callee_sets[i]);
          for (uint32_t k = 0; k < lc->nclasses; k++)
             tu_rt_partset_unref(dev, lc->trav_sets[k]);
+         for (uint32_t k = 0; k < lc->nclasses; k++)
+            free(lc->disp_words[k]);
          free(lc->rg_sets);
          free(lc->rg_stage);
          free(lc->stage_to_callee);
