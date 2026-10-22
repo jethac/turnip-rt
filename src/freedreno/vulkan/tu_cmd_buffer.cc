@@ -2278,16 +2278,30 @@ tu_disable_draw_states(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
  * making sure that the EARLYPREAMBLE bit isn't set so any leftover early
  * preamble doesn't get executed. Other stages don't seem to be affected.
  */
-static void
-tu_emit_early_preamble_workaround(struct tu_cs *cs)
+static bool
+tu_early_preamble_workaround_broad(void)
 {
-   if (cs->device->physical_device->info->props.has_early_preamble) {
-      tu_cs_emit_regs(cs, A6XX_SP_VS_CNTL_0());
-      tu_cs_emit_regs(cs, A6XX_SP_HS_CNTL_0());
-      tu_cs_emit_regs(cs, A6XX_SP_DS_CNTL_0());
-      tu_cs_emit_regs(cs, A6XX_SP_GS_CNTL_0());
-      tu_cs_emit_regs(cs, A6XX_SP_PS_CNTL_0());
+   static const bool enabled = debug_get_bool_option("TU_EPW_BROAD", false);
+   return enabled;
+}
+
+static void
+tu_emit_early_preamble_workaround(struct tu_cs *cs, bool static_regs)
+{
+   if (!cs->device->physical_device->info->props.has_early_preamble)
+      return;
+
+   if (!tu_early_preamble_workaround_broad()) {
+      if (static_regs)
+         tu_cs_emit_regs(cs, A6XX_SP_PS_CNTL_0());
+      return;
    }
+
+   tu_cs_emit_regs(cs, A6XX_SP_VS_CNTL_0());
+   tu_cs_emit_regs(cs, A6XX_SP_HS_CNTL_0());
+   tu_cs_emit_regs(cs, A6XX_SP_DS_CNTL_0());
+   tu_cs_emit_regs(cs, A6XX_SP_GS_CNTL_0());
+   tu_cs_emit_regs(cs, A6XX_SP_PS_CNTL_0());
 }
 
 template <chip CHIP>
@@ -2475,7 +2489,7 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
     * CP_SMMU_TABLE_UPDATE so we might not need this if the firmware is new
     * enough on some GPUs. And some GPUs might have fixed this altogether.
     */
-   tu_emit_early_preamble_workaround(cs);
+   tu_emit_early_preamble_workaround(cs, true);
 
    /* Workaround for draw state with constlen not being applied for
     * zero-instance draw calls. See IR3_CONST_ALLOC_DRIVER_PARAMS allocation
@@ -3525,7 +3539,7 @@ tu6_sysmem_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       tu_cs_emit_regs(cs, RB_BIN_FOVEAT(CHIP));
    }
 
-   tu_emit_early_preamble_workaround(cs);
+   tu_emit_early_preamble_workaround(cs, false);
 
    cmd->device->autotune->init_renderpass(rp_ctx, true, 0);
    cmd->device->autotune->begin_renderpass(cmd, cs, rp_ctx);
@@ -3800,7 +3814,7 @@ tu6_tile_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       /* Do the early preamble workaround separately for binning, so that it
        * executes on BV if using concurrent binning.
        */
-      tu_emit_early_preamble_workaround(cs);
+      tu_emit_early_preamble_workaround(cs, false);
 
       tu6_emit_bin_size<CHIP>(cs, tiling->tile0.width, tiling->tile0.height,
                               {
@@ -3915,7 +3929,7 @@ tu6_tile_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    }
 
    /* Do the early preamble workaround again, this time on BR. */
-   tu_emit_early_preamble_workaround(cs);
+   tu_emit_early_preamble_workaround(cs, false);
 
    tu_lrz_before_tiles<CHIP>(cmd, cs, use_cb);
 
