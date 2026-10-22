@@ -656,7 +656,7 @@ msm_bo_init(struct tu_device *dev,
    uint32_t guard = 0;
 
    if (unlikely(dev->bo_va_guard) && !lazy_vma &&
-       !(flags & TU_BO_ALLOC_REPLAYABLE) &&
+       !(flags & (TU_BO_ALLOC_REPLAYABLE | TU_BO_ALLOC_SHAREABLE)) &&
        ((flags & TU_BO_ALLOC_VA_GUARD) || dev->bo_va_guard_all))
       guard = dev->bo_va_guard;
 

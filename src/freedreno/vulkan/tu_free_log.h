@@ -7,6 +7,7 @@
 #define TU_FREE_LOG_H
 
 #include "tu_knl.h"
+#include "util/macros.h"
 
 extern bool tu_free_log_on;
 
@@ -16,6 +17,11 @@ void tu_free_log_device_finish(void);
 void tu_free_log_bo_alloc(struct tu_bo *bo, uint32_t flags, const char *name);
 void tu_free_log_bo_free(const struct tu_bo *bo);
 void tu_free_log_suballoc_bo(const struct tu_bo *bo);
+void tu_free_log_suballoc(const struct tu_bo *bo, uint64_t iova, uint64_t size,
+                          uint64_t used_end, const char *fmt, ...)
+   PRINTFLIKE(5, 6);
+void tu_free_log_config(uint32_t guard, bool guard_all, bool guard_each,
+                        uint32_t tail_pad, bool epw_broad);
 void tu_free_log_vma(const char *op, uint64_t iova, uint64_t size,
                      uint32_t flags);
 void tu_free_log_free_memory(const void *mem, uint64_t iova, uint64_t size,

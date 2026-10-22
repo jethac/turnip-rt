@@ -21,6 +21,7 @@ struct tu_suballocator
 
    uint32_t default_size;
    uint32_t tail_pad;
+   bool each;
    enum tu_bo_alloc_flags flags;
 
    /** Current BO we're suballocating out of. */

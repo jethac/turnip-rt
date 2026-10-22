@@ -23,6 +23,7 @@
 #include "ir3/ir3_replay.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
+#include "tu_free_log.h"
 #include "tu_lrz.h"
 #include "tu_pipeline.h"
 #include "tu_rmv.h"
@@ -3583,6 +3584,15 @@ tu_upload_shader(struct tu_device *dev,
       }
    }
 
+   if (unlikely(tu_free_log_on)) {
+      tu_free_log_suballoc(shader->bo.bo, shader->bo.iova, shader->bo.size,
+                           tu_cs_get_cur_iova(&shader->cs),
+                           "kind=shader stage=%s bin=%.12s code=0x%x vars=%u",
+                           _mesa_shader_stage_to_abbrev(v->type), v->blake3_str,
+                           v->info.size,
+                           1u + !!binning + !!safe_const + !!safe_const_binning);
+   }
+
    return VK_SUCCESS;
 }
 
@@ -4500,6 +4510,13 @@ tu_empty_shader_create(struct tu_device *dev,
    tu_cs_begin_sub_stream(&shader->cs, 32, &sub_cs);
    TU_CALLX(dev, tu6_emit_variant)(&sub_cs, stage, NULL, &pvtmem_config, 0, 0);
    shader->state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
+
+   if (unlikely(tu_free_log_on)) {
+      tu_free_log_suballoc(shader->bo.bo, shader->bo.iova, shader->bo.size,
+                           tu_cs_get_cur_iova(&shader->cs),
+                           "kind=empty_shader stage=%s",
+                           _mesa_shader_stage_to_abbrev(stage));
+   }
 
    *shader_out = shader;
    return VK_SUCCESS;

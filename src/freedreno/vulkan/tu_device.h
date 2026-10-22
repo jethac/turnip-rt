@@ -362,6 +362,7 @@ struct tu_device
 
    uint32_t bo_va_guard;
    bool bo_va_guard_all;
+   bool bo_va_guard_each;
 
    /* KGSL requires a small chunk of GPU mem to retrieve raw GPU time on
     * each submission.

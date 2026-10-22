@@ -29,6 +29,7 @@
 #include "tu_cs.h"
 #include "tu_device.h"
 #include "tu_formats.h"
+#include "tu_free_log.h"
 #include "tu_knl.h"
 #include "tu_lrz.h"
 #include "tu_pass.h"
@@ -1505,6 +1506,18 @@ tu_pipeline_allocate_cs(struct tu_device *dev,
 
    TU_RMV(cmd_buffer_suballoc_bo_create, dev, &pipeline->bo);
    tu_cs_init_suballoc(&pipeline->cs, dev, &pipeline->bo);
+
+   if (unlikely(tu_free_log_on)) {
+      static const char *const type_names[] = { "gfx", "gfx_lib", "compute",
+                                                "rt" };
+      tu_free_log_suballoc(pipeline->bo.bo, pipeline->bo.iova,
+                           pipeline->bo.size, 0,
+                           "kind=pipeline type=%s pipe=%p bin=%.12s",
+                           pipeline->type < ARRAY_SIZE(type_names) ?
+                              type_names[pipeline->type] : "?",
+                           (void *) pipeline,
+                           compute ? compute->blake3_str : "-");
+   }
 
    return VK_SUCCESS;
 }

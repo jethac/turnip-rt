@@ -306,6 +306,37 @@ tu_free_log_suballoc_bo(const struct tu_bo *bo)
 }
 
 void
+tu_free_log_suballoc(const struct tu_bo *bo, uint64_t iova, uint64_t size,
+                     uint64_t used_end, const char *fmt, ...)
+{
+   char line[TU_FREE_LOG_LINE_SIZE];
+   int len = fl_printf(line, sizeof(line), 0,
+                       "suballoc iova=0x%" PRIx64 " size=0x%" PRIx64
+                       " end=0x%" PRIx64 " used_end=0x%" PRIx64
+                       " bo=0x%" PRIx64 " bo_end=0x%" PRIx64
+                       " off=0x%" PRIx64 " pad=0x%x guard=0x%x name=%s ",
+                       iova, size, iova + size, used_end, bo->iova,
+                       bo->iova + bo->size, iova - bo->iova, bo->tail_pad,
+                       bo->va_guard,
+                       bo->free_log_name ? bo->free_log_name : "?");
+   va_list ap;
+   va_start(ap, fmt);
+   len = fl_vprintf(line, sizeof(line), len, fmt, ap);
+   va_end(ap);
+   fl_append(line, len);
+}
+
+void
+tu_free_log_config(uint32_t guard, bool guard_all, bool guard_each,
+                   uint32_t tail_pad, bool epw_broad)
+{
+   fl_line("cfg guard=0x%x guard_all=%u guard_each=%u tail_pad=0x%x"
+           " epw_broad=%u",
+           guard, (unsigned) guard_all, (unsigned) guard_each, tail_pad,
+           (unsigned) epw_broad);
+}
+
+void
 tu_free_log_bo_free(const struct tu_bo *bo)
 {
    char line[TU_FREE_LOG_LINE_SIZE];

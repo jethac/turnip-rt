@@ -36,6 +36,7 @@ tu_bo_suballocator_init(struct tu_suballocator *suballoc,
    suballoc->dev = dev;
    suballoc->default_size = default_size;
    suballoc->tail_pad = 0;
+   suballoc->each = false;
    suballoc->flags = flags;
    suballoc->bo = NULL;
    suballoc->cached_bo = NULL;
@@ -51,11 +52,47 @@ tu_bo_suballocator_finish(struct tu_suballocator *suballoc)
       tu_bo_finish(suballoc->dev, suballoc->cached_bo);
 }
 
+static VkResult
+tu_suballoc_bo_alloc_each(struct tu_suballoc_bo *suballoc_bo,
+                          struct tu_suballocator *suballoc,
+                          uint32_t size, uint32_t alignment)
+{
+   struct tu_bo *bo;
+   VkResult result = tu_bo_init_new(suballoc->dev, NULL, &bo,
+                                    size + suballoc->tail_pad,
+                                    suballoc->flags, suballoc->name);
+   if (result != VK_SUCCESS)
+      return result;
+   bo->tail_pad = suballoc->tail_pad;
+
+   result = tu_bo_map(suballoc->dev, bo, NULL);
+   if (result != VK_SUCCESS) {
+      tu_bo_finish(suballoc->dev, bo);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   if (bo->tail_pad) {
+      memset(static_cast<char *>(bo->map) + bo->size - bo->tail_pad, 0,
+             bo->tail_pad);
+   }
+   if (unlikely(tu_free_log_on))
+      tu_free_log_suballoc_bo(bo);
+
+   suballoc_bo->bo = bo;
+   suballoc_bo->iova =
+      bo->iova + ((bo->size - bo->tail_pad - size) & ~(uint64_t) (alignment - 1));
+   suballoc_bo->size = size;
+   return VK_SUCCESS;
+}
+
 VkResult
 tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
                      struct tu_suballocator *suballoc,
                      uint32_t size, uint32_t alignment)
 {
+   if (unlikely(suballoc->each))
+      return tu_suballoc_bo_alloc_each(suballoc_bo, suballoc, size, alignment);
+
    struct tu_bo *bo = suballoc->bo;
    if (bo) {
       uint32_t offset = align(suballoc->next_offset, alignment);
@@ -129,7 +166,8 @@ tu_suballoc_bo_free(struct tu_suballocator *suballoc, struct tu_suballoc_bo *bo)
    /* If we we held the last reference to this BO, so just move it to the
     * suballocator for the next time we need to allocate.
     */
-   if (p_atomic_read(&bo->bo->refcnt) == 1 && !suballoc->cached_bo) {
+   if (p_atomic_read(&bo->bo->refcnt) == 1 && !suballoc->cached_bo &&
+       !suballoc->each) {
       suballoc->cached_bo = bo->bo;
       return;
    }
