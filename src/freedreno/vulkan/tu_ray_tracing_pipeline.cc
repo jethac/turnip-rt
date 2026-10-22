@@ -3705,8 +3705,10 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       _mesa_blake3_update(&h, base_blake3, BLAKE3_KEY_LEN);
       static const char tag[] = "tu-rt-link-1";
       _mesa_blake3_update(&h, tag, sizeof(tag));
-      uint32_t mode = whole ? 1 : 2;
-      _mesa_blake3_update(&h, &mode, sizeof(mode));
+      uint64_t mode[3] = { whole ? 1u : 2u,
+                           debug_get_num_option("TU_RT_HIT_BUDGET", 250000),
+                           debug_get_num_option("TU_RT_MAX_PREINLINE", 400000) };
+      _mesa_blake3_update(&h, mode, sizeof(mode));
       tu_rt_hash_abi(&h);
       _mesa_blake3_update(&h, &g->handle, sizeof(g->handle));
       _mesa_blake3_final(&h, keys + v * BLAKE3_KEY_LEN);
@@ -4401,11 +4403,12 @@ tu_rt_pipeline_create(struct tu_device *dev,
          const struct ir3_shader_variant *iv =
             pipeline->variants ? pipeline->variants[v].shader->variant : sh->variant;
          mesa_logi("tu-rt: variant %u/%u handle=0x%x blake3=%s instrs=%u nops=%u regs=%u half=%d "
-                   "stp=%u ldp=%u loops=%u waves=%d wave%u",
+                   "stp=%u ldp=%u loops=%u waves=%d wave%u pvt=%u pw=%d bs=%u size=%u",
                    v, logged, pipeline->variants ? pipeline->variants[v].handle : 0, iv->blake3_str,
                    iv->info.instrs_count, iv->info.nops_count, iv->info.max_reg + 1,
                    iv->info.max_half_reg + 1, iv->info.stp_count, iv->info.ldp_count,
-                   iv->info.loops, iv->info.max_waves, iv->info.double_threadsize ? 128 : 64);
+                   iv->info.loops, iv->info.max_waves, iv->info.double_threadsize ? 128 : 64,
+                   iv->pvtmem_size, iv->pvtmem_per_wave, iv->branchstack, iv->info.size / 8);
       }
    }
 
