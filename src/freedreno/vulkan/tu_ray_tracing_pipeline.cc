@@ -2278,7 +2278,7 @@ tu_rt_log_enabled(void)
    return on;
 }
 
-static const char tu_rt_abi_tag[] = "tu-rt-abi-5";
+static const char tu_rt_abi_tag[] = "tu-rt-abi-6";
 
 static void
 tu_rt_hash_abi(struct mesa_blake3 *h)
@@ -2736,6 +2736,42 @@ tu_rt_count_instrs(nir_shader *nir)
    return n;
 }
 
+static unsigned
+tu_rt_scratch_end(nir_shader *nir)
+{
+   unsigned end = 0;
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_rt_trace_ray:
+            case nir_intrinsic_rt_execute_callable:
+            case nir_intrinsic_rt_resume:
+               end = MAX2(end, nir_intrinsic_stack_size(intr));
+               break;
+            case nir_intrinsic_load_scratch:
+               if (nir_src_is_const(intr->src[0]))
+                  end = MAX2(end, nir_src_as_uint(intr->src[0]) +
+                                     intr->def.num_components * intr->def.bit_size / 8);
+               break;
+            case nir_intrinsic_store_scratch:
+               if (nir_src_is_const(intr->src[1]))
+                  end = MAX2(end, nir_src_as_uint(intr->src[1]) +
+                                     intr->src[0].ssa->num_components *
+                                        intr->src[0].ssa->bit_size / 8);
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return end;
+}
+
 static bool
 tu_rt_should_remat(nir_instr *instr, void *data)
 {
@@ -2906,6 +2942,7 @@ tu_rt_build_raygen_parts(const struct tu_rt_part_env *env, nir_shader *stage,
       }
    }
 
+   unsigned scratch = nir->scratch_size;
    nir_lower_shader_calls_options opts = {};
    opts.address_format = nir_address_format_32bit_offset;
    opts.stack_alignment = 4;
@@ -2926,10 +2963,14 @@ tu_rt_build_raygen_parts(const struct tu_rt_part_env *env, nir_shader *stage,
    }
    ralloc_free(mem_ctx);
 
-   unsigned scratch = 0;
+   for (uint32_t i = 0; i < nparts; i++) {
+      scratch = MAX2(scratch, shaders[i]->scratch_size);
+      scratch = MAX2(scratch, tu_rt_scratch_end(shaders[i]));
+   }
+   scratch = align(scratch, 4);
    uint64_t post = 0;
    for (uint32_t i = 0; i < nparts && !fail; i++) {
-      scratch = MAX2(scratch, shaders[i]->scratch_size);
+      shaders[i]->scratch_size = scratch;
       fail = tu_rt_finish_raygen_part(shaders[i]);
       post += tu_rt_count_instrs(shaders[i]);
       if (nir_dir) {
