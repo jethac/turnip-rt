@@ -281,9 +281,20 @@ struct tu_rt_group {
    uint32_t handle;
 };
 
+struct tu_rt_stage_sum {
+   uint32_t instrs;
+   uint32_t used;
+   uint32_t psize;
+   uint32_t n_sites;
+   uint32_t n_calls;
+   uint32_t *site_psize;
+};
+
 struct tu_rt_stage_blob {
    uint32_t refcnt;
    uint32_t size;
+   bool has_sum;
+   struct tu_rt_stage_sum sum;
    uint8_t data[];
 };
 
@@ -312,8 +323,10 @@ struct tu_ray_tracing_pipeline {
    uint8_t *stage_hashes;
    struct tu_rt_group *groups;
 
+   struct tu_rt_stage_sum *stage_sums;
    uint32_t id;
    uint32_t compiled;
+   uint32_t ca_variants;
    struct tu_bo *stats_bo;
    uint64_t *stats_last;
    struct list_head stats_link;
