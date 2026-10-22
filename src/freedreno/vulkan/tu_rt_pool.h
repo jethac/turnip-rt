@@ -51,6 +51,7 @@ struct tu_rt_batch {
    uint32_t retargeted;
    uint32_t helped;
    uint32_t fallback;
+   uint32_t boosted;
    uint64_t left;
    int64_t wait_ns;
 };

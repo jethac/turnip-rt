@@ -2883,9 +2883,9 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
             len += snprintf(ph + len, sizeof(ph) - len, " %s=%.2f",
                             tu_rt_phase_name((enum tu_rt_phase) k), job.phase_ns[k].load() / 1e9);
          mesa_logi("tu-rt: vtime-sum pipe=%u compiled=%u pool deduped=%u coalesced=%u retargeted=%u "
-                   "fallback=%u ss_hits=%u helped=%u late_hits=%u wait=%.1fms wall=%.1fms cpu=%.2f/%.2fs thread-s:%s",
+                   "fallback=%u ss_hits=%u helped=%u boosted=%u late_hits=%u wait=%.1fms wall=%.1fms cpu=%.2f/%.2fs thread-s:%s",
                    pipeline->id, missing, batch.deduped, batch.coalesced, batch.retargeted,
-                   batch.fallback, ss_hits, batch.helped, job.late_hits.load(),
+                   batch.fallback, ss_hits, batch.helped, batch.boosted, job.late_hits.load(),
                    batch.wait_ns / 1e6, (t_end - t_pool) / 1e6,
                    job.cpu_ns[0].load() / 1e9, job.cpu_ns[1].load() / 1e9, ph);
       } else if (tu_rt_log_level() >= 1) {

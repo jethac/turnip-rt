@@ -492,6 +492,51 @@ tu_rt_pool_pick_own_locked(struct tu_rt_pool *pool, struct tu_rt_batch *batch)
    return best;
 }
 
+struct tu_rt_helper_arg {
+   struct tu_device *dev;
+   struct tu_rt_pool *pool;
+   struct tu_rt_batch *batch;
+};
+
+static struct tu_rt_task *
+tu_rt_pool_pick_pending_locked(struct tu_rt_batch *batch)
+{
+   struct tu_rt_task *best = NULL;
+   for (uint32_t i = 0; i < batch->count; i++) {
+      struct tu_rt_task *t = batch->tasks + i;
+      if (t->state == TU_RT_TASK_PENDING && (!best || tu_rt_task_less(best, t)))
+         best = t;
+   }
+   return best;
+}
+
+static void *
+tu_rt_pool_helper(void *data)
+{
+   struct tu_rt_helper_arg *arg = (struct tu_rt_helper_arg *) data;
+   std::unique_lock<std::mutex> lk(arg->pool->lock);
+   while (struct tu_rt_task *t = tu_rt_pool_pick_pending_locked(arg->batch))
+      tu_rt_pool_execute(arg->dev, arg->pool, lk, t);
+   return NULL;
+}
+
+static unsigned
+tu_rt_pool_boost_locked(struct tu_rt_pool *pool, struct tu_rt_batch *batch)
+{
+   static const uint32_t max_tasks = debug_get_num_option("TU_RT_POOL_BOOST", 32);
+   static const unsigned jobs = MAX2(debug_get_num_option("TU_RT_JOBS", 4), 1);
+   if (!max_tasks || batch->count > max_tasks)
+      return 0;
+   unsigned pending = 0;
+   for (uint32_t i = 0; i < batch->count; i++)
+      pending += batch->tasks[i].state == TU_RT_TASK_PENDING;
+   const unsigned idle = pool->threads.size() > pool->running ?
+                         pool->threads.size() - pool->running : 0;
+   if (pending <= idle + 1)
+      return 0;
+   return MIN2(pending - idle - 1, jobs - 1);
+}
+
 static bool
 tu_rt_pool_coalesce_locked(struct tu_rt_pool *pool, struct tu_rt_task *t)
 {
@@ -622,6 +667,7 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
    batch->retargeted = 0;
    batch->helped = 0;
    batch->fallback = 0;
+   batch->boosted = 0;
    batch->left = 0;
    batch->wait_ns = 0;
    for (uint32_t i = 0; i < batch->count; i++) {
@@ -662,6 +708,18 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
    }
    pool->work_cv.notify_all();
 
+   pthread_t helpers[16];
+   struct tu_rt_helper_arg harg = { dev, pool, batch };
+   const unsigned want = MIN2(tu_rt_pool_boost_locked(pool, batch), 16u);
+   for (unsigned i = 0; i < want; i++) {
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, 256u << 20);
+      if (pthread_create(&helpers[batch->boosted], &attr, tu_rt_pool_helper, &harg) == 0)
+         batch->boosted++;
+      pthread_attr_destroy(&attr);
+   }
+
    while (batch->remaining) {
       struct tu_rt_task *t = NULL;
       if (!batch->running || tu_rt_pool_may_start(pool))
@@ -679,4 +737,7 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
                                    [&](struct tu_rt_task *t) { return t->batch == batch; }),
                     pool->heap.end());
    std::make_heap(pool->heap.begin(), pool->heap.end(), tu_rt_task_less);
+   lk.unlock();
+   for (unsigned i = 0; i < batch->boosted; i++)
+      pthread_join(helpers[i], NULL);
 }
