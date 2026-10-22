@@ -4513,6 +4513,8 @@ tu_pipeline_finish(struct tu_pipeline *pipeline,
 
    if (pipeline->type == TU_PIPELINE_RAY_TRACING) {
       struct tu_ray_tracing_pipeline *rt = tu_pipeline_to_ray_tracing(pipeline);
+      if (rt->stats_bo)
+         tu_rt_stats_finish(dev, rt);
       for (uint32_t i = 0; i < rt->variant_count; i++) {
          if (rt->variants[i].shader)
             vk_pipeline_cache_object_unref(&dev->vk, &rt->variants[i].shader->base);

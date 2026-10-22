@@ -4,6 +4,7 @@
  */
 
 #include "tu_shader.h"
+#include "tu_rt_prof.h"
 
 #include <initializer_list>
 
@@ -3974,6 +3975,7 @@ tu_shader_create(struct tu_device *dev,
             key->ray_tracing, &const_allocs);
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   tu_rt_times_mark(TU_RT_PH_IO);
 
    struct ir3_shader_nir_options nir_options;
    init_ir3_nir_options(&nir_options, key);
@@ -4041,12 +4043,14 @@ tu_shader_create(struct tu_device *dev,
    if (lane_linear)
       ir3_shader->cs.force_linear_dispatch = true;
 
+   tu_rt_times_mark(TU_RT_PH_FINALIZE);
    struct ir3_shader_variant *variant =
       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
    if (variant)
       variant = tu_skytrace_variant(ir3_shader, ir3_key, executable_info,
                                     variant);
    shader->variant = variant;
+   tu_rt_times_mark(TU_RT_PH_BACKEND);
 
    static const bool log_hashes =
       debug_get_bool_option("TU_LOG_SHADER_HASHES", false);

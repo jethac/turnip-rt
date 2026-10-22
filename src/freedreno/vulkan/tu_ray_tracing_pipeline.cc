@@ -18,6 +18,12 @@
 #include <pthread.h>
 #include <atomic>
 #include <malloc.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+#include "util/simple_mtx.h"
+#include "compiler/glsl_types.h"
 #include "vk_pipeline.h"
 #include "vk_shader_module.h"
 
@@ -67,6 +73,118 @@ tu_rt_group_key_cmp(const void *a, const void *b, void *data)
       }
    }
    return 0;
+}
+
+static int
+tu_rt_log_level_init(void)
+{
+   int64_t n = debug_get_num_option("TU_RT_LOG", 0);
+   if (!n && debug_get_bool_option("TU_RT_LOG", false))
+      n = 1;
+   return (int) n;
+}
+
+static int
+tu_rt_log_level(void)
+{
+   static const int level = tu_rt_log_level_init();
+   return level;
+}
+
+static bool
+tu_rt_stats_enabled(void)
+{
+   static const bool on = debug_get_bool_option("TU_RT_STATS", false);
+   return on;
+}
+
+static std::atomic<uint32_t> tu_rt_pipeline_ids;
+
+static simple_mtx_t tu_rt_stats_mtx = SIMPLE_MTX_INITIALIZER;
+static struct list_head tu_rt_stats_list = { &tu_rt_stats_list, &tu_rt_stats_list };
+
+static void
+tu_rt_stats_dump_locked(struct tu_ray_tracing_pipeline *pipeline, const char *why)
+{
+   const uint32_t n = MAX2(pipeline->variant_count, 1u);
+   const volatile uint64_t *ctr = (const volatile uint64_t *) pipeline->stats_bo->map + 1;
+   uint64_t total = 0;
+   uint32_t active = 0, changed = 0;
+   for (uint32_t v = 0; v < n; v++) {
+      uint64_t c = ctr[v];
+      total += c;
+      active += c != 0;
+      changed += c != pipeline->stats_last[v];
+   }
+   if (!changed && strcmp(why, "final"))
+      return;
+   mesa_logi("tu-rt-stats: %s pipe=%u stages=%u groups=%u variants=%u dispatches=%" PRIu64
+             " active=%u changed=%u", why, pipeline->id, pipeline->stage_count,
+             pipeline->group_count, n, total, active, changed);
+   for (uint32_t v = 0; v < n; v++) {
+      uint64_t c = ctr[v];
+      if (!c || (c == pipeline->stats_last[v] && strcmp(why, "final")))
+         continue;
+      char rg[17];
+      if (pipeline->variants)
+         tu_keylog_hex(rg, pipeline->variants[v].rg_hash, 8);
+      else
+         strcpy(rg, "-");
+      mesa_logi("tu-rt-stats:   pipe=%u v=%u handle=%08x rg=%s n=%" PRIu64 " +%" PRIu64,
+                pipeline->id, v, pipeline->variants ? pipeline->variants[v].handle : 0u, rg,
+                c, c - pipeline->stats_last[v]);
+      pipeline->stats_last[v] = c;
+   }
+}
+
+void
+tu_rt_stats_init(struct tu_device *dev, struct tu_ray_tracing_pipeline *pipeline)
+{
+   const uint32_t n = MAX2(pipeline->variant_count, 1u);
+   struct tu_bo *bo = NULL;
+   if (tu_bo_init_new(dev, NULL, &bo, (n + 1) * sizeof(uint64_t),
+                      TU_BO_ALLOC_INTERNAL_RESOURCE, "rt_stats") != VK_SUCCESS)
+      return;
+   if (tu_bo_map(dev, bo, NULL) != VK_SUCCESS) {
+      tu_bo_finish(dev, bo);
+      return;
+   }
+   uint64_t *map = (uint64_t *) bo->map;
+   map[0] = 1;
+   memset(map + 1, 0, n * sizeof(uint64_t));
+   pipeline->stats_last = rzalloc_array(pipeline->mem_ctx, uint64_t, n);
+   pipeline->stats_bo = bo;
+   simple_mtx_lock(&tu_rt_stats_mtx);
+   list_addtail(&pipeline->stats_link, &tu_rt_stats_list);
+   simple_mtx_unlock(&tu_rt_stats_mtx);
+}
+
+void
+tu_rt_stats_finish(struct tu_device *dev, struct tu_ray_tracing_pipeline *pipeline)
+{
+   simple_mtx_lock(&tu_rt_stats_mtx);
+   list_del(&pipeline->stats_link);
+   tu_rt_stats_dump_locked(pipeline, "final");
+   simple_mtx_unlock(&tu_rt_stats_mtx);
+   tu_bo_finish(dev, pipeline->stats_bo);
+   pipeline->stats_bo = NULL;
+}
+
+void
+tu_rt_stats_tick(void)
+{
+   static std::atomic<int64_t> last;
+   static const int64_t period =
+      debug_get_num_option("TU_RT_STATS_PERIOD", 10) * 1000000000ll;
+   int64_t now = os_time_get_nano(), prev = last.load();
+   if (prev && now - prev < period)
+      return;
+   if (!last.compare_exchange_strong(prev, now) || !prev)
+      return;
+   simple_mtx_lock(&tu_rt_stats_mtx);
+   list_for_each_entry (struct tu_ray_tracing_pipeline, p, &tu_rt_stats_list, stats_link)
+      tu_rt_stats_dump_locked(p, "periodic");
+   simple_mtx_unlock(&tu_rt_stats_mtx);
 }
 
 static bool
@@ -523,6 +641,7 @@ struct tu_rt_compiler {
    bool nohit;
    int only_raygen;
    unsigned max_call_depth;
+   unsigned site_count;
 };
 
 static void
@@ -876,13 +995,13 @@ tu_rt_emit_cases(nir_builder *b, nir_def *handle, struct tu_rt_case *cases,
    tu_rt_emit_case_tree(b, handle, cases, count, emit);
 }
 
-static void
+static unsigned
 tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
                          nir_def *handle, mesa_shader_stage want, nir_def *arg,
                          unsigned ray_depth, unsigned call_depth)
 {
    if (c->nohit && want == MESA_SHADER_CLOSEST_HIT)
-      return;
+      return 0;
    struct tu_rt_case *cases =
       (struct tu_rt_case *) malloc(sizeof(struct tu_rt_case) * MAX2(c->pipeline->group_count, 1));
    unsigned count = 0;
@@ -903,6 +1022,7 @@ tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
       tu_rt_call_stage(b, c, stage, arg, ray_depth, call_depth);
    });
    free(cases);
+   return count;
 }
 
 static void
@@ -990,6 +1110,37 @@ static nir_function *tu_rt_get_isec_function(nir_builder *b,
                                              unsigned call_depth);
 
 static void
+tu_rt_site_const(char *out, size_t n, nir_def *def)
+{
+   nir_scalar sc = nir_get_scalar(def, 0);
+   if (nir_scalar_is_const(sc))
+      snprintf(out, n, "0x%x", (unsigned) nir_scalar_as_uint(sc));
+   else
+      snprintf(out, n, "dyn");
+}
+
+static void
+tu_rt_payload_sig(nir_def *arg, unsigned *size, uint32_t *type_hash)
+{
+   *size = 0;
+   *type_hash = 0;
+   if (!nir_def_is_deref(arg))
+      return;
+   const struct glsl_type *t = nir_def_as_deref(arg)->type;
+   unsigned al;
+   glsl_get_natural_size_align_bytes(t, size, &al);
+   struct blob b;
+   blob_init(&b);
+   encode_type_to_blob(&b, t);
+   if (!b.out_of_memory) {
+      blake3_hash h;
+      _mesa_blake3_compute(b.data, b.size, h);
+      memcpy(type_hash, h, sizeof(*type_hash));
+   }
+   blob_finish(&b);
+}
+
+static void
 tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
                 nir_intrinsic_instr *instr)
 {
@@ -1009,6 +1160,7 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
    nir_def *tmax = instr->src[9].ssa;
    nir_def *payload = instr->src[10].ssa;
    const unsigned cd = tu_rt_ctx(c, b->impl->function)->call_depth;
+   unsigned n_ahit = 0, n_isec = 0, n_chit = 0, n_miss = 0;
 
    nir_store_var(b, s->flags, flags, 0x1);
    nir_store_var(b, s->cull_mask, cull_mask, 0x1);
@@ -1103,6 +1255,7 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
                nir_shader *ahit = tu_rt_group_stage(c, c->pipeline->groups[cs.group].ahit_index);
                tu_rt_call_stage(b, c, ahit, payload, 1, cd);
             });
+            n_ahit = count;
             free(cases);
          }
 
@@ -1160,6 +1313,7 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
             tu_rt_emit_cases(b, entry.value, cases, count, [&](const struct tu_rt_case &cs) {
                nir_build_call(b, tu_rt_get_isec_function(b, c, cs.group, cd), 1, &payload);
             });
+            n_isec = count;
             free(cases);
          }
 
@@ -1221,7 +1375,7 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
          struct tu_rt_sbt_entry chit =
             tu_rt_load_sbt_entry(b, tu_rt_sbt_index(b, c, rq, true), hit_sbt);
          nir_store_var(b, s->shader_record_ptr, chit.shader_record_ptr, 0x1);
-         tu_rt_dispatch_recursive(b, c, chit.value, MESA_SHADER_CLOSEST_HIT, payload, 1, cd);
+         n_chit = tu_rt_dispatch_recursive(b, c, chit.value, MESA_SHADER_CLOSEST_HIT, payload, 1, cd);
       }
       nir_pop_if(b, NULL);
    }
@@ -1231,9 +1385,28 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
          b, miss_index,
          offsetof(VkTraceRaysIndirectCommand2KHR, missShaderBindingTableAddress));
       nir_store_var(b, s->shader_record_ptr, miss.shader_record_ptr, 0x1);
-      tu_rt_dispatch_recursive(b, c, miss.value, MESA_SHADER_MISS, payload, 1, cd);
+      n_miss = tu_rt_dispatch_recursive(b, c, miss.value, MESA_SHADER_MISS, payload, 1, cd);
    }
    nir_pop_if(b, NULL);
+
+   unsigned site = c->site_count++;
+   if (tu_rt_log_level() >= 2) {
+      unsigned psize;
+      uint32_t ptype;
+      tu_rt_payload_sig(payload, &psize, &ptype);
+      char sf[16], sc[16], so[16], ss[16], sm[16];
+      tu_rt_site_const(sf, sizeof(sf), flags);
+      tu_rt_site_const(sc, sizeof(sc), cull_mask);
+      tu_rt_site_const(so, sizeof(so), instr->src[3].ssa);
+      tu_rt_site_const(ss, sizeof(ss), instr->src[4].ssa);
+      tu_rt_site_const(sm, sizeof(sm), instr->src[5].ssa);
+      mesa_logi("tu-rt: site rg=%08x #%u in=%s cd=%u payload=%uB/%08x flags=%s cull=%s "
+                "sbt_off=%s stride=%s miss=%s cases ahit=%u isec=%u chit=%u miss=%u%s%s",
+                c->only_raygen >= 0 ? c->pipeline->groups[c->only_raygen].handle : 0u,
+                site, _mesa_shader_stage_to_abbrev(tu_rt_ctx(c, b->impl->function)->stage),
+                cd, psize, ptype, sf, sc, so, ss, sm, n_ahit, n_isec, n_chit, n_miss,
+                c->has_ahit ? "" : " opaque", c->has_isec ? "" : " noaabb");
+   }
 }
 
 static void
@@ -1637,7 +1810,11 @@ tu_rt_build_shader(struct tu_device *dev,
                nir_foreach_instr (instr, block)
                   total++;
       const uint64_t budget = tu_rt_hit_budget();
-      if (total > budget || debug_get_bool_option("TU_RT_LOG", false)) {
+      const bool shape_log = tu_rt_log_level() >= 2 ||
+         (tu_rt_log_level() >= 1 &&
+          (only_raygen < 0 || !pipeline->variants ||
+           pipeline->groups[only_raygen].handle == pipeline->variants[0].handle));
+      if (total > budget || shape_log) {
          uint64_t by_stage[32] = {};
          unsigned n_by_stage[32] = {};
          unsigned trace_sites = 0, call_sites = 0;
@@ -1689,7 +1866,7 @@ tu_rt_build_shader(struct tu_device *dev,
                    ": building without hit shaders (%u stages, %u groups)",
                    total, budget, pipeline->stage_count, pipeline->group_count);
       }
-      if (debug_get_bool_option("TU_RT_LOG", false)) {
+      if (shape_log) {
          for (uint32_t i = 0; i < create_info->stageCount && i < 4; i++)
             mesa_logi("tu-rt:   stage %u %s %s", i,
                       _mesa_shader_stage_to_abbrev(
@@ -1725,6 +1902,8 @@ tu_rt_build_shader(struct tu_device *dev,
       }
    }
 
+   tu_rt_times_mark(TU_RT_PH_SETUP);
+
    nir_def *launch_id = nir_load_ray_launch_id(b);
    nir_def *launch_size = nir_load_ray_launch_size(b);
    nir_def *oob = nir_ige(b, nir_channel(b, launch_id, 0), nir_channel(b, launch_size, 0));
@@ -1742,6 +1921,7 @@ tu_rt_build_shader(struct tu_device *dev,
 
    nir_shader_instructions_pass(b->shader, tu_rt_lower_instr,
                                 nir_metadata_none, &c);
+   tu_rt_times_mark(TU_RT_PH_EMIT);
 
    tu_rt_prof_mark("pre-inline", b->shader);
    {
@@ -1767,6 +1947,7 @@ tu_rt_build_shader(struct tu_device *dev,
    NIR_PASS(_, b->shader, nir_inline_functions);
    tu_rt_prof_mark("post-inline", b->shader);
    nir_remove_non_entrypoints(b->shader);
+   tu_rt_times_mark(TU_RT_PH_INLINE);
    NIR_PASS(_, b->shader, nir_opt_deref);
    NIR_PASS(_, b->shader, nir_opt_copy_prop);
    NIR_PASS(_, b->shader, nir_opt_deref);
@@ -1780,6 +1961,7 @@ tu_rt_build_shader(struct tu_device *dev,
    NIR_PASS(_, b->shader, nir_opt_copy_prop);
    NIR_PASS(_, b->shader, nir_opt_dce);
 
+   tu_rt_times_mark(TU_RT_PH_VARS);
    tu_rt_prof_mark("pre-rq", b->shader);
    NIR_PASS(_, b->shader, nir_opt_ray_queries);
    NIR_PASS(_, b->shader, tu_nir_lower_ray_queries);
@@ -1792,11 +1974,13 @@ tu_rt_build_shader(struct tu_device *dev,
    free(c.isec_cache);
 
    nir_shader_gather_info(b->shader, nir_shader_get_entrypoint(b->shader));
+   tu_rt_times_mark(TU_RT_PH_RQ);
 
    tu_rt_prof_mark("pre-optloop", b->shader);
    struct ir3_optimize_options optimize_options = {};
    ir3_optimize_loop(dev->compiler, &optimize_options, b->shader);
    tu_rt_prof_mark("post-optloop", b->shader);
+   tu_rt_times_mark(TU_RT_PH_OPT);
 
    return b->shader;
 }
@@ -1814,12 +1998,35 @@ struct tu_rt_variant_job {
    uint32_t count;
    std::atomic<uint32_t> next;
    std::atomic<int> result;
+   std::atomic<int64_t> phase_ns[TU_RT_PH_COUNT];
+   std::atomic<int64_t> cpu_ns[2];
+   std::atomic<int64_t> first_idle;
 };
+
+static int64_t
+tu_rt_thread_cpu_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+   return ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+
+static uint32_t
+tu_rt_count_instrs(nir_shader *nir)
+{
+   uint32_t n = 0;
+   nir_foreach_function_impl (impl, nir)
+      nir_foreach_block (block, impl)
+         nir_foreach_instr (instr, block)
+            n++;
+   return n;
+}
 
 static void *
 tu_rt_variant_worker(void *data)
 {
    struct tu_rt_variant_job *job = (struct tu_rt_variant_job *) data;
+   const bool timed = tu_rt_log_level() >= 1;
    for (;;) {
       uint32_t v = job->next.fetch_add(1);
       if (v >= job->count)
@@ -1827,22 +2034,61 @@ tu_rt_variant_worker(void *data)
       struct tu_rt_variant *var = job->pipeline->variants + v;
       if (var->shader)
          continue;
+      struct tu_rt_times times = {};
+      int64_t t0 = 0, c0 = 0;
+      if (timed) {
+         c0 = tu_rt_thread_cpu_ns();
+         t0 = times.last = os_time_get_nano();
+         tu_rt_tls_times = &times;
+      }
       nir_shader *nir = tu_rt_build_shader(job->dev, job->pipeline, job->create_info,
                                            job->flags, (int) job->groups[v]);
       if (!nir) {
+         tu_rt_tls_times = NULL;
          job->result.store(VK_ERROR_OUT_OF_HOST_MEMORY);
          continue;
       }
+      int64_t t1 = timed ? os_time_get_nano() : 0;
+      int64_t c1 = timed ? tu_rt_thread_cpu_ns() : 0;
+      uint32_t nir_instrs = timed ? tu_rt_count_instrs(nir) : 0;
+      if (timed)
+         times.last = os_time_get_nano();
       struct tu_shader *shader = NULL;
       VkResult r = tu_compute_shader_compile(job->dev, job->layout, job->cache, nir,
                                              job->key, job->hashes + v * BLAKE3_KEY_LEN,
                                              &shader);
+      tu_rt_times_mark(TU_RT_PH_TAIL);
+      tu_rt_tls_times = NULL;
       if (r != VK_SUCCESS || !shader) {
          job->result.store(r != VK_SUCCESS ? r : VK_ERROR_OUT_OF_HOST_MEMORY);
          continue;
       }
       var->shader = shader;
+      if (timed) {
+         int64_t t2 = os_time_get_nano();
+         int64_t c2 = tu_rt_thread_cpu_ns();
+         job->cpu_ns[0] += c1 - c0;
+         job->cpu_ns[1] += c2 - c1;
+         char ph[256];
+         unsigned len = 0;
+         for (unsigned k = 0; k < TU_RT_PH_COUNT; k++) {
+            job->phase_ns[k] += times.ns[k];
+            len += snprintf(ph + len, sizeof(ph) - len, " %s=%.1f",
+                            tu_rt_phase_name((enum tu_rt_phase) k), times.ns[k] / 1e6);
+         }
+         struct mallinfo2 mi = mallinfo2();
+         mesa_logi("tu-rt: vtime pipe=%u v=%u/%u handle=%08x ms=%.1f build=%.1f compile=%.1f "
+                   "cpu=%.1f/%.1f%s nir=%u instrs=%u heap=%zuM tid=%d",
+                   job->pipeline->id, v, job->count, var->handle, (t2 - t0) / 1e6,
+                   (t1 - t0) / 1e6, (t2 - t1) / 1e6, (c1 - c0) / 1e6, (c2 - c1) / 1e6,
+                   ph, nir_instrs,
+                   shader->variant->info.instrs_count, (mi.uordblks + mi.hblkhd) >> 20,
+                   (int) syscall(SYS_gettid));
+      }
    }
+   int64_t idle = os_time_get_nano(), cur = job->first_idle.load();
+   while ((!cur || idle < cur) && !job->first_idle.compare_exchange_weak(cur, idle))
+      ;
    return NULL;
 }
 
@@ -1864,6 +2110,9 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
    for (uint32_t v = 0; v < count; v++) {
       const struct tu_rt_group *g = pipeline->groups + groups[v];
       pipeline->variants[v].handle = g->handle;
+      memcpy(pipeline->variants[v].rg_hash,
+             pipeline->stage_hashes + g->recursive_index * BLAKE3_KEY_LEN,
+             sizeof(pipeline->variants[v].rg_hash));
       struct mesa_blake3 ctx;
       _mesa_blake3_init(&ctx);
       _mesa_blake3_update(&ctx, base_blake3, BLAKE3_KEY_LEN);
@@ -1902,6 +2151,14 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       job.count = count;
       job.next.store(0);
       job.result.store(VK_SUCCESS);
+      for (unsigned k = 0; k < TU_RT_PH_COUNT; k++)
+         job.phase_ns[k].store(0);
+      job.cpu_ns[0].store(0);
+      job.cpu_ns[1].store(0);
+      job.first_idle.store(0);
+      int64_t t_pool = os_time_get_nano();
+      if (tu_rt_log_level() >= 1)
+         tu_rt_times_install_hook();
 
       static const unsigned max_jobs = debug_get_num_option("TU_RT_JOBS", 4);
       unsigned nthreads = MIN2(MAX2(max_jobs, 1u), missing);
@@ -1919,13 +2176,28 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       for (unsigned t = 0; t < started; t++)
          pthread_join(threads[t], NULL);
 
+      if (tu_rt_log_level() >= 1) {
+         int64_t t_end = os_time_get_nano();
+         char ph[256];
+         unsigned len = 0;
+         for (unsigned k = 0; k < TU_RT_PH_COUNT; k++)
+            len += snprintf(ph + len, sizeof(ph) - len, " %s=%.2f",
+                            tu_rt_phase_name((enum tu_rt_phase) k), job.phase_ns[k].load() / 1e9);
+         mesa_logi("tu-rt: vtime-sum pipe=%u compiled=%u threads=%u wall=%.1fms tail=%.1fms "
+                   "cpu=%.2f/%.2fs thread-s:%s",
+                   pipeline->id, missing, started + 1, (t_end - t_pool) / 1e6,
+                   job.first_idle.load() ? (t_end - job.first_idle.load()) / 1e6 : 0.0,
+                   job.cpu_ns[0].load() / 1e9, job.cpu_ns[1].load() / 1e9, ph);
+      }
+
       ralloc_free(nir_ctx);
       memset(pipeline->stages, 0, pipeline->stage_count * sizeof(pipeline->stages[0]));
       if (job.result.load() != VK_SUCCESS)
          return (VkResult) job.result.load();
    }
 
-   if (debug_get_bool_option("TU_RT_LOG", false)) {
+   pipeline->compiled = missing;
+   if (tu_rt_log_level() >= 1) {
       uint64_t instrs = 0;
       unsigned max_regs = 0;
       for (uint32_t v = 0; v < count; v++) {
@@ -1938,23 +2210,56 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
    return VK_SUCCESS;
 }
 
+static void
+tu_rt_set_hash(struct tu_ray_tracing_pipeline *pipeline, mesa_shader_stage want,
+               uint32_t *count, char *out)
+{
+   uint32_t *h = (uint32_t *) malloc(MAX2(pipeline->group_count, 1) * sizeof(uint32_t));
+   uint32_t n = 0;
+   for (uint32_t g = 0; h && g < pipeline->group_count; g++) {
+      const struct tu_rt_group *grp = pipeline->groups + g;
+      if (grp->recursive_index == VK_SHADER_UNUSED_KHR ||
+          pipeline->stage_types[grp->recursive_index] != want)
+         continue;
+      bool dup = false;
+      for (uint32_t k = 0; k < n && !dup; k++)
+         dup = h[k] == grp->handle;
+      if (!dup)
+         h[n++] = grp->handle;
+   }
+   if (h)
+      qsort(h, n, sizeof(uint32_t), [](const void *a, const void *b) {
+         uint32_t x = *(const uint32_t *) a, y = *(const uint32_t *) b;
+         return x < y ? -1 : (x > y ? 1 : 0);
+      });
+   blake3_hash hh;
+   _mesa_blake3_compute(h, n * sizeof(uint32_t), hh);
+   tu_keylog_hex(out, hh, 8);
+   *count = n;
+   free(h);
+}
+
 static VkResult
 tu_rt_pipeline_create(struct tu_device *dev,
                       struct vk_pipeline_cache *cache,
                       const VkRayTracingPipelineCreateInfoKHR *create_info,
                       VkPipelineCreateFlags2KHR flags,
                       const VkAllocationCallbacks *alloc,
-                      VkPipeline *out_pipeline)
+                      VkPipeline *out_pipeline,
+                      const char *caller, int caller_tid)
 {
    VK_FROM_HANDLE(tu_pipeline_layout, layout, create_info->layout);
    VkResult result;
 
    int64_t t_start = os_time_get_nano();
+   struct timespec rt_start;
+   clock_gettime(CLOCK_REALTIME, &rt_start);
    struct tu_ray_tracing_pipeline *pipeline =
       (struct tu_ray_tracing_pipeline *) vk_object_zalloc(
          &dev->vk, alloc, sizeof(*pipeline), VK_OBJECT_TYPE_PIPELINE);
    if (!pipeline)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   pipeline->id = tu_rt_pipeline_ids.fetch_add(1);
 
    pipeline->base.base.type = TU_PIPELINE_RAY_TRACING;
    pipeline->base.base.executables_mem_ctx = ralloc_context(NULL);
@@ -2203,9 +2508,28 @@ tu_rt_pipeline_create(struct tu_device *dev,
       for (uint32_t v = 1; v < pipeline->variant_count; v++)
          pipeline->base.base.active_desc_sets |=
             pipeline->variants[v].shader->active_desc_sets;
+
+      if (tu_rt_stats_enabled())
+         tu_rt_stats_init(dev, pipeline);
+
+      if (tu_rt_log_level() >= 1) {
+         struct timespec rt_end;
+         clock_gettime(CLOCK_REALTIME, &rt_end);
+         char rg_set[17], miss_set[17];
+         uint32_t rg_n, miss_n;
+         tu_rt_set_hash(pipeline, MESA_SHADER_RAYGEN, &rg_n, rg_set);
+         tu_rt_set_hash(pipeline, MESA_SHADER_MISS, &miss_n, miss_set);
+         mesa_logi("tu-rt: create pipe=%u caller=%s tid=%d stages=%u groups=%u rg=%u/%s miss=%u/%s "
+                   "compiled=%u/%u t0=%lld.%06ld t1=%lld.%06ld ms=%.1f",
+                   pipeline->id, caller ? caller : "?", caller_tid, pipeline->stage_count,
+                   pipeline->group_count, rg_n, rg_set, miss_n, miss_set, pipeline->compiled,
+                   MAX2(pipeline->variant_count, 1u), (long long) rt_start.tv_sec,
+                   rt_start.tv_nsec / 1000, (long long) rt_end.tv_sec, rt_end.tv_nsec / 1000,
+                   (os_time_get_nano() - t_start) / 1e6);
+      }
    }
 
-   if (debug_get_bool_option("TU_RT_LOG", false)) {
+   if (tu_rt_log_level() >= 1) {
       const struct tu_shader *sh = pipeline->base.base.shaders[MESA_SHADER_COMPUTE];
       struct mallinfo2 mi = mallinfo2();
       mesa_logi("tu-rt: pipeline %s stages=%u groups=%u lib=%d %.1f ms instrs=%u regs=%u heap=%zuM",
@@ -2246,6 +2570,8 @@ struct tu_rt_create_job {
    const VkAllocationCallbacks *alloc;
    VkPipeline *out;
    VkResult result;
+   char caller[17];
+   int caller_tid;
 };
 
 static void *
@@ -2253,9 +2579,10 @@ tu_rt_create_job_run(void *data)
 {
    struct tu_rt_create_job *job = (struct tu_rt_create_job *) data;
    job->result = tu_rt_pipeline_create(job->dev, job->cache, job->info,
-                                       job->flags, job->alloc, job->out);
+                                       job->flags, job->alloc, job->out,
+                                       job->caller, job->caller_tid);
    if (debug_get_bool_option("TU_RT_TRIM", true)) {
-      if (debug_get_bool_option("TU_RT_LOG", false)) {
+      if (tu_rt_log_level() >= 1) {
          struct mallinfo2 a = mallinfo2();
          malloc_trim(0);
          struct mallinfo2 b = mallinfo2();
@@ -2298,13 +2625,22 @@ tu_CreateRayTracingPipelinesKHR(VkDevice _device,
    VK_FROM_HANDLE(vk_pipeline_cache, cache, pipelineCache);
    VkResult result = VK_SUCCESS;
 
+   char caller[17] = {};
+   int caller_tid = 0;
+   if (tu_rt_log_level() >= 1) {
+      if (prctl(PR_GET_NAME, caller, 0, 0, 0) != 0)
+         strcpy(caller, "?");
+      caller_tid = (int) syscall(SYS_gettid);
+   }
+
    uint32_t i = 0;
    for (; i < createInfoCount; i++) {
       VkPipelineCreateFlags2KHR flags =
          vk_rt_pipeline_create_flags(&pCreateInfos[i]);
       struct tu_rt_create_job job = { dev, cache, &pCreateInfos[i], flags,
                                       pAllocator, &pPipelines[i],
-                                      VK_ERROR_OUT_OF_HOST_MEMORY };
+                                      VK_ERROR_OUT_OF_HOST_MEMORY, {}, caller_tid };
+      memcpy(job.caller, caller, sizeof(job.caller));
       tu_rt_run_on_big_stack(&job);
       VkResult r = job.result;
       if (r != VK_SUCCESS) {

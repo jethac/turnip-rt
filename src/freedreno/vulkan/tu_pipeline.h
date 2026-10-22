@@ -294,6 +294,7 @@ struct tu_rt_stage_set {
 
 struct tu_rt_variant {
    uint32_t handle;
+   uint8_t rg_hash[8];
    struct tu_shader *shader;
 };
 
@@ -310,7 +311,17 @@ struct tu_ray_tracing_pipeline {
    uint8_t *stage_types;
    uint8_t *stage_hashes;
    struct tu_rt_group *groups;
+
+   uint32_t id;
+   uint32_t compiled;
+   struct tu_bo *stats_bo;
+   uint64_t *stats_last;
+   struct list_head stats_link;
 };
+
+void tu_rt_stats_init(struct tu_device *dev, struct tu_ray_tracing_pipeline *pipeline);
+void tu_rt_stats_finish(struct tu_device *dev, struct tu_ray_tracing_pipeline *pipeline);
+void tu_rt_stats_tick(void);
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(tu_pipeline, base, VkPipeline,
                                VK_OBJECT_TYPE_PIPELINE)

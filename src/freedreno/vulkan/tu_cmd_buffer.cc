@@ -10251,6 +10251,18 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
 }
 TU_GENX(tu_CmdDispatchIndirect);
 
+static void
+tu_rt_emit_stats_inc(struct tu_cs *cs, const struct tu_ray_tracing_pipeline *rtp,
+                     uint32_t v)
+{
+   uint64_t base = rtp->stats_bo->iova;
+   tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 7);
+   tu_cs_emit(cs, CP_MEM_TO_MEM_0_DOUBLE | CP_MEM_TO_MEM_0_WAIT_FOR_MEM_WRITES);
+   tu_cs_emit_qw(cs, base + 8 * (v + 1));
+   tu_cs_emit_qw(cs, base + 8 * (v + 1));
+   tu_cs_emit_qw(cs, base);
+}
+
 template <chip CHIP>
 static void
 tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
@@ -10279,6 +10291,7 @@ tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
                    tu_pipeline_to_ray_tracing(pipeline)->variant_count,
                    tu_pipeline_to_ray_tracing(pipeline)->stage_count);
       }
+      tu_rt_stats_tick();
    }
    if (rt_skip)
       return;
@@ -10377,12 +10390,16 @@ tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
          tu_cs_emit_state_ib(cs, vs->state);
          cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
          tu_dispatch<CHIP>(cmd, &info);
+         if (rtp->stats_bo)
+            tu_rt_emit_stats_inc(cs, rtp, v);
          tu_cond_exec_end(cs);
       }
    } else {
       cmd->state.shaders[MESA_SHADER_COMPUTE] = rt_shader;
       tu_cs_emit_state_ib(cs, rt_shader->state);
       tu_dispatch<CHIP>(cmd, &info);
+      if (rtp->stats_bo)
+         tu_rt_emit_stats_inc(cs, rtp, 0);
    }
 
    tmp = cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE];

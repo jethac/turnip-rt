@@ -8,6 +8,7 @@
 #include <atomic>
 #include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "util/os_time.h"
@@ -26,7 +27,38 @@ struct tu_rt_prof_entry {
    uint32_t calls;
 };
 
+thread_local struct tu_rt_times *tu_rt_tls_times;
+
+const char *
+tu_rt_phase_name(enum tu_rt_phase ph)
+{
+   static const char *const names[TU_RT_PH_COUNT] = {
+      "setup", "emit", "inline", "vars", "rq", "opt",
+      "io", "fin", "post", "lv", "be", "tail",
+   };
+   return names[ph];
+}
+
+static void
+tu_rt_times_hook(const char *name)
+{
+   if (!tu_rt_tls_times)
+      return;
+   if (!strcmp(name, "post_finalize"))
+      tu_rt_times_mark(TU_RT_PH_POST_FINALIZE);
+   else if (!strcmp(name, "emit_instructions"))
+      tu_rt_times_mark(TU_RT_PH_LOWER_VARIANT);
+}
+
+void
+tu_rt_times_install_hook(void)
+{
+   if (!ir3_pass_hook)
+      ir3_pass_hook = tu_rt_times_hook;
+}
+
 static struct {
+   void (*saved_ir3_hook)(const char *name);
    std::atomic<bool> active;
    std::atomic<int> cur;
    pthread_t owner;
@@ -120,6 +152,7 @@ tu_rt_prof_begin(void)
    prof.cur_start = os_time_get_nano();
    prof.active.store(true);
    nir_pass_hook = prof_hook;
+   prof.saved_ir3_hook = ir3_pass_hook;
    ir3_pass_hook = prof_hook;
    pthread_create(&prof.sampler, NULL, prof_sampler, NULL);
 }
@@ -155,7 +188,7 @@ tu_rt_prof_end(const char *label)
    prof_hook("<end>");
    prof.active.store(false);
    nir_pass_hook = NULL;
-   ir3_pass_hook = NULL;
+   ir3_pass_hook = prof.saved_ir3_hook;
    pthread_join(prof.sampler, NULL);
 
    uint32_t order[TU_RT_PROF_MAX];
