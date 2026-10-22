@@ -3083,7 +3083,9 @@ tu_rt_pipeline_create(struct tu_device *dev,
 
       struct tu_shader *shader = NULL;
       nir_shader *nir = NULL;
-      if (rg_count > 1 && !debug_get_bool_option("TU_RT_NO_VARIANTS", false)) {
+      static const bool force_variants = debug_get_bool_option("TU_RT_FORCE_VARIANTS", false);
+      if ((rg_count > 1 || (rg_count == 1 && force_variants)) &&
+          !debug_get_bool_option("TU_RT_NO_VARIANTS", false)) {
          if (tu_rt_ca_keys() && tu_rt_use_case_tree() &&
              !tu_rt_collect_sums(dev, cache, pipeline, create_info, flags, &key))
             pipeline->stage_sums = NULL;
