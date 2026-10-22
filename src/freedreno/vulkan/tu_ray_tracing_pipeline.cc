@@ -2800,6 +2800,19 @@ tu_rt_build_raygen_parts(const struct tu_rt_part_env *env, nir_shader *stage,
    unsigned locals = nir->scratch_size - TU_RT_FRAME_STACK;
    uint64_t pre = tu_rt_count_instrs(nir);
 
+   static const char *nir_dir = os_get_option("TU_RT_PROBE_NIR_DIR");
+   char nir_prefix[17] = "";
+   if (nir_dir) {
+      tu_keylog_hex(nir_prefix, pkey, 8);
+      char path[512];
+      snprintf(path, sizeof(path), "%s/rg_%s_pre.nir", nir_dir, nir_prefix);
+      FILE *f = fopen(path, "w");
+      if (f) {
+         nir_print_shader(nir, f);
+         fclose(f);
+      }
+   }
+
    nir_lower_shader_calls_options opts = {};
    opts.address_format = nir_address_format_32bit_offset;
    opts.stack_alignment = 4;
@@ -2826,6 +2839,15 @@ tu_rt_build_raygen_parts(const struct tu_rt_part_env *env, nir_shader *stage,
       scratch = MAX2(scratch, shaders[i]->scratch_size);
       fail = tu_rt_finish_raygen_part(shaders[i]);
       post += tu_rt_count_instrs(shaders[i]);
+      if (nir_dir) {
+         char path[512];
+         snprintf(path, sizeof(path), "%s/rg_%s_part%u.nir", nir_dir, nir_prefix, i);
+         FILE *f = fopen(path, "w");
+         if (f) {
+            nir_print_shader(shaders[i], f);
+            fclose(f);
+         }
+      }
    }
    if (!fail && scratch > TU_RT_FRAME_CALLEE)
       fail = "stack too large";
@@ -3112,6 +3134,8 @@ tu_rt_link_fixup(struct ir3_shader_variant *v, void *data)
       v->has_ssbo |= !!(p->bindless & 16);
       v->num_samp = MAX2(v->num_samp, (int) p->num_samp);
       v->num_uavs = MAX2(v->num_uavs, p->num_uavs);
+      v->info.stp_count += p->stp_count;
+      v->info.ldp_count += p->ldp_count;
    }
    v->info.max_reg = max_reg;
    v->info.max_half_reg = max_half_reg;
@@ -3208,7 +3232,7 @@ tu_rt_build_glue(struct tu_device *dev, bool whole, uint32_t handle,
 
    nir_shader *nir = b->shader;
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
-   nir->scratch_size = TU_RT_FRAME_PAYLOAD;
+   nir->scratch_size = TU_RT_FRAME_CALLEE;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    struct ir3_optimize_options optimize_options = {};
    ir3_optimize_loop(dev->compiler, &optimize_options, nir);
@@ -3957,13 +3981,34 @@ tu_rt_prebuild_parts(struct tu_device *dev, struct vk_pipeline_cache *cache,
 
    int64_t t0 = os_time_get_nano();
    const char *why;
+   int64_t probe[6] = {};
    if (st == MESA_SHADER_RAYGEN)
-      why = tu_rt_build_raygen_parts(&env, nir, pkey, &ps, NULL);
+      why = tu_rt_build_raygen_parts(&env, nir, pkey, &ps, probe);
    else
       why = tu_rt_build_callee_part(&env, nir, pkey, &ps);
    int64_t dt = os_time_get_nano() - t0;
    uint32_t n = tu_rt_prebuild_count.fetch_add(1) + 1;
    int64_t total = tu_rt_prebuild_ns.fetch_add(dt) + dt;
+   if (tu_rt_log_enabled()) {
+      uint32_t instrs = 0, regs = 0, stp = 0, ldp = 0, pvt = 0;
+      char sizes[256] = "";
+      unsigned len = 0;
+      for (uint32_t i = 0; ps && !why && i < ps->nparts; i++) {
+         instrs += ps->parts[i].instrs_count;
+         regs = MAX2(regs, (uint32_t) (ps->parts[i].max_reg + 1));
+         stp += ps->parts[i].stp_count;
+         ldp += ps->parts[i].ldp_count;
+         pvt = MAX2(pvt, ps->parts[i].pvtmem_size);
+         if (len + 8 < sizeof(sizes))
+            len += snprintf(sizes + len, sizeof(sizes) - len, "%u,", ps->parts[i].instrs_count);
+      }
+      mesa_logi("tu-rt-prebuild: %s %.1f ms%s%s parts=%" PRId64 " stack=%" PRId64
+                " nir=%" PRId64 "->%" PRId64 " ir3=%u [%s] regs=%u stp=%u ldp=%u pvt=%u"
+                " (total %u parts %.1f ms)",
+                _mesa_shader_stage_to_abbrev(st), dt / 1e6, why ? " FAIL: " : "",
+                why ? why : "", probe[0], probe[1], probe[3], probe[4], instrs, sizes,
+                regs, stp, ldp, pvt, n, total / 1e6);
+   }
    if (!why) {
       struct tu_rt_partset *ins = tu_rt_partset_insert(dev, cache, ps);
       if (debug_get_bool_option("TU_RT_LINK_KEYDBG", false)) {
@@ -3974,10 +4019,6 @@ tu_rt_prebuild_parts(struct tu_device *dev, struct vk_pipeline_cache *cache,
       }
       tu_rt_partset_unref(dev, ins);
    }
-   if (tu_rt_log_enabled())
-      mesa_logi("tu-rt-prebuild: %s %.1f ms%s%s (total %u parts %.1f ms)",
-                _mesa_shader_stage_to_abbrev(st), dt / 1e6, why ? " FAIL: " : "",
-                why ? why : "", n, total / 1e6);
 }
 
 struct tu_rt_variant_job {
