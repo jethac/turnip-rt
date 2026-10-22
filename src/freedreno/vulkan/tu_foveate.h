@@ -49,7 +49,12 @@ struct tu_rt_fov_block {
    float gaze[2][2];
    float sbs;
    uint32_t max_lvl;
-   uint32_t pad[6];
+   uint32_t min_w;
+   uint32_t min_h;
+   float sbs_max;
+   float eye_min;
+   float eye_max;
+   uint32_t pad;
 };
 
 uint32_t tu_foveate_rt_mode(void);
