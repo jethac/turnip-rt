@@ -25,6 +25,7 @@
 #include "tu_device.h"
 #include "tu_shader.h"
 #include "tu_rt_prof.h"
+#include "tu_rt_funnel.h"
 #include "ir3/ir3_nir.h"
 
 static VkResult
@@ -531,7 +532,28 @@ struct tu_rt_compiler {
    bool nohit;
    int only_raygen;
    unsigned max_call_depth;
+
+   void *funnel_ctx;
+   struct hash_table *funnel_map;
 };
+
+static bool
+tu_rt_funnel_enabled(void)
+{
+   static const bool on = debug_get_bool_option("TU_RT_FUNNEL", false);
+   return on;
+}
+
+static const struct tu_rt_funnel_options *
+tu_rt_funnel_options(void)
+{
+   static const struct tu_rt_funnel_options opts = {
+      .max_stack_bytes = (unsigned) debug_get_num_option("TU_RT_FUNNEL_MAX_STACK", 1024),
+      .split_flags = debug_get_bool_option("TU_RT_FUNNEL_SPLIT_FLAGS", true),
+      .slots_in_regs = debug_get_bool_option("TU_RT_FUNNEL_REGS", false),
+   };
+   return &opts;
+}
 
 static void
 tu_rt_state_init(nir_shader *nir, struct tu_rt_state *s)
@@ -740,6 +762,30 @@ tu_rt_clone_stage(struct tu_rt_compiler *c, nir_shader *dst, nir_shader *stage)
    return function;
 }
 
+static nir_shader *
+tu_rt_funnel_stage(struct tu_rt_compiler *c, nir_shader *stage)
+{
+   struct hash_entry *e = _mesa_hash_table_search(c->funnel_map, stage);
+   if (e)
+      return (nir_shader *) e->data;
+
+   struct tu_rt_funnel_info info;
+   int64_t t0 = os_time_get_nano();
+   nir_shader *funneled =
+      tu_rt_funnel_raygen(stage, c->funnel_ctx, tu_rt_funnel_options(), &info);
+   if (tu_rt_log_enabled()) {
+      uint32_t handle = c->only_raygen >= 0 ? c->pipeline->groups[c->only_raygen].handle : 0;
+      mesa_logi("tu-rt: funnel handle=0x%x sites=%u classes=%u stack=%u nir=%u->%u %.1f ms %s",
+                handle, info.sites, info.classes, info.stack_bytes, info.instrs_before,
+                info.instrs_after, (os_time_get_nano() - t0) / 1e6,
+                funneled ? "ok" : info.fallback);
+   }
+   if (!funneled)
+      funneled = stage;
+   _mesa_hash_table_insert(c->funnel_map, stage, funneled);
+   return funneled;
+}
+
 static void
 tu_rt_call_stage(nir_builder *b, struct tu_rt_compiler *c, nir_shader *stage,
                  nir_def *arg, unsigned ray_depth, unsigned call_depth)
@@ -748,7 +794,12 @@ tu_rt_call_stage(nir_builder *b, struct tu_rt_compiler *c, nir_shader *stage,
                    (TU_RT_MAX_CALL_DEPTH + 1) + call_depth;
    nir_function *function = c->fn_cache[slot];
    if (!function) {
-      function = tu_rt_clone_stage(c, b->shader, stage);
+      nir_shader *src = stage;
+      if (c->funnel_ctx && stage->info.stage == MESA_SHADER_RAYGEN) {
+         src = tu_rt_funnel_stage(c, stage);
+         b->shader->scratch_size = MAX2(b->shader->scratch_size, src->scratch_size);
+      }
+      function = tu_rt_clone_stage(c, b->shader, src);
       tu_rt_set_ctx(c, function, stage->info.stage, ray_depth, call_depth);
       c->fn_cache[slot] = function;
    }
@@ -1611,6 +1662,10 @@ tu_rt_build_shader(struct tu_device *dev,
              sizeof(nir_function *));
    tu_rt_state_init(b->shader, &c.state);
    c.hit_words = tu_rt_hit_words_var(b->shader);
+   if (tu_rt_funnel_enabled()) {
+      c.funnel_ctx = ralloc_context(NULL);
+      c.funnel_map = _mesa_pointer_hash_table_create(c.funnel_ctx);
+   }
 
    for (uint32_t i = 0; i < pipeline->group_count; i++) {
       const struct tu_rt_group *g = pipeline->groups + i;
@@ -1754,6 +1809,7 @@ tu_rt_build_shader(struct tu_device *dev,
          ralloc_free(c.fn_ctx);
          free(c.fn_cache);
          free(c.isec_cache);
+         ralloc_free(c.funnel_ctx);
          ralloc_free(b->shader);
          return NULL;
       }
@@ -1786,6 +1842,7 @@ tu_rt_build_shader(struct tu_device *dev,
    ralloc_free(c.fn_ctx);
    free(c.fn_cache);
    free(c.isec_cache);
+   ralloc_free(c.funnel_ctx);
 
    nir_shader_gather_info(b->shader, nir_shader_get_entrypoint(b->shader));
 
@@ -2091,6 +2148,14 @@ tu_rt_pipeline_create(struct tu_device *dev,
       _mesa_blake3_update(&ctx, &hflags, sizeof(hflags));
       uint32_t depth = MIN2(create_info->maxPipelineRayRecursionDepth, 1);
       _mesa_blake3_update(&ctx, &depth, sizeof(depth));
+      if (tu_rt_funnel_enabled()) {
+         static const char funnel_tag[] = "tu-rt-funnel-1";
+         const struct tu_rt_funnel_options *fo = tu_rt_funnel_options();
+         _mesa_blake3_update(&ctx, funnel_tag, sizeof(funnel_tag));
+         _mesa_blake3_update(&ctx, &fo->max_stack_bytes, sizeof(fo->max_stack_bytes));
+         _mesa_blake3_update(&ctx, &fo->split_flags, sizeof(fo->split_flags));
+         _mesa_blake3_update(&ctx, &fo->slots_in_regs, sizeof(fo->slots_in_regs));
+      }
       static const bool key_sort = debug_get_bool_option("TU_RT_KEY_SORT", false) && tu_rt_use_case_tree();
       uint32_t *key_order = (uint32_t *) malloc(MAX2(pipeline->group_count, 1) * sizeof(uint32_t));
       if (!key_order) {
