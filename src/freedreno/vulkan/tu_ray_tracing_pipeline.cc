@@ -3684,10 +3684,29 @@ struct tu_rt_link_ctx {
 
    int64_t t_rg, t_callee, t_trav, t_link, t_link_max;
    std::atomic<int64_t> a_rg, a_callee, a_trav, a_link, a_link_max, a_glue;
+   std::atomic<int64_t> a_link_tcpu, a_link_tcpu_max;
    std::atomic<uint32_t> n_rg_built, n_callee_built, n_trav_built;
    int64_t probe[6];
    std::atomic<int64_t> probe_acc[8];
 };
+
+static int64_t
+tu_rt_thread_cpu_ns(void)
+{
+   struct timespec ts;
+   if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts))
+      return 0;
+   return (int64_t) ts.tv_sec * 1000000000ll + ts.tv_nsec;
+}
+
+static void
+tu_rt_note_tcpu(struct tu_rt_link_ctx *lc, int64_t dt)
+{
+   lc->a_link_tcpu.fetch_add(dt);
+   int64_t prev = lc->a_link_tcpu_max.load();
+   while (dt > prev && !lc->a_link_tcpu_max.compare_exchange_weak(prev, dt))
+      ;
+}
 
 static void
 tu_rt_link_note_fail(struct tu_rt_link_ctx *lc, const char *why)
@@ -3934,6 +3953,7 @@ tu_rt_link_variant_job(void *data, uint32_t v)
    if (lc->fail_count.load() || p->variants[v].shader)
       return;
    int64_t t0 = os_time_get_nano();
+   int64_t c0 = tu_rt_thread_cpu_ns();
 
    const struct tu_rt_partset *rg = lc->rg_sets[v];
    uint32_t nblobs = rg->nparts;
@@ -3984,6 +4004,7 @@ tu_rt_link_variant_job(void *data, uint32_t v)
    int64_t prev = lc->a_link_max.load();
    while (dt > prev && !lc->a_link_max.compare_exchange_weak(prev, dt))
       ;
+   tu_rt_note_tcpu(lc, tu_rt_thread_cpu_ns() - c0);
    if (why) {
       tu_rt_link_note_fail(lc, why);
       return;
@@ -3999,6 +4020,7 @@ tu_rt_link_all_job(void *data, uint32_t unused)
    if (lc->fail_count.load() || p->variants[0].shader)
       return;
    int64_t t0 = os_time_get_nano();
+   int64_t c0 = tu_rt_thread_cpu_ns();
    const uint32_t nrg = lc->nraygens;
    uint32_t total = 0;
    for (uint32_t r = 0; r < nrg; r++)
@@ -4051,6 +4073,7 @@ tu_rt_link_all_job(void *data, uint32_t unused)
    int64_t dt = os_time_get_nano() - t0;
    lc->a_link.fetch_add(dt);
    lc->a_link_max.store(dt);
+   tu_rt_note_tcpu(lc, tu_rt_thread_cpu_ns() - c0);
    if (why) {
       tu_rt_link_note_fail(lc, why);
       return;
@@ -4194,6 +4217,8 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       lc->a_trav.store(0);
       lc->a_link.store(0);
       lc->a_link_max.store(0);
+      lc->a_link_tcpu.store(0);
+      lc->a_link_tcpu_max.store(0);
       lc->a_glue.store(0);
       lc->n_rg_built.store(0);
       lc->n_callee_built.store(0);
@@ -4307,7 +4332,7 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          mesa_logi("tu-rt-link: %s %u variants (%u to link) stages=%u groups=%u classes=%u "
                    "callees=%u | rg parts built=%u %.1f ms cpu, callee built=%u %.1f ms cpu, "
                    "trav built=%u %.1f ms cpu, link %.1f ms cpu (glue nir %.1f, max %.2f ms) | wall rg=%.1f "
-                   "callee+trav=%.1f link=%.1f ms%s%s",
+                   "callee+trav=%.1f link=%.1f ms | link thread cpu %.1f ms (max %.2f ms)%s%s",
                    whole ? "whole" : "force", count, missing, pipeline->stage_count,
                    pipeline->group_count, lc->nclasses, lc->ncallee,
                    lc->n_rg_built.load(), lc->a_rg.load() / 1e6,
@@ -4315,6 +4340,7 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
                    lc->n_trav_built.load(), lc->a_trav.load() / 1e6,
                    lc->a_link.load() / 1e6, lc->a_glue.load() / 1e6, lc->a_link_max.load() / 1e6,
                    (t1 - t0) / 1e6, (t2 - t1) / 1e6, (t3 - t2) / 1e6,
+                   lc->a_link_tcpu.load() / 1e6, lc->a_link_tcpu_max.load() / 1e6,
                    fail ? " FAIL: " : "", fail ? fail : "");
          mesa_logi("tu-rt-link: cumulative host lower %.1f ms, host create %.1f ms",
                    tu_rt_link_lower_ns.load() / 1e6, tu_rt_link_create_ns.load() / 1e6);
