@@ -1089,6 +1089,29 @@ tu_rt_max_preinline(void)
    return max_instrs;
 }
 
+static bool
+tu_rt_lite_opt(void)
+{
+   static const bool on = debug_get_bool_option("TU_RT_LITE_OPT", false);
+   return on;
+}
+
+static void
+tu_rt_hash_knobs(struct mesa_blake3 *h)
+{
+   const uint64_t knobs[] = {
+      tu_rt_hit_budget(),
+      tu_rt_max_preinline(),
+      tu_rt_use_case_tree(),
+      TU_RT_MAX_CALL_DEPTH,
+   };
+   _mesa_blake3_update(h, knobs, sizeof(knobs));
+   if (tu_rt_lite_opt()) {
+      static const char lite[] = "lite-opt-1";
+      _mesa_blake3_update(h, lite, sizeof(lite));
+   }
+}
+
 template <typename F>
 static void
 tu_rt_emit_case_chain(nir_builder *b, nir_def *handle, const struct tu_rt_case *cases,
@@ -2144,8 +2167,20 @@ tu_rt_build_shader(struct tu_device *dev,
    tu_rt_times_mark(TU_RT_PH_RQ);
 
    tu_rt_prof_mark("pre-optloop", b->shader);
-   struct ir3_optimize_options optimize_options = {};
-   ir3_optimize_loop(dev->compiler, &optimize_options, b->shader);
+   if (tu_rt_lite_opt()) {
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, b->shader, nir_opt_copy_prop);
+         NIR_PASS(progress, b->shader, nir_opt_dce);
+         NIR_PASS(progress, b->shader, nir_opt_dead_cf);
+         NIR_PASS(progress, b->shader, nir_opt_if, nir_opt_if_optimize_phi_true_false);
+         NIR_PASS(progress, b->shader, nir_opt_constant_folding);
+      } while (progress);
+   } else {
+      struct ir3_optimize_options optimize_options = {};
+      ir3_optimize_loop(dev->compiler, &optimize_options, b->shader);
+   }
    tu_rt_prof_mark("post-optloop", b->shader);
    tu_rt_times_mark(TU_RT_PH_OPT);
 
@@ -2517,13 +2552,7 @@ tu_rt_ca_variant_keys(struct tu_ray_tracing_pipeline *pipeline,
       _mesa_blake3_update(&h, &hflags, sizeof(hflags));
       uint32_t depth = MIN2(create_info->maxPipelineRayRecursionDepth, 1);
       _mesa_blake3_update(&h, &depth, sizeof(depth));
-      const uint64_t knobs[] = {
-         tu_rt_hit_budget(),
-         tu_rt_max_preinline(),
-         tu_rt_use_case_tree(),
-         TU_RT_MAX_CALL_DEPTH,
-      };
-      _mesa_blake3_update(&h, knobs, sizeof(knobs));
+      tu_rt_hash_knobs(&h);
       _mesa_blake3_final(&h, common);
    }
 
@@ -2983,13 +3012,7 @@ tu_rt_pipeline_create(struct tu_device *dev,
       _mesa_blake3_update(&ctx, &hflags, sizeof(hflags));
       uint32_t depth = MIN2(create_info->maxPipelineRayRecursionDepth, 1);
       _mesa_blake3_update(&ctx, &depth, sizeof(depth));
-      const uint64_t knobs[] = {
-         tu_rt_hit_budget(),
-         tu_rt_max_preinline(),
-         tu_rt_use_case_tree(),
-         TU_RT_MAX_CALL_DEPTH,
-      };
-      _mesa_blake3_update(&ctx, knobs, sizeof(knobs));
+      tu_rt_hash_knobs(&ctx);
       static const bool key_sort = debug_get_bool_option("TU_RT_KEY_SORT", true) && tu_rt_use_case_tree();
       uint32_t *key_order = (uint32_t *) malloc(MAX2(pipeline->group_count, 1) * sizeof(uint32_t));
       if (!key_order) {
