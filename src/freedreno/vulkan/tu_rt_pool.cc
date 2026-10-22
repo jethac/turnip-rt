@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstring>
 #include <malloc.h>
 #include <mutex>
 #include <pthread.h>
@@ -179,23 +180,69 @@ tu_rt_pool_may_start(struct tu_rt_pool *pool)
    return false;
 }
 
-static bool
-tu_rt_pool_fair(void)
+enum {
+   TU_RT_SCHED_SRPT,
+   TU_RT_SCHED_FAIR,
+   TU_RT_SCHED_LARGEST,
+};
+
+static int
+tu_rt_pool_sched_init(void)
 {
-   static const bool on = debug_get_bool_option("TU_RT_POOL_FAIR", false);
-   return on;
+   const char *v = debug_get_option("TU_RT_POOL_SCHED", NULL);
+   if (v && !strcmp(v, "fair"))
+      return TU_RT_SCHED_FAIR;
+   if (v && !strcmp(v, "largest"))
+      return TU_RT_SCHED_LARGEST;
+   if (!v && debug_get_bool_option("TU_RT_POOL_FAIR", false))
+      return TU_RT_SCHED_FAIR;
+   return TU_RT_SCHED_SRPT;
+}
+
+static int
+tu_rt_pool_sched(void)
+{
+   static const int sched = tu_rt_pool_sched_init();
+   return sched;
+}
+
+static void
+tu_rt_task_count_locked(struct tu_rt_task *t, bool on)
+{
+   if (on == t->counted)
+      return;
+   t->counted = on;
+   if (on)
+      t->batch->left += t->cost;
+   else
+      t->batch->left -= t->cost;
+}
+
+static uint64_t
+tu_rt_task_rank(const struct tu_rt_task *t)
+{
+   uint64_t r = t->batch->left;
+   const struct tu_rt_pool_entry *e = (const struct tu_rt_pool_entry *) t->entry;
+   if (e)
+      for (const struct tu_rt_task *w : e->waiters)
+         r = MIN2(r, w->batch->left);
+   return r;
 }
 
 static struct tu_rt_task *
-tu_rt_pool_pop_fair_locked(struct tu_rt_pool *pool)
+tu_rt_pool_pop_scan_locked(struct tu_rt_pool *pool)
 {
+   const bool fair = tu_rt_pool_sched() == TU_RT_SCHED_FAIR;
    struct tu_rt_task *best = NULL;
+   uint64_t best_rank = 0;
    for (struct tu_rt_task *t : pool->heap) {
       if (t->state != TU_RT_TASK_PENDING)
          continue;
-      if (!best || t->batch->running < best->batch->running ||
-          (t->batch->running == best->batch->running && tu_rt_task_less(best, t)))
+      const uint64_t rank = fair ? t->batch->running : tu_rt_task_rank(t);
+      if (!best || rank < best_rank || (rank == best_rank && tu_rt_task_less(best, t))) {
          best = t;
+         best_rank = rank;
+      }
    }
    return best;
 }
@@ -203,8 +250,8 @@ tu_rt_pool_pop_fair_locked(struct tu_rt_pool *pool)
 static struct tu_rt_task *
 tu_rt_pool_pop_locked(struct tu_rt_pool *pool)
 {
-   if (tu_rt_pool_fair())
-      return tu_rt_pool_pop_fair_locked(pool);
+   if (tu_rt_pool_sched() != TU_RT_SCHED_LARGEST)
+      return tu_rt_pool_pop_scan_locked(pool);
    while (!pool->heap.empty()) {
       std::pop_heap(pool->heap.begin(), pool->heap.end(), tu_rt_task_less);
       struct tu_rt_task *t = pool->heap.back();
@@ -228,6 +275,7 @@ static void
 tu_rt_pool_push_locked(struct tu_rt_pool *pool, struct tu_rt_task *t)
 {
    t->state = TU_RT_TASK_PENDING;
+   tu_rt_task_count_locked(t, true);
    pool->heap.push_back(t);
    std::push_heap(pool->heap.begin(), pool->heap.end(), tu_rt_task_less);
 }
@@ -264,6 +312,7 @@ tu_rt_pool_complete_locked(struct tu_device *dev, struct tu_rt_pool *pool,
 {
    t->state = TU_RT_TASK_DONE;
    t->batch->remaining--;
+   tu_rt_task_count_locked(t, false);
    tu_rt_by_rg_remove_locked(pool, t);
    const bool failed = t->result != VK_SUCCESS || !t->shader;
    if (t->ckey && !failed && tu_rt_superset_mode() >= 1) {
@@ -522,6 +571,7 @@ tu_rt_pool_retarget_locked(struct tu_rt_pool *pool, struct tu_rt_task *sup)
       delete ue;
       u->entry = se;
       u->state = TU_RT_TASK_WAITING;
+      tu_rt_task_count_locked(u, false);
       u->coalesced = true;
       se->waiters.push_back(u);
       u->batch->retargeted++;
@@ -545,6 +595,7 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
    batch->retargeted = 0;
    batch->helped = 0;
    batch->fallback = 0;
+   batch->left = 0;
    batch->wait_ns = 0;
    for (uint32_t i = 0; i < batch->count; i++) {
       struct tu_rt_task *t = batch->tasks + i;
@@ -556,6 +607,7 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
       t->result = VK_SUCCESS;
       t->coalesced = false;
       t->ran = false;
+      t->counted = false;
       if (!t->key || tu_rt_superset_mode() <= 0)
          t->ckey = NULL;
       if (t->key) {
@@ -585,7 +637,7 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
 
    while (batch->remaining) {
       struct tu_rt_task *t = NULL;
-      if (tu_rt_pool_may_start(pool))
+      if (!batch->running || tu_rt_pool_may_start(pool))
          t = tu_rt_pool_pick_own_locked(pool, batch);
       if (t) {
          tu_rt_pool_execute(dev, pool, lk, t);

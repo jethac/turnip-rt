@@ -25,6 +25,7 @@ struct tu_rt_task {
    uint32_t have_count;
    bool coalesced;
    bool ran;
+   bool counted;
 
    struct tu_shader *shader;
    VkResult result;
@@ -50,6 +51,7 @@ struct tu_rt_batch {
    uint32_t retargeted;
    uint32_t helped;
    uint32_t fallback;
+   uint64_t left;
    int64_t wait_ns;
 };
 
