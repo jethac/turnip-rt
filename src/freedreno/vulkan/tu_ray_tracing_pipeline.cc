@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <atomic>
 #include <malloc.h>
+#include <time.h>
 #include "vk_pipeline.h"
 #include "vk_shader_module.h"
 
@@ -67,6 +68,13 @@ tu_rt_group_key_cmp(const void *a, const void *b, void *data)
       }
    }
    return 0;
+}
+
+static bool
+tu_rt_log_enabled(void)
+{
+   static const bool on = debug_get_bool_option("TU_RT_LOG", false);
+   return on;
 }
 
 static bool
@@ -1815,12 +1823,16 @@ tu_rt_variant_worker(void *data)
       struct tu_rt_variant *var = job->pipeline->variants + v;
       if (var->shader)
          continue;
+      int64_t t0 = os_time_get_nano();
+      struct timespec c0, c1;
+      clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
       nir_shader *nir = tu_rt_build_shader(job->dev, job->pipeline, job->create_info,
                                            job->flags, (int) job->groups[v]);
       if (!nir) {
          job->result.store(VK_ERROR_OUT_OF_HOST_MEMORY);
          continue;
       }
+      int64_t t1 = os_time_get_nano();
       struct tu_shader *shader = NULL;
       VkResult r = tu_compute_shader_compile(job->dev, job->layout, job->cache, nir,
                                              job->key, job->hashes + v * BLAKE3_KEY_LEN,
@@ -1830,6 +1842,14 @@ tu_rt_variant_worker(void *data)
          continue;
       }
       var->shader = shader;
+      if (tu_rt_log_enabled()) {
+         clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+         int64_t t2 = os_time_get_nano();
+         double cpu = (c1.tv_sec - c0.tv_sec) * 1e3 + (c1.tv_nsec - c0.tv_nsec) / 1e6;
+         mesa_logi("tu-rt: vtime %u handle=0x%x build=%.1f compile=%.1f cpu=%.1f ms instrs=%u",
+                   v, var->handle, (t1 - t0) / 1e6, (t2 - t1) / 1e6, cpu,
+                   shader->variant->info.instrs_count);
+      }
    }
    return NULL;
 }
