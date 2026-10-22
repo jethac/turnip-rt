@@ -2364,23 +2364,66 @@ tu_rt_variant_worker(void *data)
    return NULL;
 }
 
-static struct tu_shader *
-tu_rt_alias_shader(struct tu_device *dev, struct vk_pipeline_cache *cache,
-                   struct tu_shader *shader, const unsigned char *key)
+static void
+tu_rt_ss_alias_key(const unsigned char *key, const std::vector<uint64_t> &have,
+                   unsigned char *out)
 {
-   if (!shader || !cache)
+   static const char tag[] = "tu-rt-ss-alias-1";
+   struct mesa_blake3 h;
+   _mesa_blake3_init(&h);
+   _mesa_blake3_update(&h, tag, sizeof(tag));
+   _mesa_blake3_update(&h, key, BLAKE3_KEY_LEN);
+   const uint32_t policy = tu_rt_superset_policy();
+   _mesa_blake3_update(&h, &policy, sizeof(policy));
+   const uint32_t n = have.size();
+   _mesa_blake3_update(&h, &n, sizeof(n));
+   _mesa_blake3_update(&h, have.data(), n * sizeof(uint64_t));
+   _mesa_blake3_final(&h, out);
+}
+
+static struct tu_shader *
+tu_rt_ss_publish(struct tu_device *dev, struct vk_pipeline_cache *cache,
+                 struct tu_shader *shader, const unsigned char *akey)
+{
+   if (!shader || !cache || shader->base.key_size != BLAKE3_KEY_LEN)
       return shader;
-   struct blob b;
-   blob_init(&b);
-   struct vk_pipeline_cache_object *obj = NULL;
-   if (shader->base.ops->serialize(&shader->base, &b) && !b.out_of_memory)
-      obj = vk_pipeline_cache_create_and_insert_object(cache, key, BLAKE3_KEY_LEN,
-                                                       b.data, b.size, shader->base.ops);
-   blob_finish(&b);
+   struct tu_shader *own =
+      tu_compute_pipeline_cache_lookup(dev, cache, (const unsigned char *) shader->base.key_data);
+   if (own) {
+      vk_pipeline_cache_object_unref(&dev->vk, &shader->base);
+      shader = own;
+   } else {
+      struct vk_pipeline_cache_object *obj = vk_pipeline_cache_add_object(cache, &shader->base);
+      shader = container_of(obj, struct tu_shader, base);
+   }
+   struct vk_raw_data_cache_object *alias =
+      vk_raw_data_cache_object_create(&dev->vk, akey, BLAKE3_KEY_LEN,
+                                      shader->base.key_data, BLAKE3_KEY_LEN);
+   if (alias) {
+      struct vk_pipeline_cache_object *obj = vk_pipeline_cache_add_object(cache, &alias->base);
+      vk_pipeline_cache_object_unref(&dev->vk, obj);
+   }
+   return shader;
+}
+
+static struct tu_shader *
+tu_rt_ss_lookup(struct tu_device *dev, struct vk_pipeline_cache *cache,
+                const unsigned char *akey)
+{
+   cache = cache ? cache : dev->mem_cache;
+   struct vk_pipeline_cache_object *obj =
+      vk_pipeline_cache_lookup_object(cache, akey, BLAKE3_KEY_LEN,
+                                      &vk_raw_data_cache_object_ops, NULL);
    if (!obj)
-      return shader;
-   vk_pipeline_cache_object_unref(&dev->vk, &shader->base);
-   return container_of(obj, struct tu_shader, base);
+      return NULL;
+   struct vk_raw_data_cache_object *alias =
+      container_of(obj, struct vk_raw_data_cache_object, base);
+   struct tu_shader *shader = NULL;
+   if (alias->data_size == BLAKE3_KEY_LEN)
+      shader = tu_compute_pipeline_cache_lookup(dev, cache,
+                                                (const unsigned char *) alias->data);
+   vk_pipeline_cache_object_unref(&dev->vk, obj);
+   return shader;
 }
 
 static VkResult
@@ -2542,7 +2585,7 @@ tu_rt_ca_variant_keys(struct tu_ray_tracing_pipeline *pipeline,
 
    unsigned char common[BLAKE3_KEY_LEN];
    {
-      static const char version[] = "tu-rt-var-2";
+      static const char version[] = "tu-rt-var-3";
       struct mesa_blake3 h;
       _mesa_blake3_init(&h);
       _mesa_blake3_update(&h, version, sizeof(version));
@@ -2652,6 +2695,7 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       std::sort(have.begin(), have.end());
       have.erase(std::unique(have.begin(), have.end()), have.end());
    }
+   uint32_t ss_hits = 0;
    for (uint32_t v = 0; v < count; v++) {
       const struct tu_rt_group *g = pipeline->groups + groups[v];
       pipeline->variants[v].handle = g->handle;
@@ -2675,9 +2719,17 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          mesa_logi("tu-key:  variant %u handle=%08x key=%s ca=%d env=%u", v, g->handle, hk,
                    classes ? (int) classes[v].ca : 0, classes ? classes[v].env_count : 0);
       }
-      if (!(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR))
+      if (!(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR)) {
          pipeline->variants[v].shader =
             tu_compute_pipeline_cache_lookup(dev, cache, hashes + v * BLAKE3_KEY_LEN);
+         if (!pipeline->variants[v].shader && ss && classes[v].ca && !classes[v].nohit &&
+             classes[v].need) {
+            unsigned char akey[BLAKE3_KEY_LEN];
+            tu_rt_ss_alias_key(hashes + v * BLAKE3_KEY_LEN, have, akey);
+            pipeline->variants[v].shader = tu_rt_ss_lookup(dev, cache, akey);
+            ss_hits += pipeline->variants[v].shader != NULL;
+         }
+      }
       if (!pipeline->variants[v].shader)
          missing++;
    }
@@ -2789,9 +2841,11 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
                   vk_pipeline_cache_object_unref(&dev->vk, &tasks[i].shader->base);
                continue;
             }
-            if (tasks[i].coalesced && can_cache)
-               tasks[i].shader = tu_rt_alias_shader(dev, batch.cache, tasks[i].shader,
-                                                    hashes + pool_map[i] * BLAKE3_KEY_LEN);
+            if (tasks[i].coalesced && can_cache) {
+               unsigned char akey[BLAKE3_KEY_LEN];
+               tu_rt_ss_alias_key(hashes + pool_map[i] * BLAKE3_KEY_LEN, have, akey);
+               tasks[i].shader = tu_rt_ss_publish(dev, batch.cache, tasks[i].shader, akey);
+            }
             pipeline->variants[pool_map[i]].shader = tasks[i].shader;
          }
          pipeline->compiled = missing - batch.deduped - batch.coalesced - batch.retargeted -
@@ -2821,9 +2875,9 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
             len += snprintf(ph + len, sizeof(ph) - len, " %s=%.2f",
                             tu_rt_phase_name((enum tu_rt_phase) k), job.phase_ns[k].load() / 1e9);
          mesa_logi("tu-rt: vtime-sum pipe=%u compiled=%u pool deduped=%u coalesced=%u retargeted=%u "
-                   "helped=%u late_hits=%u wait=%.1fms wall=%.1fms cpu=%.2f/%.2fs thread-s:%s",
+                   "ss_hits=%u helped=%u late_hits=%u wait=%.1fms wall=%.1fms cpu=%.2f/%.2fs thread-s:%s",
                    pipeline->id, missing, batch.deduped, batch.coalesced, batch.retargeted,
-                   batch.helped, job.late_hits.load(),
+                   ss_hits, batch.helped, job.late_hits.load(),
                    batch.wait_ns / 1e6, (t_end - t_pool) / 1e6,
                    job.cpu_ns[0].load() / 1e9, job.cpu_ns[1].load() / 1e9, ph);
       } else if (tu_rt_log_level() >= 1) {
@@ -2855,8 +2909,8 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          instrs += pipeline->variants[v].shader->variant->info.instrs_count;
          max_regs = MAX2(max_regs, pipeline->variants[v].shader->variant->info.max_reg + 1u);
       }
-      mesa_logi("tu-rt: %u raygen variants (%u compiled) total instrs=%" PRIu64 " max regs=%u ca=%u missed=%u",
-                count, pipeline->compiled, instrs, max_regs, pipeline->ca_variants, missing);
+      mesa_logi("tu-rt: %u raygen variants (%u compiled) total instrs=%" PRIu64 " max regs=%u ca=%u missed=%u ss_hits=%u",
+                count, pipeline->compiled, instrs, max_regs, pipeline->ca_variants, missing, ss_hits);
    }
    return VK_SUCCESS;
 }

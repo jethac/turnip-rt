@@ -53,6 +53,7 @@ struct tu_rt_batch {
 
 bool tu_rt_pool_enabled(void);
 int tu_rt_superset_mode(void);
+uint32_t tu_rt_superset_policy(void);
 void tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch);
 void tu_rt_pool_finish(struct tu_device *dev);
 

@@ -81,12 +81,24 @@ tu_rt_superset_mode(void)
    return mode;
 }
 
+static uint32_t
+tu_rt_superset_ratio_pct(void)
+{
+   static const uint32_t pct =
+      (uint32_t) debug_get_num_option("TU_RT_SUPERSET_RATIO_PCT", 125);
+   return pct;
+}
+
 static double
 tu_rt_superset_ratio(void)
 {
-   static const double r =
-      debug_get_num_option("TU_RT_SUPERSET_RATIO_PCT", 125) / 100.0;
-   return r;
+   return tu_rt_superset_ratio_pct() / 100.0;
+}
+
+uint32_t
+tu_rt_superset_policy(void)
+{
+   return tu_rt_superset_mode() >= 2 ? 0 : tu_rt_superset_ratio_pct();
 }
 
 static bool
