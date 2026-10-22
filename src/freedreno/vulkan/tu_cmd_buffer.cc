@@ -10260,6 +10260,17 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
 }
 TU_GENX(tu_CmdDispatchIndirect);
 
+static_assert(sizeof(VkTraceRaysIndirectCommand2KHR) <= TU_RT_FOV_CMD_OFFSET,
+              "fov block overlaps the trace rays command");
+static_assert(sizeof(struct tu_rt_fov_block) == TU_RT_FOV_CMD_SIZE,
+              "fov block size");
+
+static uint32_t
+tu_rt_fov_mode(struct tu_device *dev)
+{
+   return dev->physical_device->info->chip >= 7 ? tu_foveate_rt_mode() : 0;
+}
+
 template <chip CHIP>
 static void
 tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
@@ -10295,14 +10306,25 @@ tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
    struct tu_cs *cs = &cmd->cs;
    struct tu_dispatch_info info = {};
    info.rt_cmd = rt_cmd_iova;
+   const uint32_t fov_mode = CHIP >= A7XX ? tu_rt_fov_mode(cmd->device) : 0;
 
    if (dims) {
       if (!dims[0] || !dims[1] || !dims[2])
          return;
-      info.unaligned = true;
-      info.blocks[0] = dims[0];
-      info.blocks[1] = dims[1];
-      info.blocks[2] = dims[2];
+      if (fov_mode && dims[1] == 1) {
+         info.blocks[0] = DIV_ROUND_UP(dims[0], 64);
+         info.blocks[1] = 1;
+         info.blocks[2] = dims[2];
+      } else if (fov_mode & TU_RT_FOV_SHARE) {
+         info.blocks[0] = DIV_ROUND_UP(dims[0], 8);
+         info.blocks[1] = DIV_ROUND_UP(dims[1], 8);
+         info.blocks[2] = dims[2];
+      } else {
+         info.unaligned = true;
+         info.blocks[0] = dims[0];
+         info.blocks[1] = dims[1];
+         info.blocks[2] = dims[2];
+      }
    } else {
       tu_emit_cache_flush<CHIP>(cmd);
       struct tu_cs_memory grp;
@@ -10331,6 +10353,28 @@ tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
             });
          }
          cs->reg_to_mem(grp.iova + 4 * k, tu_scratch_reg<CHIP>(0));
+      }
+      if (fov_mode) {
+         cs->mem_to_reg(tu_scratch_reg<CHIP>(0), dims_iova + 4,
+                        { .one_reg_wr = true, .wait_cache_flush = true });
+         tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+         tu_cond_exec_start_imm(cs,
+            CP_COND_REG_EXEC_0_MODE(REG_COMPARE_IMM) |
+            CP_COND_REG_EXEC_0_REG0(tu_scratch_reg<CHIP>(0).reg), 1);
+         cs->mem_to_reg(tu_scratch_reg<CHIP>(0), dims_iova,
+                        { .one_reg_wr = true, .wait_cache_flush = true });
+         cs->rmw(tu_scratch_reg<CHIP>(0), {
+            .src1_add = true,
+            .src0 = 0xffffffff,
+            .src1 = 63,
+         });
+         cs->rmw(tu_scratch_reg<CHIP>(0), {
+            .rotate = 26,
+            .src0 = ~63u,
+            .src1 = 0,
+         });
+         cs->reg_to_mem(grp.iova, tu_scratch_reg<CHIP>(0));
+         tu_cond_exec_end(cs);
       }
       tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
       info.indirect = grp.iova;
@@ -10429,10 +10473,11 @@ tu_rt_cmd_alloc(struct tu_cmd_buffer *cmd,
       .height = height,
       .depth = depth,
    };
+   const bool fov = tu_rt_fov_mode(cmd->device) != 0;
+   const uint32_t size = fov ? TU_RT_FOV_CMD_OFFSET + TU_RT_FOV_CMD_SIZE : sizeof(rt_cmd);
    if (writeable)
       tu_cs_set_writeable(&cmd->sub_cs, true);
-   VkResult result = tu_cs_alloc(&cmd->sub_cs,
-                                 DIV_ROUND_UP(sizeof(rt_cmd), 16), 4, mem);
+   VkResult result = tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(size, 16), 4, mem);
    if (writeable)
       tu_cs_set_writeable(&cmd->sub_cs, false);
    if (result != VK_SUCCESS) {
@@ -10440,6 +10485,11 @@ tu_rt_cmd_alloc(struct tu_cmd_buffer *cmd,
       return false;
    }
    memcpy(mem->map, &rt_cmd, sizeof(rt_cmd));
+   if (fov) {
+      struct tu_rt_fov_block blk;
+      tu_foveate_rt_fill(cmd->device, &blk);
+      memcpy((uint8_t *) mem->map + TU_RT_FOV_CMD_OFFSET, &blk, sizeof(blk));
+   }
    return true;
 }
 
@@ -10506,6 +10556,26 @@ tu_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
                             VkDeviceAddress indirectDeviceAddress)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+   if (CHIP >= A7XX && tu_rt_fov_mode(cmd->device)) {
+      if (!cmd->state.rt_pipeline || !cmd->state.rt_pipeline->shaders[MESA_SHADER_COMPUTE])
+         return;
+      const VkStridedDeviceAddressRegionKHR none = {};
+      struct tu_cs_memory mem;
+      if (!tu_rt_cmd_alloc(cmd, &none, &none, &none, &none, 0, 0, 0, true, &mem))
+         return;
+      struct tu_cs *cs = &cmd->cs;
+      tu_emit_cache_flush<CHIP>(cmd);
+      tu_cs_emit_pkt7(cs, CP_MEMCPY, 5);
+      tu_cs_emit(cs, sizeof(VkTraceRaysIndirectCommand2KHR) / sizeof(uint32_t));
+      tu_cs_emit_qw(cs, indirectDeviceAddress);
+      tu_cs_emit_qw(cs, mem.iova);
+      tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+      tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
+      tu_trace_rays<CHIP>(cmd, mem.iova, NULL,
+                          indirectDeviceAddress +
+                          offsetof(VkTraceRaysIndirectCommand2KHR, width), 0);
+      return;
+   }
    tu_trace_rays<CHIP>(cmd, indirectDeviceAddress, NULL,
                        indirectDeviceAddress +
                        offsetof(VkTraceRaysIndirectCommand2KHR, width), 0);

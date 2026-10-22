@@ -26,6 +26,7 @@
 #include "tu_device.h"
 #include "tu_shader.h"
 #include "tu_rt_prof.h"
+#include "tu_foveate.h"
 #include "ir3/ir3_nir.h"
 #include "bvh/tu_bvh_defines.h"
 
@@ -557,7 +558,15 @@ struct tu_rt_compiler {
    bool nohit;
    int only_raygen;
    unsigned max_call_depth;
+   uint32_t fov_mode;
+   nir_variable *fov_sel;
 };
+
+static uint32_t
+tu_rt_fov_mode(struct tu_device *dev)
+{
+   return dev->physical_device->info->chip >= 7 ? tu_foveate_rt_mode() : 0;
+}
 
 static void
 tu_rt_state_init(nir_shader *nir, struct tu_rt_state *s)
@@ -1153,6 +1162,150 @@ static void tu_rt_traversal_tail(nir_builder *b, struct tu_rt_compiler *c,
                                  nir_def *committed_hit_kind,
                                  const struct tu_rt_ray *r);
 
+static nir_def *
+tu_rt_fov_launch_id(nir_builder *b, struct tu_rt_compiler *c)
+{
+   nir_def *size = tu_rt_load_cmd(b, offsetof(VkTraceRaysIndirectCommand2KHR, width), 3);
+   nir_def *wg = nir_load_workgroup_id(b);
+   nir_def *li = nir_load_local_invocation_index(b);
+   nir_def *id1d = nir_vec3(b, nir_iadd(b, nir_ishl_imm(b, nir_channel(b, wg, 0), 6), li),
+                            nir_imm_int(b, 0), nir_channel(b, wg, 2));
+   nir_def *id2d;
+   if (c->fov_mode & TU_RT_FOV_SHARE) {
+      nir_def *lx = nir_ior(b, nir_iand_imm(b, li, 1),
+                            nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, li, 1), 2),
+                                    nir_iand_imm(b, nir_ushr_imm(b, li, 2), 4)));
+      nir_def *ly = nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, li, 1), 1),
+                            nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, li, 2), 2),
+                                    nir_iand_imm(b, nir_ushr_imm(b, li, 3), 4)));
+      id2d = nir_vec3(b, nir_iadd(b, nir_ishl_imm(b, nir_channel(b, wg, 0), 3), lx),
+                      nir_iadd(b, nir_ishl_imm(b, nir_channel(b, wg, 1), 3), ly),
+                      nir_channel(b, wg, 2));
+   } else {
+      id2d = nir_load_global_invocation_id(b, 32);
+   }
+   return nir_bcsel(b, nir_ieq_imm(b, nir_channel(b, size, 1), 1), id1d, id2d);
+}
+
+struct tu_rt_fov_site {
+   nir_def *off;
+   nir_def *take[4];
+};
+
+static nir_def *
+tu_rt_fov_level(nir_builder *b, struct tu_rt_compiler *c)
+{
+   nir_def *size = tu_rt_load_cmd(b, offsetof(VkTraceRaysIndirectCommand2KHR, width), 3);
+   nir_def *p0 = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET, 4);
+   nir_def *gz = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET + 16, 4);
+   nir_def *p2 = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET + 32, 2);
+   nir_def *id = tu_rt_fov_launch_id(b, c);
+
+   nir_def *w = nir_u2f32(b, nir_channel(b, size, 0));
+   nir_def *h = nir_u2f32(b, nir_channel(b, size, 1));
+   nir_def *sbs = nir_fge(b, w, nir_fmul(b, nir_channel(b, p2, 0), h));
+   nir_def *ew = nir_bcsel(b, sbs, nir_fmul_imm(b, w, 0.5), w);
+   nir_def *px = nir_fadd_imm(b, nir_u2f32(b, nir_channel(b, id, 0)), 0.5);
+   nir_def *py = nir_fadd_imm(b, nir_u2f32(b, nir_channel(b, id, 1)), 0.5);
+   nir_def *eye1 = nir_iand(b, sbs, nir_fge(b, px, ew));
+   nir_def *ex0 = nir_bcsel(b, eye1, ew, nir_imm_float(b, 0.0f));
+   nir_def *gx = nir_bcsel(b, eye1, nir_channel(b, gz, 2), nir_channel(b, gz, 0));
+   nir_def *gy = nir_bcsel(b, eye1, nir_channel(b, gz, 3), nir_channel(b, gz, 1));
+   nir_def *dx = nir_fsub(b, px, nir_fadd(b, nir_fmul(b, gx, ew), ex0));
+   nir_def *dy = nir_fsub(b, py, nir_fmul(b, gy, h));
+   nir_def *d2 = nir_fadd(b, nir_fmul(b, dx, dx), nir_fmul(b, dy, dy));
+   nir_def *rr0 = nir_fmul(b, nir_channel(b, p0, 2), h);
+   nir_def *rr1 = nir_fmul(b, nir_channel(b, p0, 3), h);
+   nir_def *lvl2d =
+      nir_bcsel(b, nir_fge(b, d2, nir_fmul(b, rr1, rr1)), nir_imm_int(b, 4),
+                nir_bcsel(b, nir_fge(b, d2, nir_fmul(b, rr0, rr0)), nir_imm_int(b, 2),
+                          nir_imm_int(b, 0)));
+   lvl2d = nir_umin(b, lvl2d, nir_channel(b, p2, 1));
+   nir_def *lvl = nir_bcsel(b, nir_ieq_imm(b, nir_channel(b, size, 1), 1),
+                            nir_channel(b, p0, 1), lvl2d);
+   return nir_bcsel(b, nir_ine_imm(b, nir_channel(b, p0, 0), 0), lvl, nir_imm_int(b, 0));
+}
+
+static nir_def *
+tu_rt_fov_select(nir_builder *b, nir_def *lvl)
+{
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *word0 = nir_ieq_imm(b, nir_ushr_imm(b, lane, 5), 0);
+   nir_def *sh = nir_iand_imm(b, lane, 31);
+   nir_def *sel = nir_imm_int(b, 0);
+   for (unsigned k = 1; k <= 4; k++) {
+      nir_def *bal = nir_ballot(b, 2, 32, nir_uge_imm(b, lvl, k));
+      nir_def *bits = nir_bcsel(b, word0, nir_channel(b, bal, 0), nir_channel(b, bal, 1));
+      const unsigned bs = 1u << k;
+      const uint32_t m = (1u << bs) - 1;
+      nir_def *base = nir_iand_imm(b, sh, ~(bs - 1) & 31);
+      nir_def *full = nir_ieq_imm(b, nir_iand_imm(b, nir_ushr(b, bits, base), m), m);
+      sel = nir_bcsel(b, full, nir_imm_int(b, k), sel);
+   }
+   return sel;
+}
+
+static void
+tu_rt_fov_begin(nir_builder *b, struct tu_rt_compiler *c, struct tu_rt_fov_site *fs)
+{
+   nir_def *sel = nir_load_var(b, c->fov_sel);
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *bs = nir_ishl(b, nir_imm_int(b, 1), sel);
+   nir_def *act = nir_ballot(b, 2, 32, nir_imm_true(b));
+   nir_def *bits = nir_bcsel(b, nir_ieq_imm(b, nir_ushr_imm(b, lane, 5), 0),
+                             nir_channel(b, act, 0), nir_channel(b, act, 1));
+   nir_def *base = nir_iand(b, nir_iand_imm(b, lane, 31), nir_inot(b, nir_iadd_imm(b, bs, -1)));
+   nir_def *m = nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), bs), -1);
+   nir_def *full = nir_ieq(b, nir_iand(b, nir_ushr(b, bits, base), m), m);
+   fs->off = nir_bcsel(b, full, nir_iand(b, lane, nir_iadd_imm(b, bs, -1)), nir_imm_int(b, 0));
+}
+
+static nir_def *
+tu_rt_fov_bcast_val(nir_builder *b, nir_def *v, const struct tu_rt_fov_site *fs)
+{
+   const unsigned bits = v->bit_size;
+   nir_def *x;
+   if (bits == 1)
+      x = nir_b2i32(b, v);
+   else if (bits < 32)
+      x = nir_u2u32(b, v);
+   else if (bits == 64)
+      x = nir_bitcast_vector(b, v, 32);
+   else
+      x = v;
+   for (unsigned i = 0; i < 4; i++) {
+      nir_def *t = nir_shuffle_xor(b, x, nir_imm_int(b, 1u << i));
+      x = nir_bcsel(b, fs->take[i], t, x);
+   }
+   if (bits == 1)
+      return nir_ine_imm(b, x, 0);
+   if (bits < 32)
+      return nir_u2uN(b, x, bits);
+   if (bits == 64)
+      return nir_bitcast_vector(b, x, 64);
+   return x;
+}
+
+static void
+tu_rt_fov_bcast_deref(nir_builder *b, nir_deref_instr *d, const struct tu_rt_fov_site *fs)
+{
+   const struct glsl_type *t = d->type;
+   if (glsl_type_is_vector_or_scalar(t)) {
+      nir_def *v = nir_load_deref(b, d);
+      nir_store_deref(b, d, tu_rt_fov_bcast_val(b, v, fs),
+                      nir_component_mask(v->num_components));
+   } else if (glsl_type_is_struct_or_ifc(t)) {
+      for (unsigned i = 0; i < glsl_get_length(t); i++)
+         tu_rt_fov_bcast_deref(b, nir_build_deref_struct(b, d, i), fs);
+   } else if (glsl_type_is_matrix(t)) {
+      for (unsigned i = 0; i < glsl_get_matrix_columns(t); i++)
+         tu_rt_fov_bcast_deref(b, nir_build_deref_array_imm(b, d, i), fs);
+   } else if (glsl_type_is_array(t)) {
+      for (unsigned i = 0; i < glsl_get_length(t); i++)
+         tu_rt_fov_bcast_deref(b, nir_build_deref_array_imm(b, d, i), fs);
+   }
+}
+
 static void
 tu_rt_trace_ray_emit(nir_builder *b, struct tu_rt_compiler *c,
                      const struct tu_rt_ray *r)
@@ -1173,6 +1326,13 @@ tu_rt_trace_ray_emit(nir_builder *b, struct tu_rt_compiler *c,
    nir_def *tmax = r->tmax;
    nir_def *payload = r->payload;
    const unsigned cd = tu_rt_ctx(c, b->impl->function)->call_depth;
+
+   struct tu_rt_fov_site fov_site = {};
+   const bool fov = (c->fov_mode & TU_RT_FOV_SHARE) && nir_def_is_deref(payload);
+   if (fov) {
+      tu_rt_fov_begin(b, c, &fov_site);
+      nir_push_if(b, nir_ieq_imm(b, fov_site.off, 0));
+   }
 
    nir_store_var(b, s->flags, flags, 0x1);
    nir_store_var(b, s->cull_mask, cull_mask, 0x1);
@@ -1406,6 +1566,15 @@ tu_rt_trace_ray_emit(nir_builder *b, struct tu_rt_compiler *c,
       tu_rt_dispatch_recursive(b, c, miss.value, MESA_SHADER_MISS, payload, 1, cd);
    }
    nir_pop_if(b, NULL);
+
+   if (fov) {
+      nir_pop_if(b, NULL);
+      nir_push_if(b, nir_vote_any(b, 1, nir_ine_imm(b, fov_site.off, 0)));
+      for (unsigned i = 0; i < 4; i++)
+         fov_site.take[i] = nir_ine_imm(b, nir_iand_imm(b, fov_site.off, 1u << i), 0);
+      tu_rt_fov_bcast_deref(b, nir_def_as_deref(payload), &fov_site);
+      nir_pop_if(b, NULL);
+   }
 }
 
 static void
@@ -1835,7 +2004,7 @@ tu_rt_lower_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_load_ray_launch_id:
       if (c->part != TU_RT_PART_NONE)
          return false;
-      def = nir_load_global_invocation_id(b, 32);
+      def = c->fov_mode ? tu_rt_fov_launch_id(b, c) : nir_load_global_invocation_id(b, 32);
       break;
    case nir_intrinsic_load_ray_launch_size:
       def = tu_rt_load_cmd(b, offsetof(VkTraceRaysIndirectCommand2KHR, width), 3);
@@ -2049,6 +2218,7 @@ tu_rt_build_shader(struct tu_device *dev,
    c.flags = flags;
    c.only_raygen = only_raygen;
    c.part = part;
+   c.fov_mode = tu_rt_fov_mode(dev);
    c.fn_ctx = _mesa_pointer_hash_table_create(NULL);
    c.fn_cache = (nir_function **)
       calloc(MAX2(pipeline->stage_count, 1) * 2 * (TU_RT_MAX_CALL_DEPTH + 1),
@@ -2175,6 +2345,11 @@ tu_rt_build_shader(struct tu_device *dev,
    nir_push_if(b, oob);
    nir_jump(b, nir_jump_return);
    nir_pop_if(b, NULL);
+
+   if (c.fov_mode & TU_RT_FOV_SHARE) {
+      c.fov_sel = nir_variable_create(b->shader, nir_var_shader_temp, glsl_uint_type(), "fov_sel");
+      nir_store_var(b, c.fov_sel, tu_rt_fov_select(b, tu_rt_fov_level(b, &c)), 0x1);
+   }
 
    struct tu_rt_sbt_entry raygen = tu_rt_load_sbt_entry(
       b, NULL, offsetof(VkTraceRaysIndirectCommand2KHR, raygenShaderRecordAddress));
@@ -4754,6 +4929,12 @@ tu_rt_pipeline_create(struct tu_device *dev,
       _mesa_blake3_update(&ctx, &hflags, sizeof(hflags));
       uint32_t depth = MIN2(create_info->maxPipelineRayRecursionDepth, 1);
       _mesa_blake3_update(&ctx, &depth, sizeof(depth));
+      const uint32_t fov_mode = tu_rt_fov_mode(dev);
+      if (fov_mode) {
+         static const char fov_tag[] = "tu-rt-fov-1";
+         _mesa_blake3_update(&ctx, fov_tag, sizeof(fov_tag));
+         _mesa_blake3_update(&ctx, &fov_mode, sizeof(fov_mode));
+      }
       static const bool key_sort = debug_get_bool_option("TU_RT_KEY_SORT", false) && tu_rt_use_case_tree();
       uint32_t *key_order = (uint32_t *) malloc(MAX2(pipeline->group_count, 1) * sizeof(uint32_t));
       if (!key_order) {
