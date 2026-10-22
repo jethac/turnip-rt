@@ -38,6 +38,7 @@
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
 #include "tu_dynamic_rendering.h"
+#include "tu_free_log.h"
 #include "tu_image.h"
 #include "tu_pass.h"
 #include "tu_query_pool.h"
@@ -2963,6 +2964,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       return result;
    }
 
+   tu_free_log_device_init();
+
    device->vk.command_buffer_ops = &tu_cmd_buffer_ops;
    device->vk.as_build_ops = &tu_as_build_ops;
    device->vk.check_status = tu_device_check_status;
@@ -3400,6 +3403,7 @@ fail_queues:
 #endif
    tu_device_destroy_mutexes(device);
    tu_drm_device_finish(device);
+   tu_free_log_device_finish();
    vk_device_finish(&device->vk);
    vk_free(&device->vk.alloc, device);
    return result;
@@ -3520,6 +3524,7 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    _mesa_hash_table_destroy(device->bo_sizes, NULL);
    vk_free(&device->vk.alloc, device->submit_bo_list);
    util_dynarray_fini(&device->dump_bo_list);
+   tu_free_log_device_finish();
    vk_device_finish(&device->vk);
    vk_free(&device->vk.alloc, device);
 }
@@ -4006,6 +4011,9 @@ tu_FreeMemory(VkDevice _device,
    TU_RMV(resource_destroy, device, mem);
 
    tu_memory_emit_report(device, mem, /* alloc_info */ NULL, VK_SUCCESS);
+
+   if (unlikely(tu_free_log_on))
+      tu_free_log_free_memory(mem, mem->iova, mem->size, mem->bo, mem->lazy);
 
    _tu_destroy_memory(device, mem);
 

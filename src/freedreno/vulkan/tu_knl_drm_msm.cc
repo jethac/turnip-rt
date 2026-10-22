@@ -22,6 +22,7 @@
 #include "tu_cs.h"
 #include "tu_device.h"
 #include "tu_dynamic_rendering.h"
+#include "tu_free_log.h"
 #include "tu_knl.h"
 #include "tu_knl_drm.h"
 #include "tu_queue.h"
@@ -704,6 +705,8 @@ msm_bo_init(struct tu_device *dev,
          lazy_vma->msm.backs_lazy_bo = true;
          bo->lazy = true;
       }
+      if (unlikely(tu_free_log_on))
+         tu_free_log_bo_alloc(bo, flags, name);
    } else {
       if (!lazy_vma)
          tu_free_iova(dev, iova, size);
@@ -798,6 +801,8 @@ msm_bo_init_dmabuf(struct tu_device *dev,
       memset(bo, 0, sizeof(*bo));
    } else {
       *out_bo = bo;
+      if (unlikely(tu_free_log_on))
+         tu_free_log_bo_alloc(bo, flags, "dmabuf");
    }
 
 out_unlock:
@@ -878,6 +883,9 @@ msm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
       return;
    }
 
+   if (unlikely(tu_free_log_on))
+      tu_free_log_bo_free(bo);
+
    tu_debug_bos_del(dev, bo);
    tu_dump_bo_del(dev, bo);
 
@@ -929,6 +937,9 @@ msm_sparse_vma_init(struct tu_device *dev,
    if (result != VK_SUCCESS)
       return result;
 
+   if (unlikely(tu_free_log_on))
+      tu_free_log_vma("vma_alloc", out_vma->msm.iova, size, flags);
+
    if (flags & TU_SPARSE_VMA_MAP_ZERO) {
       assert(dev->physical_device->has_vm_bind);
       result = tu_map_vm_bind(dev, MSM_VM_BIND_OP_MAP_NULL, 0,
@@ -944,6 +955,10 @@ static void
 msm_sparse_vma_finish(struct tu_device *dev,
                       struct tu_sparse_vma *vma)
 {
+   if (unlikely(tu_free_log_on))
+      tu_free_log_vma("vma_free", vma->msm.iova, vma->msm.size,
+                      vma->msm.backs_lazy_bo);
+
    if (dev->physical_device->has_vm_bind) {
       tu_map_vm_bind(dev, MSM_VM_BIND_OP_UNMAP, 0, vma->msm.iova, 0, 0,
                      vma->msm.size);

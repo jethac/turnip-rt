@@ -13,6 +13,7 @@
 #include "vk_debug_utils.h"
 
 #include "tu_device.h"
+#include "tu_free_log.h"
 #include "tu_rmv.h"
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -98,6 +99,11 @@ tu_DestroyBuffer(VkDevice _device,
 
    if (!buffer)
       return;
+
+   if (unlikely(tu_free_log_on))
+      tu_free_log_destroy_buffer(
+         buffer, buffer->vk.device_address, buffer->vk.size,
+         buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT);
 
    TU_RMV(buffer_destroy, device, buffer);
 
