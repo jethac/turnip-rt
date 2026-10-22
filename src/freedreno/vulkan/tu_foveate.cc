@@ -356,9 +356,9 @@ tu_foveate_log(uint64_t frame)
 }
 
 static void
-tu_foveate_gaze(struct tu_cmd_buffer *cmd, unsigned eye, float *gx, float *gy)
+tu_foveate_gaze_dev(struct tu_device *dev, unsigned eye, float *gx, float *gy)
 {
-   uint64_t frame = tu_foveate_frame(cmd->device);
+   uint64_t frame = tu_foveate_frame(dev);
    simple_mtx_lock(&latch_mtx);
    if (latch.key != frame) {
       if (latch.key != UINT64_MAX)
@@ -374,6 +374,73 @@ tu_foveate_gaze(struct tu_cmd_buffer *cmd, unsigned eye, float *gx, float *gy)
    *gx = latch.uv[eye & 1][0];
    *gy = latch.uv[eye & 1][1];
    simple_mtx_unlock(&latch_mtx);
+}
+
+static void
+tu_foveate_gaze(struct tu_cmd_buffer *cmd, unsigned eye, float *gx, float *gy)
+{
+   tu_foveate_gaze_dev(cmd->device, eye, gx, gy);
+}
+
+struct tu_rt_fov_cfg {
+   uint32_t mode;
+   uint32_t lvl_1d;
+   uint32_t max_lvl;
+   float r0, r1;
+   float sbs;
+};
+
+static struct tu_rt_fov_cfg rt_cfg;
+
+static void
+tu_foveate_rt_init_once(void)
+{
+   tu_foveate_init();
+   uint32_t mode = 0;
+   if (debug_get_bool_option("TU_RT_PACK1D", false))
+      mode |= TU_RT_FOV_PACK1D;
+   if (debug_get_bool_option("TU_FOVEATE_RT", false))
+      mode |= TU_RT_FOV_PACK1D | TU_RT_FOV_SHARE;
+   rt_cfg.mode = mode;
+   uint32_t run = debug_get_num_option("TU_FOVEATE_RT_1D", 1);
+   rt_cfg.lvl_1d = run >= 16 ? 4 : run >= 8 ? 3 : run >= 4 ? 2 : run >= 2 ? 1 : 0;
+   rt_cfg.max_lvl = MIN2(debug_get_num_option("TU_FOVEATE_RT_MAX", 4), 4);
+   rt_cfg.r0 = env_f("TU_FOVEATE_RT_R0", cfg.r0);
+   rt_cfg.r1 = env_f("TU_FOVEATE_RT_R1", cfg.r1);
+   rt_cfg.sbs = env_f("TU_FOVEATE_RT_SBS", cfg.sbs_min);
+   if (mode)
+      mesa_logi("tu-foveate-rt: mode=0x%x r0=%.3f r1=%.3f max_lvl=%u lvl_1d=%u sbs=%.2f gaze=%d fixed=%.3f,%.3f",
+                mode, rt_cfg.r0, rt_cfg.r1, rt_cfg.max_lvl, rt_cfg.lvl_1d, rt_cfg.sbs,
+                cfg.src, cfg.fixed_x, cfg.fixed_y);
+}
+
+static void
+tu_foveate_rt_init(void)
+{
+   static once_flag once = ONCE_FLAG_INIT;
+   call_once(&once, tu_foveate_rt_init_once);
+}
+
+uint32_t
+tu_foveate_rt_mode(void)
+{
+   tu_foveate_rt_init();
+   return rt_cfg.mode;
+}
+
+void
+tu_foveate_rt_fill(struct tu_device *dev, struct tu_rt_fov_block *blk)
+{
+   tu_foveate_rt_init();
+   memset(blk, 0, sizeof(*blk));
+   blk->enable = (rt_cfg.mode & TU_RT_FOV_SHARE) ? 1 : 0;
+   blk->lvl_1d = rt_cfg.lvl_1d;
+   blk->r0 = rt_cfg.r0;
+   blk->r1 = rt_cfg.r1;
+   blk->sbs = rt_cfg.sbs;
+   blk->max_lvl = rt_cfg.max_lvl;
+   for (unsigned e = 0; e < 2; e++)
+      tu_foveate_gaze_dev(dev, e, &blk->gaze[e][0], &blk->gaze[e][1]);
 }
 
 uint32_t
