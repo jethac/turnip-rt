@@ -17,6 +17,7 @@
 #include "nir/nir_serialize.h"
 #include <pthread.h>
 #include <atomic>
+#include <algorithm>
 #include <malloc.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -1985,6 +1986,107 @@ tu_rt_build_shader(struct tu_device *dev,
    return b->shader;
 }
 
+#define TU_RT_PSIZE_NONE UINT32_MAX
+
+struct tu_rt_stage_sum {
+   uint32_t instrs;
+   uint32_t used;
+   uint32_t psize;
+   uint32_t n_sites;
+   uint32_t n_calls;
+   uint32_t *site_psize;
+};
+
+static uint32_t
+tu_rt_def_psize(nir_def *arg)
+{
+   if (!nir_def_is_deref(arg))
+      return TU_RT_PSIZE_NONE;
+   unsigned size, al;
+   glsl_get_natural_size_align_bytes(nir_def_as_deref(arg)->type, &size, &al);
+   return size;
+}
+
+static void
+tu_rt_summarize_stage(nir_shader *nir, struct tu_rt_stage_sum *sum, void *mem_ctx)
+{
+   memset(sum, 0, sizeof(*sum));
+   sum->psize = TU_RT_PSIZE_NONE;
+   nir_foreach_variable_with_modes (var, nir, nir_var_shader_call_data) {
+      unsigned size, al;
+      glsl_get_natural_size_align_bytes(var->type, &size, &al);
+      sum->psize = size;
+      break;
+   }
+   sum->used = tu_rt_scan_used(nir);
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            sum->instrs++;
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            sum->n_sites += op == nir_intrinsic_trace_ray;
+            sum->n_calls += op == nir_intrinsic_execute_callable;
+         }
+      }
+   }
+   sum->site_psize = ralloc_array(mem_ctx, uint32_t, MAX2(sum->n_sites, 1));
+   unsigned k = 0;
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_trace_ray)
+               sum->site_psize[k++] = tu_rt_def_psize(intr->src[10].ssa);
+         }
+      }
+   }
+}
+
+static bool
+tu_rt_sum_compatible(const struct tu_rt_stage_sum *callee, uint32_t site_psize)
+{
+   return site_psize == TU_RT_PSIZE_NONE || callee->psize == TU_RT_PSIZE_NONE ||
+          callee->psize == site_psize;
+}
+
+static uint64_t
+tu_rt_predict_variant(const struct tu_ray_tracing_pipeline *pipeline,
+                      const struct tu_rt_stage_sum *sums, uint32_t group)
+{
+   const struct tu_rt_stage_sum *rg = sums + pipeline->groups[group].recursive_index;
+   uint64_t n = rg->instrs;
+   for (uint32_t s = 0; s < rg->n_sites; s++) {
+      for (uint32_t i = 0; i < pipeline->group_count; i++) {
+         const struct tu_rt_group *g = pipeline->groups + i;
+         if (g->isec_index != VK_SHADER_UNUSED_KHR) {
+            n += sums[g->isec_index].instrs;
+            if (g->ahit_index != VK_SHADER_UNUSED_KHR)
+               n += sums[g->ahit_index].instrs;
+         } else if (g->ahit_index != VK_SHADER_UNUSED_KHR &&
+                    tu_rt_sum_compatible(sums + g->ahit_index, rg->site_psize[s])) {
+            n += sums[g->ahit_index].instrs;
+         }
+         if (g->recursive_index != VK_SHADER_UNUSED_KHR &&
+             pipeline->stage_types[g->recursive_index] != MESA_SHADER_RAYGEN &&
+             pipeline->stage_types[g->recursive_index] != MESA_SHADER_CALLABLE &&
+             tu_rt_sum_compatible(sums + g->recursive_index, rg->site_psize[s]))
+            n += sums[g->recursive_index].instrs;
+      }
+   }
+   return n;
+}
+
+static bool
+tu_rt_largest_first(void)
+{
+   static const bool on = debug_get_bool_option("TU_RT_LARGEST_FIRST", false);
+   return on;
+}
+
 struct tu_rt_variant_job {
    struct tu_device *dev;
    struct tu_ray_tracing_pipeline *pipeline;
@@ -1995,6 +2097,8 @@ struct tu_rt_variant_job {
    const struct tu_shader_key *key;
    const uint32_t *groups;
    const unsigned char *hashes;
+   const uint32_t *order;
+   const uint64_t *predicted;
    uint32_t count;
    std::atomic<uint32_t> next;
    std::atomic<int> result;
@@ -2031,6 +2135,8 @@ tu_rt_variant_worker(void *data)
       uint32_t v = job->next.fetch_add(1);
       if (v >= job->count)
          break;
+      if (job->order)
+         v = job->order[v];
       struct tu_rt_variant *var = job->pipeline->variants + v;
       if (var->shader)
          continue;
@@ -2078,10 +2184,10 @@ tu_rt_variant_worker(void *data)
          }
          struct mallinfo2 mi = mallinfo2();
          mesa_logi("tu-rt: vtime pipe=%u v=%u/%u handle=%08x ms=%.1f build=%.1f compile=%.1f "
-                   "cpu=%.1f/%.1f%s nir=%u instrs=%u heap=%zuM tid=%d",
+                   "cpu=%.1f/%.1f%s pred=%" PRIu64 " nir=%u instrs=%u heap=%zuM tid=%d",
                    job->pipeline->id, v, job->count, var->handle, (t2 - t0) / 1e6,
                    (t1 - t0) / 1e6, (t2 - t1) / 1e6, (c1 - c0) / 1e6, (c2 - c1) / 1e6,
-                   ph, nir_instrs,
+                   ph, job->predicted ? job->predicted[v] : 0, nir_instrs,
                    shader->variant->info.instrs_count, (mi.uordblks + mi.hblkhd) >> 20,
                    (int) syscall(SYS_gettid));
       }
@@ -2148,6 +2254,29 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
       job.key = key;
       job.groups = groups;
       job.hashes = hashes;
+      job.order = NULL;
+      job.predicted = NULL;
+      uint32_t *order = NULL;
+      uint64_t *predicted = NULL;
+      if (tu_rt_largest_first() || tu_rt_log_level() >= 1) {
+         struct tu_rt_stage_sum *sums = rzalloc_array(nir_ctx, struct tu_rt_stage_sum,
+                                                      MAX2(pipeline->stage_count, 1));
+         for (uint32_t i = 0; i < pipeline->stage_count; i++)
+            tu_rt_summarize_stage(pipeline->stages[i], sums + i, nir_ctx);
+         predicted = rzalloc_array(nir_ctx, uint64_t, count);
+         for (uint32_t v = 0; v < count; v++)
+            predicted[v] = tu_rt_predict_variant(pipeline, sums, groups[v]);
+         job.predicted = predicted;
+      }
+      if (tu_rt_largest_first()) {
+         order = rzalloc_array(nir_ctx, uint32_t, count);
+         for (uint32_t v = 0; v < count; v++)
+            order[v] = v;
+         std::stable_sort(order, order + count, [&](uint32_t a, uint32_t b) {
+            return predicted[a] > predicted[b];
+         });
+         job.order = order;
+      }
       job.count = count;
       job.next.store(0);
       job.result.store(VK_SUCCESS);
