@@ -184,7 +184,7 @@ tu_rt_pool_complete_locked(struct tu_device *dev, struct tu_rt_pool *pool,
    t->state = TU_RT_TASK_DONE;
    t->batch->remaining--;
    tu_rt_by_rg_remove_locked(pool, t);
-   if (t->ckey && t->shader && tu_rt_superset_mode() >= 2) {
+   if (t->ckey && t->shader && tu_rt_superset_mode() >= 1) {
       struct tu_rt_done_rec rec;
       rec.env.assign(t->env, t->env + t->env_count * BLAKE3_KEY_LEN);
       rec.ccost = t->ccost;
@@ -348,6 +348,28 @@ static bool
 tu_rt_pool_coalesce_locked(struct tu_rt_pool *pool, struct tu_rt_task *t)
 {
    const std::string ck = tu_rt_ckey(t);
+   auto dit = pool->done_by_rg.find(ck);
+   if (dit != pool->done_by_rg.end()) {
+      struct tu_rt_done_rec *best = NULL;
+      for (struct tu_rt_done_rec &rec : dit->second) {
+         if ((rec.need_sets & ~t->have_sets) || !tu_rt_cost_ok(t->ccost, rec.ccost) ||
+             !tu_rt_env_subset(t->env, t->env_count, rec.env.data(),
+                               rec.env.size() / BLAKE3_KEY_LEN))
+            continue;
+         if (!best || rec.ccost < best->ccost)
+            best = &rec;
+      }
+      if (best) {
+         vk_pipeline_cache_object_ref(&best->shader->base);
+         t->shader = best->shader;
+         t->result = VK_SUCCESS;
+         t->coalesced = true;
+         t->state = TU_RT_TASK_DONE;
+         t->batch->remaining--;
+         t->batch->coalesced++;
+         return true;
+      }
+   }
    auto it = pool->by_rg.find(ck);
    if (it != pool->by_rg.end()) {
       struct tu_rt_task *best = NULL;
@@ -367,25 +389,6 @@ tu_rt_pool_coalesce_locked(struct tu_rt_pool *pool, struct tu_rt_task *t)
          ((struct tu_rt_pool_entry *) best->entry)->waiters.push_back(t);
          t->batch->coalesced++;
          return true;
-      }
-   }
-   if (tu_rt_superset_mode() >= 2) {
-      auto dit = pool->done_by_rg.find(ck);
-      if (dit != pool->done_by_rg.end()) {
-         for (struct tu_rt_done_rec &rec : dit->second) {
-            if ((rec.need_sets & ~t->have_sets) ||
-                !tu_rt_env_subset(t->env, t->env_count, rec.env.data(),
-                                  rec.env.size() / BLAKE3_KEY_LEN))
-               continue;
-            vk_pipeline_cache_object_ref(&rec.shader->base);
-            t->shader = rec.shader;
-            t->result = VK_SUCCESS;
-            t->coalesced = true;
-            t->state = TU_RT_TASK_DONE;
-            t->batch->remaining--;
-            t->batch->coalesced++;
-            return true;
-         }
       }
    }
    return false;
