@@ -19,6 +19,7 @@
 #include <atomic>
 #include <algorithm>
 #include <malloc.h>
+#include <math.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -801,11 +802,22 @@ tu_rt_summarize_stage(nir_shader *nir, struct tu_rt_stage_sum *sum, void *mem_ct
       nir_foreach_block (block, impl) {
          nir_foreach_instr (instr, block) {
             sum->instrs++;
+            if (instr->type == nir_instr_type_deref) {
+               nir_deref_instr *d = nir_instr_as_deref(instr);
+               if (d->deref_type == nir_deref_type_var &&
+                   (d->var->data.mode & (nir_var_uniform | nir_var_image |
+                                         nir_var_mem_ubo | nir_var_mem_ssbo)))
+                  sum->set_mask |= 1u << MIN2(d->var->data.descriptor_set, 31u);
+               continue;
+            }
             if (instr->type != nir_instr_type_intrinsic)
                continue;
-            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            nir_intrinsic_op op = intr->intrinsic;
             sum->n_sites += op == nir_intrinsic_trace_ray;
             sum->n_calls += op == nir_intrinsic_execute_callable;
+            if (op == nir_intrinsic_vulkan_resource_index)
+               sum->set_mask |= 1u << MIN2(nir_intrinsic_desc_set(intr), 31u);
          }
       }
    }
@@ -1903,6 +1915,9 @@ struct tu_rt_class {
    uint32_t used;
    uint32_t env_count;
    uint64_t total;
+   uint8_t ckey[BLAKE3_KEY_LEN];
+   uint8_t *env_hashes;
+   uint32_t set_mask;
 };
 
 static nir_shader *
@@ -2307,6 +2322,25 @@ tu_rt_variant_worker(void *data)
    return NULL;
 }
 
+static struct tu_shader *
+tu_rt_alias_shader(struct tu_device *dev, struct vk_pipeline_cache *cache,
+                   struct tu_shader *shader, const unsigned char *key)
+{
+   if (!shader || !cache)
+      return shader;
+   struct blob b;
+   blob_init(&b);
+   struct vk_pipeline_cache_object *obj = NULL;
+   if (shader->base.ops->serialize(&shader->base, &b) && !b.out_of_memory)
+      obj = vk_pipeline_cache_create_and_insert_object(cache, key, BLAKE3_KEY_LEN,
+                                                       b.data, b.size, shader->base.ops);
+   blob_finish(&b);
+   if (!obj)
+      return shader;
+   vk_pipeline_cache_object_unref(&dev->vk, &shader->base);
+   return container_of(obj, struct tu_shader, base);
+}
+
 static VkResult
 tu_rt_pool_run_variant(struct tu_rt_batch *batch, uint32_t index, struct tu_shader **out)
 {
@@ -2389,10 +2423,12 @@ tu_rt_classify(const struct tu_ray_tracing_pipeline *pipeline,
    }
    uint64_t total = rs->instrs;
    uint32_t used_all = rs->used, used_miss = rs->used;
+   cls->set_mask = rs->set_mask;
    for (uint32_t i = 0; i < pipeline->stage_count; i++) {
       if (!stage_mark[i])
          continue;
       total += sums[i].instrs;
+      cls->set_mask |= sums[i].set_mask;
       used_all |= sums[i].used;
       if (stage_mark[i] & TU_RT_MARK_MISS)
          used_miss |= sums[i].used;
@@ -2452,6 +2488,18 @@ tu_rt_ca_variant_keys(struct tu_ray_tracing_pipeline *pipeline,
             collided[j] = 1;
    }
 
+   uint8_t *gh = ralloc_array(ctx, uint8_t, MAX2(gc, 1) * BLAKE3_KEY_LEN);
+   if (!gh) {
+      ralloc_free(ctx);
+      return;
+   }
+   for (uint32_t i = 0; i < gc; i++) {
+      struct mesa_blake3 h;
+      _mesa_blake3_init(&h);
+      tu_rt_hash_group(&h, pipeline, pipeline->groups + i);
+      _mesa_blake3_final(&h, gh + i * BLAKE3_KEY_LEN);
+   }
+
    unsigned char common[BLAKE3_KEY_LEN];
    {
       static const char version[] = "tu-rt-var-2";
@@ -2501,11 +2549,24 @@ tu_rt_ca_variant_keys(struct tu_ray_tracing_pipeline *pipeline,
       _mesa_blake3_init(&h);
       _mesa_blake3_update(&h, common, sizeof(common));
       tu_rt_hash_group(&h, pipeline, pipeline->groups + rg);
+      struct mesa_blake3 hc = h;
+      _mesa_blake3_final(&hc, cls.ckey);
       _mesa_blake3_update(&h, &m, sizeof(m));
       for (uint32_t k = 0; k < m; k++)
          tu_rt_hash_group(&h, pipeline, pipeline->groups + env[k]);
       _mesa_blake3_final(&h, hashes + v * BLAKE3_KEY_LEN);
       cls.env_count = m;
+      if (tu_rt_superset_mode() > 0) {
+         cls.env_hashes = ralloc_array(pipeline->mem_ctx, uint8_t, MAX2(m, 1) * BLAKE3_KEY_LEN);
+         if (cls.env_hashes) {
+            for (uint32_t k = 0; k < m; k++)
+               memcpy(cls.env_hashes + k * BLAKE3_KEY_LEN, gh + env[k] * BLAKE3_KEY_LEN,
+                      BLAKE3_KEY_LEN);
+            qsort(cls.env_hashes, m, BLAKE3_KEY_LEN, [](const void *a, const void *b) {
+               return memcmp(a, b, BLAKE3_KEY_LEN);
+            });
+         }
+      }
       classes[v] = cls;
    }
    ralloc_free(ctx);
@@ -2634,6 +2695,9 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          const bool can_cache =
             !(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
          uint32_t *pool_map = rzalloc_array(nir_ctx, uint32_t, missing);
+         uint32_t pipe_sets = 0;
+         for (uint32_t i = 0; pipeline->stage_sums && i < pipeline->stage_count; i++)
+            pipe_sets |= pipeline->stage_sums[i].set_mask;
          struct tu_rt_task *tasks = rzalloc_array(nir_ctx, struct tu_rt_task, missing);
          uint32_t n = 0;
          for (uint32_t v = 0; v < count; v++) {
@@ -2642,6 +2706,15 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
             pool_map[n] = v;
             tasks[n].key = can_cache ? hashes + v * BLAKE3_KEY_LEN : NULL;
             tasks[n].cost = predicted ? predicted[v] : 0;
+            if (classes && classes[v].ca && !classes[v].nohit && classes[v].env_hashes &&
+                tu_rt_superset_mode() > 0) {
+               tasks[n].need_sets = classes[v].set_mask;
+               tasks[n].have_sets = pipe_sets;
+               tasks[n].ckey = classes[v].ckey;
+               tasks[n].env = classes[v].env_hashes;
+               tasks[n].env_count = classes[v].env_count;
+               tasks[n].ccost = pow((double) MAX2(tasks[n].cost, 1), 1.56);
+            }
             n++;
          }
          job.pool_map = pool_map;
@@ -2660,9 +2733,13 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
                   vk_pipeline_cache_object_unref(&dev->vk, &tasks[i].shader->base);
                continue;
             }
+            if (tasks[i].coalesced && can_cache)
+               tasks[i].shader = tu_rt_alias_shader(dev, batch.cache, tasks[i].shader,
+                                                    hashes + pool_map[i] * BLAKE3_KEY_LEN);
             pipeline->variants[pool_map[i]].shader = tasks[i].shader;
          }
-         pipeline->compiled = missing - batch.deduped - job.late_hits.load();
+         pipeline->compiled = missing - batch.deduped - batch.coalesced - batch.retargeted -
+                              job.late_hits.load();
       } else {
          static const unsigned max_jobs = debug_get_num_option("TU_RT_JOBS", 4);
          unsigned nthreads = MIN2(MAX2(max_jobs, 1u), missing);
@@ -2687,9 +2764,10 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          for (unsigned k = 0; k < TU_RT_PH_COUNT; k++)
             len += snprintf(ph + len, sizeof(ph) - len, " %s=%.2f",
                             tu_rt_phase_name((enum tu_rt_phase) k), job.phase_ns[k].load() / 1e9);
-         mesa_logi("tu-rt: vtime-sum pipe=%u compiled=%u pool deduped=%u helped=%u late_hits=%u "
-                   "wait=%.1fms wall=%.1fms cpu=%.2f/%.2fs thread-s:%s",
-                   pipeline->id, missing, batch.deduped, batch.helped, job.late_hits.load(),
+         mesa_logi("tu-rt: vtime-sum pipe=%u compiled=%u pool deduped=%u coalesced=%u retargeted=%u "
+                   "helped=%u late_hits=%u wait=%.1fms wall=%.1fms cpu=%.2f/%.2fs thread-s:%s",
+                   pipeline->id, missing, batch.deduped, batch.coalesced, batch.retargeted,
+                   batch.helped, job.late_hits.load(),
                    batch.wait_ns / 1e6, (t_end - t_pool) / 1e6,
                    job.cpu_ns[0].load() / 1e9, job.cpu_ns[1].load() / 1e9, ph);
       } else if (tu_rt_log_level() >= 1) {

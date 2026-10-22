@@ -35,7 +35,16 @@ struct tu_rt_pool_entry {
    std::vector<struct tu_rt_task *> waiters;
 };
 
+struct tu_rt_done_rec {
+   std::vector<uint8_t> env;
+   double ccost;
+   uint32_t need_sets;
+   struct tu_shader *shader;
+};
+
 struct tu_rt_pool {
+   std::unordered_map<std::string, std::vector<struct tu_rt_task *>> by_rg;
+   std::unordered_map<std::string, std::vector<struct tu_rt_done_rec>> done_by_rg;
    std::mutex lock;
    std::condition_variable work_cv;
    std::condition_variable done_cv;
@@ -63,6 +72,65 @@ tu_rt_pool_enabled(void)
 {
    static const bool on = debug_get_bool_option("TU_RT_POOL", false);
    return on;
+}
+
+int
+tu_rt_superset_mode(void)
+{
+   static const int mode = (int) debug_get_num_option("TU_RT_SUPERSET", 0);
+   return mode;
+}
+
+static double
+tu_rt_superset_ratio(void)
+{
+   static const double r =
+      debug_get_num_option("TU_RT_SUPERSET_RATIO_PCT", 125) / 100.0;
+   return r;
+}
+
+static bool
+tu_rt_env_subset(const uint8_t *a, uint32_t na, const uint8_t *b, uint32_t nb)
+{
+   uint32_t j = 0;
+   for (uint32_t i = 0; i < na; i++) {
+      int c = 1;
+      while (j < nb && (c = memcmp(b + j * BLAKE3_KEY_LEN, a + i * BLAKE3_KEY_LEN,
+                                   BLAKE3_KEY_LEN)) < 0)
+         j++;
+      if (j == nb || c != 0)
+         return false;
+      j++;
+   }
+   return true;
+}
+
+static bool
+tu_rt_cost_ok(double sub, double sup)
+{
+   if (tu_rt_superset_mode() >= 2)
+      return true;
+   return sup <= sub * tu_rt_superset_ratio();
+}
+
+static std::string
+tu_rt_ckey(const struct tu_rt_task *t)
+{
+   return std::string((const char *) t->ckey, BLAKE3_KEY_LEN);
+}
+
+static void
+tu_rt_by_rg_remove_locked(struct tu_rt_pool *pool, struct tu_rt_task *t)
+{
+   if (!t->ckey)
+      return;
+   auto it = pool->by_rg.find(tu_rt_ckey(t));
+   if (it == pool->by_rg.end())
+      return;
+   auto &v = it->second;
+   v.erase(std::remove(v.begin(), v.end(), t), v.end());
+   if (v.empty())
+      pool->by_rg.erase(it);
 }
 
 static size_t
@@ -115,6 +183,16 @@ tu_rt_pool_complete_locked(struct tu_device *dev, struct tu_rt_pool *pool,
 {
    t->state = TU_RT_TASK_DONE;
    t->batch->remaining--;
+   tu_rt_by_rg_remove_locked(pool, t);
+   if (t->ckey && t->shader && tu_rt_superset_mode() >= 2) {
+      struct tu_rt_done_rec rec;
+      rec.env.assign(t->env, t->env + t->env_count * BLAKE3_KEY_LEN);
+      rec.ccost = t->ccost;
+      rec.need_sets = t->need_sets;
+      vk_pipeline_cache_object_ref(&t->shader->base);
+      rec.shader = t->shader;
+      pool->done_by_rg[tu_rt_ckey(t)].push_back(std::move(rec));
+   }
    struct tu_rt_pool_entry *e = (struct tu_rt_pool_entry *) t->entry;
    if (e) {
       for (struct tu_rt_task *w : e->waiters) {
@@ -122,7 +200,7 @@ tu_rt_pool_complete_locked(struct tu_device *dev, struct tu_rt_pool *pool,
          if (t->shader) {
             vk_pipeline_cache_object_ref(&t->shader->base);
             w->shader = t->shader;
-            if (w->batch->cache != t->batch->cache) {
+            if (!w->coalesced && w->batch->cache != t->batch->cache) {
                struct vk_pipeline_cache_object *obj =
                   vk_pipeline_cache_add_object(w->batch->cache, &t->shader->base);
                w->shader = container_of(obj, struct tu_shader, base);
@@ -235,6 +313,9 @@ tu_rt_pool_finish(struct tu_device *dev)
    pool->work_cv.notify_all();
    for (pthread_t th : pool->threads)
       pthread_join(th, NULL);
+   for (auto &kv : pool->done_by_rg)
+      for (struct tu_rt_done_rec &rec : kv.second)
+         vk_pipeline_cache_object_unref(&dev->vk, &rec.shader->base);
    delete pool;
    dev->rt_pool = NULL;
 }
@@ -263,6 +344,98 @@ tu_rt_pool_pick_own_locked(struct tu_rt_pool *pool, struct tu_rt_batch *batch)
    return best;
 }
 
+static bool
+tu_rt_pool_coalesce_locked(struct tu_rt_pool *pool, struct tu_rt_task *t)
+{
+   const std::string ck = tu_rt_ckey(t);
+   auto it = pool->by_rg.find(ck);
+   if (it != pool->by_rg.end()) {
+      struct tu_rt_task *best = NULL;
+      for (struct tu_rt_task *s : it->second) {
+         if (s == t || (s->state != TU_RT_TASK_PENDING && s->state != TU_RT_TASK_RUNNING) ||
+             !s->entry || !tu_rt_cost_ok(t->ccost, s->ccost) ||
+             (s->need_sets & ~t->have_sets) ||
+             !tu_rt_env_subset(t->env, t->env_count, s->env, s->env_count))
+            continue;
+         if (!best || s->ccost < best->ccost)
+            best = s;
+      }
+      if (best) {
+         t->state = TU_RT_TASK_WAITING;
+         t->coalesced = true;
+         t->entry = best->entry;
+         ((struct tu_rt_pool_entry *) best->entry)->waiters.push_back(t);
+         t->batch->coalesced++;
+         return true;
+      }
+   }
+   if (tu_rt_superset_mode() >= 2) {
+      auto dit = pool->done_by_rg.find(ck);
+      if (dit != pool->done_by_rg.end()) {
+         for (struct tu_rt_done_rec &rec : dit->second) {
+            if ((rec.need_sets & ~t->have_sets) ||
+                !tu_rt_env_subset(t->env, t->env_count, rec.env.data(),
+                                  rec.env.size() / BLAKE3_KEY_LEN))
+               continue;
+            vk_pipeline_cache_object_ref(&rec.shader->base);
+            t->shader = rec.shader;
+            t->result = VK_SUCCESS;
+            t->coalesced = true;
+            t->state = TU_RT_TASK_DONE;
+            t->batch->remaining--;
+            t->batch->coalesced++;
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+static void
+tu_rt_pool_retarget_locked(struct tu_rt_pool *pool, struct tu_rt_task *sup)
+{
+   auto it = pool->by_rg.find(tu_rt_ckey(sup));
+   if (it == pool->by_rg.end())
+      return;
+   std::vector<struct tu_rt_task *> moved;
+   for (struct tu_rt_task *u : it->second) {
+      if (u == sup || u->state != TU_RT_TASK_PENDING || !u->entry ||
+          (sup->need_sets & ~u->have_sets) ||
+          !tu_rt_env_subset(u->env, u->env_count, sup->env, sup->env_count))
+         continue;
+      struct tu_rt_pool_entry *ue = (struct tu_rt_pool_entry *) u->entry;
+      bool ok = tu_rt_cost_ok(u->ccost, sup->ccost);
+      for (struct tu_rt_task *w : ue->waiters)
+         ok = ok && !(sup->need_sets & ~w->have_sets) &&
+              (w->ccost <= 0 || tu_rt_cost_ok(w->ccost, sup->ccost));
+      if (!ok)
+         continue;
+      moved.push_back(u);
+   }
+   if (moved.empty())
+      return;
+   struct tu_rt_pool_entry *se = (struct tu_rt_pool_entry *) sup->entry;
+   for (struct tu_rt_task *u : moved) {
+      struct tu_rt_pool_entry *ue = (struct tu_rt_pool_entry *) u->entry;
+      for (struct tu_rt_task *w : ue->waiters) {
+         w->entry = se;
+         w->coalesced = true;
+         se->waiters.push_back(w);
+      }
+      pool->inflight.erase(std::string((const char *) u->key, BLAKE3_KEY_LEN));
+      delete ue;
+      u->entry = se;
+      u->state = TU_RT_TASK_WAITING;
+      u->coalesced = true;
+      se->waiters.push_back(u);
+      u->batch->retargeted++;
+   }
+   auto &v = it->second;
+   v.erase(std::remove_if(v.begin(), v.end(), [&](struct tu_rt_task *x) {
+              return std::find(moved.begin(), moved.end(), x) != moved.end();
+           }), v.end());
+}
+
 void
 tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
 {
@@ -271,6 +444,8 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
 
    batch->remaining = batch->count;
    batch->deduped = 0;
+   batch->coalesced = 0;
+   batch->retargeted = 0;
    batch->helped = 0;
    batch->wait_ns = 0;
    for (uint32_t i = 0; i < batch->count; i++) {
@@ -281,6 +456,9 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
       t->entry = NULL;
       t->shader = NULL;
       t->result = VK_SUCCESS;
+      t->coalesced = false;
+      if (!t->key || tu_rt_superset_mode() <= 0)
+         t->ckey = NULL;
       if (t->key) {
          std::string k((const char *) t->key, BLAKE3_KEY_LEN);
          auto it = pool->inflight.find(k);
@@ -291,10 +469,16 @@ tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch)
             batch->deduped++;
             continue;
          }
+         if (t->ckey && tu_rt_pool_coalesce_locked(pool, t))
+            continue;
          struct tu_rt_pool_entry *e = new tu_rt_pool_entry();
          e->owner = t;
          t->entry = e;
          pool->inflight.emplace(k, e);
+         if (t->ckey) {
+            tu_rt_pool_retarget_locked(pool, t);
+            pool->by_rg[tu_rt_ckey(t)].push_back(t);
+         }
       }
       t->state = TU_RT_TASK_PENDING;
       pool->heap.push_back(t);

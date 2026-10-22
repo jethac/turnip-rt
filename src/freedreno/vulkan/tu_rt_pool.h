@@ -15,6 +15,14 @@ struct tu_rt_task {
    const uint8_t *key;
    uint64_t cost;
 
+   const uint8_t *ckey;
+   const uint8_t *env;
+   uint32_t env_count;
+   double ccost;
+   uint32_t need_sets;
+   uint32_t have_sets;
+   bool coalesced;
+
    struct tu_shader *shader;
    VkResult result;
 
@@ -34,11 +42,14 @@ struct tu_rt_batch {
 
    uint32_t remaining;
    uint32_t deduped;
+   uint32_t coalesced;
+   uint32_t retargeted;
    uint32_t helped;
    int64_t wait_ns;
 };
 
 bool tu_rt_pool_enabled(void);
+int tu_rt_superset_mode(void);
 void tu_rt_pool_run(struct tu_device *dev, struct tu_rt_batch *batch);
 void tu_rt_pool_finish(struct tu_device *dev);
 
