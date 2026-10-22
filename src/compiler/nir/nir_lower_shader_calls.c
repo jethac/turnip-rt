@@ -1986,6 +1986,13 @@ nir_lower_shader_calls(nir_shader *shader,
    NIR_PASS(_, shader, nir_opt_sort_and_pack_stack,
             start_call_scratch, options->stack_alignment, num_calls);
 
+   if (options->keep_resumes_inline) {
+      NIR_PASS(_, shader, nir_lower_stack_to_scratch, options->address_format);
+      *resume_shaders_out = NULL;
+      *num_resume_shaders_out = 0;
+      return true;
+   }
+
    /* Make N copies of our shader */
    nir_shader **resume_shaders = ralloc_array(mem_ctx, nir_shader *, num_calls);
    for (unsigned i = 0; i < num_calls; i++) {

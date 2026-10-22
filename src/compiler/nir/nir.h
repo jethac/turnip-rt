@@ -6085,6 +6085,8 @@ typedef struct nir_lower_shader_calls_options {
 
    /* Data passed to should_remat_callback */
    void *should_remat_data;
+
+   bool keep_resumes_inline;
 } nir_lower_shader_calls_options;
 
 bool
