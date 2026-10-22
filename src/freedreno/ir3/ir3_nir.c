@@ -1466,6 +1466,47 @@ ir3_nir_set_threadsize(struct ir3_shader_variant *v, const nir_shader *s)
    }
 }
 
+static bool
+ir3_nir_localize_consts(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl (impl, nir) {
+      bool impl_progress = false;
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr_safe (instr, block) {
+            if (instr->type != nir_instr_type_load_const)
+               continue;
+            nir_load_const_instr *lc = nir_instr_as_load_const(instr);
+            nir_foreach_use_including_if_safe (src, &lc->def) {
+               nir_cursor cursor;
+               if (nir_src_is_if(src)) {
+                  cursor = nir_before_cf_node(&nir_src_use_if(src)->cf_node);
+               } else {
+                  nir_instr *user = nir_src_use_instr(src);
+                  if (user->type == nir_instr_type_phi) {
+                     nir_phi_src *ps = exec_node_data(nir_phi_src, src, src);
+                     cursor = nir_after_block_before_jump(ps->pred);
+                  } else {
+                     cursor = nir_before_instr(user);
+                  }
+               }
+               if (nir_cursor_current_block(cursor) == block)
+                  continue;
+               nir_load_const_instr *copy = nir_load_const_instr_create(
+                  nir, lc->def.num_components, lc->def.bit_size);
+               memcpy(copy->value, lc->value,
+                      sizeof(lc->value[0]) * lc->def.num_components);
+               nir_instr_insert(cursor, &copy->instr);
+               nir_src_rewrite(src, &copy->def);
+               impl_progress = true;
+            }
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 void
 ir3_nir_lower_variant(struct ir3_shader_variant *so,
                       const struct ir3_shader_nir_options *options,
@@ -1635,7 +1676,9 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
     * have to lower the preamble after UBO lowering so that UBO lowering can
     * insert instructions in the preamble to push UBOs.
     */
-   if (so->compiler->has_preamble &&
+   const bool rt_part = so->shader_options.rt_part;
+
+   if (so->compiler->has_preamble && !rt_part &&
        !(ir3_shader_debug & IR3_DBG_NOPREAMBLE))
       progress |= OPT(s, ir3_nir_opt_preamble, so);
 
@@ -1649,19 +1692,20 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
    progress |= OPT(s, nir_opt_reassociate_matrix_mul);
 
    /* TODO: ldg.k might also work on a6xx */
-   if (so->compiler->gen >= 7)
+   if (so->compiler->gen >= 7 && !rt_part)
       progress |= OPT(s, ir3_nir_lower_const_global_loads, so);
 
-   if (!so->binning_pass)
+   if (!so->binning_pass && !rt_part)
       ir3_nir_analyze_ubo_ranges(s, so);
 
    progress |= OPT(s, ir3_nir_lower_ubo_loads, so);
 
-   if (so->compiler->gen >= 7 &&
+   if (so->compiler->gen >= 7 && !rt_part &&
        !(ir3_shader_debug & (IR3_DBG_NOPREAMBLE | IR3_DBG_NODESCPREFETCH)))
       progress |= OPT(s, ir3_nir_opt_prefetch_descriptors, so);
 
-   if (so->shader_options.push_consts_type == IR3_PUSH_CONSTS_SHARED_PREAMBLE)
+   if (so->shader_options.push_consts_type == IR3_PUSH_CONSTS_SHARED_PREAMBLE &&
+       !rt_part)
       progress |= OPT(s, ir3_nir_lower_push_consts_to_preamble, so);
 
    progress |= OPT(s, ir3_nir_lower_preamble, so);
@@ -1739,6 +1783,9 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
    }
 
    OPT(s, nir_opt_sink, nir_move_const_undef);
+
+   if (so->shader_options.rt_blobs)
+      OPT(s, ir3_nir_localize_consts);
 
    if (ir3_shader_debug & IR3_DBG_DISASM) {
       mesa_logi("----------------------");

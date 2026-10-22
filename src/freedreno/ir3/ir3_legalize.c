@@ -9,6 +9,7 @@
 #include "util/ralloc.h"
 #include "util/u_math.h"
 
+#include "util/os_misc.h"
 #include "ir3.h"
 #include "ir3_shader.h"
 
@@ -744,6 +745,14 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
       unsigned i;
 
       n->flags &= ~(IR3_INSTR_SS | IR3_INSTR_SY);
+
+      if (n->opc == OPC_META_BLOB) {
+         list_delinit(&n->node);
+         list_addtail(&n->node, &block->instr_list);
+         ir3_init_legalize_state(state, ctx->compiler);
+         last_n = n;
+         continue;
+      }
 
       /* _meta::tex_prefetch instructions removed later in
        * collect_tex_prefetches()
@@ -2111,6 +2120,7 @@ static bool
 needs_eolm(struct ir3_instruction *instr)
 {
    switch (instr->opc) {
+   case OPC_META_BLOB:
    case OPC_STL:
    case OPC_LDL:
    case OPC_STLW:
@@ -2135,7 +2145,8 @@ needs_eolm(struct ir3_instruction *instr)
 static bool
 needs_eogm(struct ir3_instruction *instr)
 {
-   return opc_cat(instr->opc) == 5 || opc_cat(instr->opc) == 6;
+   return opc_cat(instr->opc) == 5 || opc_cat(instr->opc) == 6 ||
+          instr->opc == OPC_META_BLOB;
 }
 
 static bool
@@ -2481,6 +2492,99 @@ align_aliases(struct ir3 *ir)
    ralloc_free(ctx);
 }
 
+static bool
+regmask_is_empty(const regmask_t *m)
+{
+   return BITSET_IS_EMPTY(m->full) && BITSET_IS_EMPTY(m->half) &&
+          BITSET_IS_EMPTY(m->shared) && BITSET_IS_EMPTY(m->nongpr);
+}
+
+static bool
+rt_reg_per_wave(const struct ir3_register *reg)
+{
+   return (reg->flags & (IR3_REG_SHARED | IR3_REG_UNIFORM)) ||
+          reg_num(reg) == REG_A0 && (reg->num & 3) == 1;
+}
+
+static bool
+rt_blobs_live_pass(struct ir3 *ir, struct ir3_shader_variant *so, bool wave)
+{
+   void *mem_ctx = ralloc_context(NULL);
+   struct set *valid = _mesa_pointer_set_create(mem_ctx);
+   foreach_block (block, &ir->block_list) {
+      regmask_t *live_in = rzalloc(mem_ctx, regmask_t);
+      regmask_init(live_in, so->mergedregs);
+      block->data = live_in;
+      _mesa_set_add(valid, block);
+   }
+
+   bool fail = false, progress;
+   do {
+      progress = false;
+      foreach_block_rev (block, &ir->block_list) {
+         regmask_t live;
+         regmask_init(&live, so->mergedregs);
+         for (unsigned i = 0; i < ARRAY_SIZE(block->successors); i++) {
+            if (block->successors[i] && _mesa_set_search(valid, block->successors[i]))
+               regmask_or(&live, &live, block->successors[i]->data);
+         }
+         if (wave) {
+            for (unsigned i = 0; i < block->physical_successors_count; i++) {
+               if (_mesa_set_search(valid, block->physical_successors[i]))
+                  regmask_or(&live, &live, block->physical_successors[i]->data);
+            }
+         }
+
+         foreach_instr_rev (instr, &block->instr_list) {
+            if (instr->opc == OPC_META_BLOB) {
+               if (!regmask_is_empty(&live)) {
+                  if (!fail && os_get_option("IR3_RT_BLOB_DEBUG")) {
+                     mesa_logw("ir3: blob %u (%s): live full=%08x%08x%08x%08x shared=%08x nongpr=%08x",
+                               (unsigned) instr->raw.value, wave ? "wave" : "thread",
+                               live.full[0], live.full[1], live.full[2], live.full[3],
+                               live.shared[0], live.nongpr[0]);
+                     ir3_print(ir);
+                  }
+                  fail = true;
+               }
+               continue;
+            }
+            foreach_dst (dst, instr) {
+               if ((dst->flags & IR3_REG_RELATIV) || !dst->wrmask)
+                  continue;
+               if (wave && !rt_reg_per_wave(dst))
+                  continue;
+               regmask_clear(&live, dst);
+            }
+            foreach_src (src, instr) {
+               if (src->flags & (IR3_REG_CONST | IR3_REG_IMMED))
+                  continue;
+               if (wave && !rt_reg_per_wave(src))
+                  continue;
+               regmask_set(&live, src);
+            }
+            if (instr->address && (!wave || rt_reg_per_wave(instr->address)))
+               regmask_set(&live, instr->address);
+         }
+
+         regmask_t *live_in = block->data;
+         if (memcmp(live_in, &live, sizeof(live))) {
+            *live_in = live;
+            progress = true;
+         }
+      }
+   } while (progress);
+
+   ralloc_free(mem_ctx);
+   return fail;
+}
+
+static bool
+rt_blobs_live_fail(struct ir3 *ir, struct ir3_shader_variant *so)
+{
+   return rt_blobs_live_pass(ir, so, false) || rt_blobs_live_pass(ir, so, true);
+}
+
 bool
 ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary,
              bool can_speculate_preamble)
@@ -2627,7 +2731,8 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary,
       kill_sched(ir, so);
 
    if ((so->type == MESA_SHADER_FRAGMENT || ir3_shader_compute(so)) &&
-       so->compiler->info->props.has_eolm_eogm) {
+       so->compiler->info->props.has_eolm_eogm &&
+       !so->shader_options.rt_part) {
       feature_usage_sched(ctx, ir, so, needs_eolm, is_cheap_for_eolm_eogm,
                           IR3_INSTR_EOLM);
       feature_usage_sched(ctx, ir, so, needs_eogm, is_cheap_for_eolm_eogm,
@@ -2668,6 +2773,9 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary,
    resolve_jumps(ir);
 
    mark_xvergence_points(ir);
+
+   if (ir->rt_blobs)
+      so->rt_blob_live_fail = rt_blobs_live_fail(ir, so);
 
    ralloc_free(ctx);
 

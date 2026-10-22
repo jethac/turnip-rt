@@ -1363,6 +1363,18 @@ ir3_shader_disasm_options(struct ir3_shader_variant *so, uint32_t *bin,
 }
 
 void
+ir3_rt_disasm(const struct ir3_shader_variant *v, FILE *out)
+{
+   ir3_isa_disasm(v->bin, v->info.sizedwords * 4, out,
+                  &(struct isa_decode_options){
+                     .gpu_id = v->compiler->gen * 100,
+                     .show_errors = true,
+                     .branch_labels = true,
+                     .no_match_cb = print_raw,
+                  });
+}
+
+void
 ir3_shader_disasm(struct ir3_shader_variant *so, uint32_t *bin, FILE *out)
 {
    struct ir3_disasm_options options = {

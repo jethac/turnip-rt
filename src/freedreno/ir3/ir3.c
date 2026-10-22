@@ -39,6 +39,7 @@ ir3_create(struct ir3_compiler *compiler, struct ir3_shader_variant *v)
    shader->compiler = compiler;
    shader->type = v->type;
    shader->lin_ctx = linear_context(shader);
+   shader->rt_blobs = v->shader_options.rt_blobs;
 
    list_inithead(&shader->block_list);
    list_inithead(&shader->array_list);
@@ -387,9 +388,19 @@ ir3_collect_info(struct ir3_shader_variant *v)
    info->multi_dword_ldp_stp = false;
 
    uint32_t instr_count = 0;
+   uint32_t blob_instrs = 0, blob_nops = 0;
    foreach_block (block, &shader->block_list) {
       foreach_instr (instr, &block->instr_list) {
-         instr_count++;
+         if (instr->opc == OPC_META_BLOB) {
+            unsigned pre, post;
+            const struct ir3_rt_blob *blob =
+               &shader->rt_blobs->blobs[instr->raw.value];
+            instr_count += ir3_rt_blob_region(blob, instr_count, &pre, &post);
+            blob_instrs += blob->count;
+            blob_nops += pre + post;
+         } else {
+            instr_count++;
+         }
       }
    }
 
@@ -437,6 +448,8 @@ ir3_collect_info(struct ir3_shader_variant *v)
       }
 
       foreach_instr (instr, &block->instr_list) {
+         if (instr->opc == OPC_META_BLOB)
+            continue;
 
          foreach_src (reg, instr) {
             if (!is_reg_gpr(reg) || !regmask_get(&aliases, reg)) {
@@ -552,6 +565,9 @@ ir3_collect_info(struct ir3_shader_variant *v)
       }
    }
 
+   info->instrs_count += blob_instrs + blob_nops;
+   info->nops_count += blob_nops;
+
    /* for vertex shader, the inputs are loaded into registers before the shader
     * is executed, so max_regs from the shader instructions might not properly
     * reflect the # of registers actually used, especially in case passthrough
@@ -646,6 +662,20 @@ ir3_collect_info(struct ir3_shader_variant *v)
    assert(info->max_waves <= v->compiler->info->max_waves);
 
    ralloc_free(mem_ctx);
+}
+
+void
+ir3_update_max_waves(struct ir3_shader_variant *v)
+{
+   const struct ir3_compiler *compiler = v->compiler;
+   struct ir3_info *info = &v->info;
+   unsigned regs_count =
+      info->max_reg + 1 +
+      (compiler->gen >= 6 ? ((info->max_half_reg + 2) / 2) : 0);
+   unsigned a = ir3_get_reg_independent_max_waves(v, info->double_threadsize);
+   unsigned d = ir3_get_reg_dependent_max_waves(compiler, regs_count,
+                                                info->double_threadsize);
+   info->max_waves = MIN2(a, d);
 }
 
 static struct ir3_register *
@@ -1482,7 +1512,14 @@ ir3_count_instructions(struct ir3 *ir)
    foreach_block (block, &ir->block_list) {
       block->start_ip = cnt;
       foreach_instr (instr, &block->instr_list) {
-         instr->ip = cnt++;
+         instr->ip = cnt;
+         if (instr->opc == OPC_META_BLOB) {
+            unsigned pre, post;
+            cnt += ir3_rt_blob_region(&ir->rt_blobs->blobs[instr->raw.value],
+                                      cnt - 1, &pre, &post);
+         } else {
+            cnt++;
+         }
       }
       block->end_ip = cnt;
    }

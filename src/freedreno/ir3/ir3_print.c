@@ -114,6 +114,9 @@ print_instr_name(struct log_stream *stream, struct ir3_instruction *instr,
       case OPC_META_PHI:
          mesa_log_stream_printf(stream, "_meta:phi");
          break;
+      case OPC_META_BLOB:
+         mesa_log_stream_printf(stream, "_meta:blob %u", (unsigned)instr->raw.value);
+         break;
 
       /* shouldn't hit here.. just for debugging: */
       default:

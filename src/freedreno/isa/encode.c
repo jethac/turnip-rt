@@ -351,7 +351,37 @@ isa_assemble(struct ir3_shader_variant *v)
 			};
 
 			bitmask_t encoded;
-			if (instr->opc == OPC_META_RAW) {
+			if (instr->opc == OPC_META_BLOB) {
+				const struct ir3_rt_blob *blob =
+					&shader->rt_blobs->blobs[instr->raw.value];
+				unsigned pre, post;
+				unsigned pos = (instrs - ptr) / BITMASK_WORDS;
+				ir3_rt_blob_region(blob, pos, &pre, &post);
+				struct ir3_instruction nop = {
+					.opc = OPC_NOP,
+					.flags = IR3_INSTR_SS | IR3_INSTR_SY |
+						(instr->flags & IR3_INSTR_JP),
+				};
+				s.instr = &nop;
+				encoded = encode__instruction(&s, NULL, &nop);
+				store_instruction(instrs, encoded);
+				instrs += BITMASK_WORDS;
+				nop.flags = 0;
+				encoded = encode__instruction(&s, NULL, &nop);
+				for (unsigned i = 1; i < pre; i++) {
+					store_instruction(instrs, encoded);
+					instrs += BITMASK_WORDS;
+				}
+				for (unsigned i = 0; i < blob->count; i++) {
+					store_instruction(instrs, uint64_t_to_bitmask(blob->instrs[i]));
+					instrs += BITMASK_WORDS;
+				}
+				for (unsigned i = 0; i < post; i++) {
+					store_instruction(instrs, encoded);
+					instrs += BITMASK_WORDS;
+				}
+				continue;
+			} else if (instr->opc == OPC_META_RAW) {
 				encoded = uint64_t_to_bitmask(instr->raw.value);
 			} else {
 				encoded = encode__instruction(&s, NULL, instr);

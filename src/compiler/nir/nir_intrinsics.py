@@ -1734,6 +1734,8 @@ intrinsic("copy_global_to_uniform_ir3", [1], indices=[ACCESS, BASE, RANGE_BASE, 
 # Should be used in the shader preamble.
 intrinsic("copy_push_const_to_uniform_ir3", [1], indices=[BASE, RANGE])
 
+intrinsic("rt_blob_ir3", indices=[BASE])
+
 intrinsic("brcst_active_ir3", dest_comp=1, src_comp=[1, 1], bit_sizes=src0,
           indices=[CLUSTER_SIZE])
 intrinsic("reduce_clusters_ir3", dest_comp=1, src_comp=[1], bit_sizes=src0,

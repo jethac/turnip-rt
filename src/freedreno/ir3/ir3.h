@@ -639,6 +639,8 @@ struct ir3_instruction_rpt {
    struct ir3_instruction *rpts[4];
 };
 
+struct ir3_rt_blobs;
+
 struct ir3 {
    struct ir3_compiler *compiler;
    mesa_shader_stage type;
@@ -693,6 +695,8 @@ struct ir3 {
    unsigned block_count;
 #endif
    unsigned instr_count;
+
+   const struct ir3_rt_blobs *rt_blobs;
 };
 
 struct ir3_array {

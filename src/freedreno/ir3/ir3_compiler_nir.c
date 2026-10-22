@@ -3179,6 +3179,15 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
       for (int i = 0; i < dest_components; i++)
          dst[i] = create_driver_param(ctx, IR3_DP_CS(rt_cmd_addr_lo) + i);
       break;
+   case nir_intrinsic_rt_blob_ir3: {
+      struct ir3_instruction *blob =
+         ir3_build_instr(&ctx->build, OPC_META_BLOB, 0, 0);
+      blob->raw.value = nir_intrinsic_base(intr);
+      blob->barrier_class = IR3_BARRIER_EVERYTHING;
+      blob->barrier_conflict = IR3_BARRIER_EVERYTHING;
+      array_insert(ctx->block, ctx->block->keeps, blob);
+      break;
+   }
    case nir_intrinsic_load_work_dim:
       dst[0] = create_driver_param(ctx, IR3_DP_CS(work_dim));
       break;
@@ -4658,6 +4667,7 @@ instr_can_be_predicated(nir_instr *instr)
       case nir_intrinsic_terminate_if:
       case nir_intrinsic_vote_all:
       case nir_intrinsic_vote_any:
+      case nir_intrinsic_rt_blob_ir3:
          return false;
       default:
          return true;
@@ -6112,7 +6122,7 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
       /* the folding doesn't seem to work reliably on a4xx */
       if (ctx->compiler->gen != 4)
          progress |= IR3_PASS(ir, ir3_cf, so);
-      progress |= IR3_PASS(ir, ir3_cp, so, true);
+      progress |= IR3_PASS(ir, ir3_cp, so, !so->shader_options.rt_part);
       progress |= IR3_PASS(ir, ir3_cse);
       progress |= IR3_PASS(ir, ir3_dce, so);
       progress |= IR3_PASS(ir, ir3_opt_predicates, so);
@@ -6273,7 +6283,12 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
     */
    IR3_PASS(ir, ir3_legalize, so, &max_bary, is_preamble_speculatable);
 
-   if (ir3_shader_compute(so) &&
+   if (so->shader_options.rt_part) {
+      struct ir3_instruction *end = ir3_find_end(so->ir);
+      end->opc = OPC_NOP;
+      end->srcs_count = 0;
+      end->flags |= IR3_INSTR_SS | IR3_INSTR_SY;
+   } else if (ir3_shader_compute(so) &&
        IR3_QUIRK(ctx->compiler, QCTDD08407086_cs_lock_unlock)) {
       struct ir3_instruction *end = ir3_find_end(so->ir);
       struct ir3_instruction *lock =

@@ -415,6 +415,7 @@ typedef enum {
     * A manually encoded opcode
     */
    OPC_META_RAW = _OPC(OPC_META, 7),
+   OPC_META_BLOB = _OPC(OPC_META, 8),
 } opc_t;
 /* clang-format on */
 

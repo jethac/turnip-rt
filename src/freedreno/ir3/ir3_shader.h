@@ -615,6 +615,26 @@ struct ir3_shader_nir_options {
    nir_variable_mode robust_modes;
 };
 
+struct ir3_rt_blob {
+   const uint64_t *instrs;
+   uint32_t count;
+};
+
+struct ir3_rt_blobs {
+   uint32_t count;
+   const struct ir3_rt_blob *blobs;
+};
+
+static inline unsigned
+ir3_rt_blob_region(const struct ir3_rt_blob *blob, unsigned pos,
+                   unsigned *pre, unsigned *post)
+{
+   unsigned start = align(pos + 1, 16);
+   *pre = start - pos;
+   *post = (17 - ((*pre + blob->count) % 16)) % 16;
+   return *pre + blob->count + *post;
+}
+
 struct ir3_shader_options {
    /* What API-visible wavesizes are allowed. Even if only double wavesize is
     * allowed, we may still use the smaller wavesize "under the hood" and the
@@ -644,6 +664,9 @@ struct ir3_shader_options {
    bool no_early_preamble;
 
    uint8_t target_full_regs;
+
+   bool rt_part;
+   const struct ir3_rt_blobs *rt_blobs;
 };
 
 struct ir3_shader_output {
@@ -763,6 +786,8 @@ struct ir3_shader_variant {
 
    /* Whether early preamble is enabled. */
    bool early_preamble;
+
+   bool rt_blob_live_fail;
 
    /* Size in bytes of required shared memory */
    unsigned shared_size;
@@ -1236,6 +1261,7 @@ ir3_exceeds_safe_constlen(const struct ir3_shader_variant *v)
 }
 
 void *ir3_shader_assemble(struct ir3_shader_variant *v);
+void ir3_update_max_waves(struct ir3_shader_variant *v);
 struct ir3_shader_variant *
 ir3_shader_create_variant(struct ir3_shader *shader,
                           const struct ir3_shader_key *key,
@@ -1255,6 +1281,7 @@ struct ir3_shader *
 ir3_shader_passthrough_tcs(struct ir3_shader *vs, unsigned patch_vertices);
 void ir3_shader_destroy(struct ir3_shader *shader);
 void ir3_shader_disasm(struct ir3_shader_variant *so, uint32_t *bin, FILE *out);
+void ir3_rt_disasm(const struct ir3_shader_variant *v, FILE *out);
 void ir3_shader_disasm_options(struct ir3_shader_variant *so, uint32_t *bin,
                                struct ir3_disasm_options *options);
 uint64_t ir3_shader_outputs(const struct ir3_shader *so);
