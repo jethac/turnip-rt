@@ -1163,7 +1163,7 @@ static void tu_rt_traversal_tail(nir_builder *b, struct tu_rt_compiler *c,
                                  const struct tu_rt_ray *r);
 
 static nir_def *
-tu_rt_fov_launch_id(nir_builder *b, struct tu_rt_compiler *c)
+tu_rt_fov_launch_id(nir_builder *b, uint32_t fov_mode)
 {
    nir_def *size = tu_rt_load_cmd(b, offsetof(VkTraceRaysIndirectCommand2KHR, width), 3);
    nir_def *wg = nir_load_workgroup_id(b);
@@ -1171,7 +1171,7 @@ tu_rt_fov_launch_id(nir_builder *b, struct tu_rt_compiler *c)
    nir_def *id1d = nir_vec3(b, nir_iadd(b, nir_ishl_imm(b, nir_channel(b, wg, 0), 6), li),
                             nir_imm_int(b, 0), nir_channel(b, wg, 2));
    nir_def *id2d;
-   if (c->fov_mode & TU_RT_FOV_SHARE) {
+   if (fov_mode & TU_RT_FOV_SHARE) {
       nir_def *lx = nir_ior(b, nir_iand_imm(b, li, 1),
                             nir_ior(b, nir_iand_imm(b, nir_ushr_imm(b, li, 1), 2),
                                     nir_iand_imm(b, nir_ushr_imm(b, li, 2), 4)));
@@ -1217,7 +1217,7 @@ tu_rt_fov_level(nir_builder *b, struct tu_rt_compiler *c)
 
    nir_def *rr = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET + 8, 2);
    nir_def *gz = tu_rt_load_cmd(b, TU_RT_FOV_CMD_OFFSET + 16, 4);
-   nir_def *id = tu_rt_fov_launch_id(b, c);
+   nir_def *id = tu_rt_fov_launch_id(b, c->fov_mode);
    nir_def *ew = nir_bcsel(b, sbs, nir_fmul_imm(b, w, 0.5), w);
    nir_def *px = nir_fadd_imm(b, nir_u2f32(b, nir_channel(b, id, 0)), 0.5);
    nir_def *py = nir_fadd_imm(b, nir_u2f32(b, nir_channel(b, id, 1)), 0.5);
@@ -2019,7 +2019,8 @@ tu_rt_lower_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_load_ray_launch_id:
       if (c->part != TU_RT_PART_NONE)
          return false;
-      def = c->fov_mode ? tu_rt_fov_launch_id(b, c) : nir_load_global_invocation_id(b, 32);
+      def = c->fov_mode ? tu_rt_fov_launch_id(b, c->fov_mode)
+                        : nir_load_global_invocation_id(b, 32);
       break;
    case nir_intrinsic_load_ray_launch_size:
       def = tu_rt_load_cmd(b, offsetof(VkTraceRaysIndirectCommand2KHR, width), 3);
@@ -2233,7 +2234,7 @@ tu_rt_build_shader(struct tu_device *dev,
    c.flags = flags;
    c.only_raygen = only_raygen;
    c.part = part;
-   c.fov_mode = tu_rt_fov_mode(dev);
+   c.fov_mode = part == TU_RT_PART_NONE ? tu_rt_fov_mode(dev) : 0;
    c.fn_ctx = _mesa_pointer_hash_table_create(NULL);
    c.fn_cache = (nir_function **)
       calloc(MAX2(pipeline->stage_count, 1) * 2 * (TU_RT_MAX_CALL_DEPTH + 1),
@@ -2454,6 +2455,10 @@ tu_rt_link_mode(void)
          m = TU_RT_LINK_FORCE;
       else if (v && !strcmp(v, "auto"))
          m = TU_RT_LINK_AUTO;
+      if (m != TU_RT_LINK_OFF && (tu_foveate_rt_mode() & TU_RT_FOV_SHARE)) {
+         mesa_logw("tu-rt: TU_RT_LINK=%s ignored with TU_FOVEATE_RT", v);
+         m = TU_RT_LINK_OFF;
+      }
       mode = m;
    }
    return mode;
@@ -3596,7 +3601,9 @@ tu_rt_build_glue(struct tu_device *dev, bool whole, const uint32_t *handles,
    nir_builder _b = tu_rt_part_builder(dev, "tu rt link");
    nir_builder *b = &_b;
 
-   nir_def *launch_id = nir_load_global_invocation_id(b, 32);
+   const uint32_t pack = tu_rt_fov_mode(dev) & TU_RT_FOV_PACK1D;
+   nir_def *launch_id = pack ? tu_rt_fov_launch_id(b, pack)
+                             : nir_load_global_invocation_id(b, 32);
    nir_def *launch_size =
       tu_rt_load_cmd(b, offsetof(VkTraceRaysIndirectCommand2KHR, width), 3);
    nir_def *oob = nir_ige(b, nir_channel(b, launch_id, 0), nir_channel(b, launch_size, 0));
