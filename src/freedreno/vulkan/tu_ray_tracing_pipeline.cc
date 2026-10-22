@@ -2278,7 +2278,7 @@ tu_rt_log_enabled(void)
    return on;
 }
 
-static const char tu_rt_abi_tag[] = "tu-rt-abi-6";
+static const char tu_rt_abi_tag[] = "tu-rt-abi-7";
 
 static void
 tu_rt_hash_abi(struct mesa_blake3 *h)
@@ -2560,6 +2560,10 @@ tu_rt_part_compile(struct tu_device *dev, struct tu_pipeline_layout *layout,
 {
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, tu_rt_lower_part_abi_instr,
             nir_metadata_control_flow, NULL);
+   if (merge) {
+      for (uint32_t i = 0; i < merge->nparts; i++)
+         scratch_base = MAX2(scratch_base, merge->parts[i]->pvtmem_size);
+   }
    nir->scratch_size = MAX2(nir->scratch_size, scratch_base);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
@@ -3453,6 +3457,9 @@ tu_rt_link_one(struct tu_device *dev, struct tu_pipeline_layout *layout,
    opts.blobs = blobs;
    opts.fixup = tu_rt_link_fixup;
    opts.fixup_data = &merge;
+
+   for (uint32_t i = 0; i < nparts; i++)
+      glue->scratch_size = MAX2(glue->scratch_size, parts[i]->pvtmem_size);
 
    struct ir3_shader_key ir3_key = {};
    struct tu_shader_info info = {};
