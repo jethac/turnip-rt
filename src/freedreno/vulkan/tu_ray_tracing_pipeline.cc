@@ -970,6 +970,47 @@ tu_rt_emit_case_tree(nir_builder *b, nir_def *handle, const struct tu_rt_case *c
    nir_pop_if(b, NULL);
 }
 
+template <typename F, typename G>
+static void
+tu_rt_emit_case_chain_or(nir_builder *b, nir_def *handle, const struct tu_rt_case *cases,
+                         unsigned count, F &emit, G &dflt)
+{
+   for (unsigned i = 0; i < count; i++) {
+      nir_push_if(b, nir_ieq_imm(b, handle, cases[i].handle));
+      emit(cases[i]);
+      nir_push_else(b, NULL);
+   }
+   dflt();
+   for (unsigned i = 0; i < count; i++)
+      nir_pop_if(b, NULL);
+}
+
+template <typename F, typename G>
+static void
+tu_rt_emit_case_tree_or(nir_builder *b, nir_def *handle, const struct tu_rt_case *cases,
+                        unsigned count, F &emit, G &dflt)
+{
+   if (count <= 3) {
+      tu_rt_emit_case_chain_or(b, handle, cases, count, emit, dflt);
+      return;
+   }
+   unsigned mid = count / 2;
+   nir_push_if(b, nir_ult(b, handle, nir_imm_int(b, cases[mid].handle)));
+   tu_rt_emit_case_tree_or(b, handle, cases, mid, emit, dflt);
+   nir_push_else(b, NULL);
+   tu_rt_emit_case_tree_or(b, handle, cases + mid, count - mid, emit, dflt);
+   nir_pop_if(b, NULL);
+}
+
+template <typename F, typename G>
+static void
+tu_rt_emit_cases_or(nir_builder *b, nir_def *handle, struct tu_rt_case *cases,
+                    unsigned count, F &&emit, G &&dflt)
+{
+   qsort(cases, count, sizeof(*cases), tu_rt_case_cmp);
+   tu_rt_emit_case_tree_or(b, handle, cases, count, emit, dflt);
+}
+
 template <typename F>
 static void
 tu_rt_emit_cases(nir_builder *b, nir_def *handle, struct tu_rt_case *cases,
@@ -2237,7 +2278,7 @@ tu_rt_log_enabled(void)
    return on;
 }
 
-static const char tu_rt_abi_tag[] = "tu-rt-abi-4";
+static const char tu_rt_abi_tag[] = "tu-rt-abi-5";
 
 static void
 tu_rt_hash_abi(struct mesa_blake3 *h)
@@ -3305,11 +3346,12 @@ tu_rt_build_glue(struct tu_device *dev, bool whole, const uint32_t *handles,
          }
          nir_push_else(b, NULL);
          {
-            tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_DONE));
             sel = nir_bcsel(b, nir_ieq_imm(b, kind, 3),
                             nir_iand_imm(b, sel, 0x2ffffff), sel);
-            tu_rt_emit_cases(b, sel, cases, n, [&](const struct tu_rt_case &cs) {
+            tu_rt_emit_cases_or(b, sel, cases, n, [&](const struct tu_rt_case &cs) {
                tu_rt_emit_blob(b, cs.group);
+            }, [&]() {
+               tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_DONE));
             });
          }
          nir_pop_if(b, NULL);
