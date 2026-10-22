@@ -2924,9 +2924,6 @@ static const char *
 tu_rt_finish_raygen_part(nir_shader *nir)
 {
    const char *fail = NULL;
-   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   nir_builder b = nir_builder_at(nir_after_impl(impl));
-   tu_rt_fstore(&b, TU_RT_FRAME_SEL, nir_imm_int(&b, TU_RT_SEL_DONE));
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, tu_rt_lower_rt_call,
             nir_metadata_control_flow, &fail);
    NIR_PASS(_, nir, nir_shader_instructions_pass, tu_rt_halt_to_return,
