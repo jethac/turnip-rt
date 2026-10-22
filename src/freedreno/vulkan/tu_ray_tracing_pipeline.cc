@@ -13,6 +13,8 @@
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include "util/os_time.h"
+#include "util/os_misc.h"
+#include "util/simple_mtx.h"
 #include "util/blob.h"
 #include "nir/nir_serialize.h"
 #include <pthread.h>
@@ -507,11 +509,29 @@ struct tu_rt_state {
    nir_variable *opaque;
 };
 
+enum tu_rt_part_kind {
+   TU_RT_PART_NONE = 0,
+   TU_RT_PART_WHOLE,
+   TU_RT_PART_RAYGEN,
+   TU_RT_PART_TRAVERSAL,
+   TU_RT_PART_CALLEE,
+};
+
+#define TU_RT_MAX_CLASSES 8
+
 struct tu_rt_compiler {
    struct tu_ray_tracing_pipeline *pipeline;
    VkPipelineCreateFlags2KHR flags;
    struct tu_rt_state state;
    nir_variable *hit_words;
+
+   enum tu_rt_part_kind part;
+   unsigned part_payload_size;
+   uint32_t part_hit_used;
+   const char *part_fail;
+   unsigned part_nclasses;
+   uint32_t part_classes[TU_RT_MAX_CLASSES];
+   nir_variable *part_dummy;
 
    struct hash_table *fn_ctx;
    nir_function **fn_cache;
@@ -598,6 +618,61 @@ tu_rt_load_cmd_addr(nir_builder *b, uint32_t offset)
 {
    return nir_pack_64_2x32(b, tu_rt_load_cmd(b, offset, 2));
 }
+
+enum {
+   TU_RT_FRAME_SEL = 0,
+   TU_RT_FRAME_RET = 4,
+   TU_RT_FRAME_LAUNCH_ID = 8,
+   TU_RT_FRAME_CMD = 24,
+   TU_RT_FRAME_ACCEL = 32,
+   TU_RT_FRAME_FLAGS = 40,
+   TU_RT_FRAME_CULL = 44,
+   TU_RT_FRAME_SBT_OFFSET = 48,
+   TU_RT_FRAME_SBT_STRIDE = 52,
+   TU_RT_FRAME_MISS_INDEX = 56,
+   TU_RT_FRAME_TMIN = 60,
+   TU_RT_FRAME_ORIGIN = 64,
+   TU_RT_FRAME_DIR = 76,
+   TU_RT_FRAME_TMAX = 88,
+   TU_RT_FRAME_HIT_KIND = 92,
+   TU_RT_FRAME_INSTANCE_ID = 96,
+   TU_RT_FRAME_CUSTOM_INDEX = 100,
+   TU_RT_FRAME_PRIMITIVE_ID = 104,
+   TU_RT_FRAME_GEOMETRY_INDEX = 108,
+   TU_RT_FRAME_RECORD = 112,
+   TU_RT_FRAME_HANDLE = 120,
+   TU_RT_FRAME_OBJECT_ORIGIN = 124,
+   TU_RT_FRAME_OBJECT_DIR = 136,
+   TU_RT_FRAME_WTO = 148,
+   TU_RT_FRAME_OTW = 196,
+   TU_RT_FRAME_HIT_WORDS = 244,
+   TU_RT_FRAME_PAYLOAD = 288,
+   TU_RT_PAYLOAD_MAX = 256,
+   TU_RT_FRAME_STACK = TU_RT_FRAME_PAYLOAD + TU_RT_PAYLOAD_MAX,
+   TU_RT_STACK_MAX = 4096,
+   TU_RT_FRAME_CALLEE = TU_RT_FRAME_STACK + TU_RT_STACK_MAX,
+   TU_RT_FRAME_WHOLE = 32,
+};
+
+#define TU_RT_SEL_DONE 0u
+#define TU_RT_SEL_RG(k) (1u + (k))
+#define TU_RT_SEL_TRAV(c) (0x1000000u | (c))
+#define TU_RT_SEL_CHIT(c) (0x2000000u | (c))
+#define TU_RT_SEL_MISS(c) (0x3000000u | (c))
+
+static nir_def *
+tu_rt_fload(nir_builder *b, unsigned off, unsigned comps)
+{
+   return nir_load_scratch(b, comps, 32, nir_imm_int(b, off), .align_mul = 4);
+}
+
+static void
+tu_rt_fstore(nir_builder *b, unsigned off, nir_def *v)
+{
+   nir_store_scratch(b, v, nir_imm_int(b, off), .align_mul = 4,
+                     .write_mask = nir_component_mask(v->num_components));
+}
+
 
 struct tu_rt_sbt_entry {
    nir_def *value;
@@ -789,6 +864,30 @@ tu_rt_payload_compatible(nir_shader *stage, nir_def *arg)
    return true;
 }
 
+static unsigned
+tu_rt_call_data_size(nir_shader *stage, bool *has)
+{
+   nir_foreach_variable_with_modes (var, stage, nir_var_shader_call_data) {
+      unsigned size, al;
+      glsl_get_natural_size_align_bytes(var->type, &size, &al);
+      *has = true;
+      return size;
+   }
+   *has = false;
+   return 0;
+}
+
+static bool
+tu_rt_compat(struct tu_rt_compiler *c, nir_shader *stage, nir_def *arg)
+{
+   if (c->part == TU_RT_PART_TRAVERSAL) {
+      bool has;
+      unsigned size = tu_rt_call_data_size(stage, &has);
+      return !has || size == c->part_payload_size;
+   }
+   return tu_rt_payload_compatible(stage, arg);
+}
+
 struct tu_rt_case {
    uint32_t handle;
    uint32_t group;
@@ -880,7 +979,7 @@ tu_rt_dispatch_recursive(nir_builder *b, struct tu_rt_compiler *c,
       nir_shader *stage = tu_rt_group_stage(c, group->recursive_index);
       if (!stage || stage->info.stage != want ||
           tu_rt_handle_seen(c, i, group->handle, 0) ||
-          !tu_rt_payload_compatible(stage, arg))
+          !tu_rt_compat(c, stage, arg))
          continue;
       cases[count++] = (struct tu_rt_case) { group->handle, i };
    }
@@ -975,25 +1074,35 @@ static nir_function *tu_rt_get_isec_function(nir_builder *b,
                                              uint32_t group,
                                              unsigned call_depth);
 
+struct tu_rt_ray {
+   nir_def *accel, *flags, *cull_mask, *sbt_offset, *sbt_stride, *miss_index;
+   nir_def *origin, *tmin, *dir, *tmax, *payload;
+};
+
+static void tu_rt_traversal_tail(nir_builder *b, struct tu_rt_compiler *c,
+                                 nir_def *rq, nir_def *committed_type,
+                                 nir_def *committed_hit_kind,
+                                 const struct tu_rt_ray *r);
+
 static void
-tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
-                nir_intrinsic_instr *instr)
+tu_rt_trace_ray_emit(nir_builder *b, struct tu_rt_compiler *c,
+                     const struct tu_rt_ray *r)
 {
    struct tu_rt_state *s = &c->state;
    const uint32_t hit_sbt =
       offsetof(VkTraceRaysIndirectCommand2KHR, hitShaderBindingTableAddress);
 
-   nir_def *accel_struct = instr->src[0].ssa;
-   nir_def *flags = instr->src[1].ssa;
-   nir_def *cull_mask = instr->src[2].ssa;
-   nir_def *sbt_offset = nir_iand_imm(b, instr->src[3].ssa, 0xF);
-   nir_def *sbt_stride = nir_iand_imm(b, instr->src[4].ssa, 0xF);
-   nir_def *miss_index = nir_iand_imm(b, instr->src[5].ssa, 0xFFFF);
-   nir_def *origin = instr->src[6].ssa;
-   nir_def *tmin = instr->src[7].ssa;
-   nir_def *dir = instr->src[8].ssa;
-   nir_def *tmax = instr->src[9].ssa;
-   nir_def *payload = instr->src[10].ssa;
+   nir_def *accel_struct = r->accel;
+   nir_def *flags = r->flags;
+   nir_def *cull_mask = r->cull_mask;
+   nir_def *sbt_offset = nir_iand_imm(b, r->sbt_offset, 0xF);
+   nir_def *sbt_stride = nir_iand_imm(b, r->sbt_stride, 0xF);
+   nir_def *miss_index = nir_iand_imm(b, r->miss_index, 0xFFFF);
+   nir_def *origin = r->origin;
+   nir_def *tmin = r->tmin;
+   nir_def *dir = r->dir;
+   nir_def *tmax = r->tmax;
+   nir_def *payload = r->payload;
    const unsigned cd = tu_rt_ctx(c, b->impl->function)->call_depth;
 
    nir_store_var(b, s->flags, flags, 0x1);
@@ -1081,7 +1190,7 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
                nir_shader *ahit = tu_rt_group_stage(c, c->pipeline->groups[i].ahit_index);
                if (!ahit || c->pipeline->groups[i].isec_index != VK_SHADER_UNUSED_KHR ||
                    tu_rt_handle_seen(c, i, c->pipeline->groups[i].handle, 1) ||
-                   !tu_rt_payload_compatible(ahit, payload))
+                   !tu_rt_compat(c, ahit, payload))
                   continue;
                cases[count++] = (struct tu_rt_case) { c->pipeline->groups[i].handle, i };
             }
@@ -1175,6 +1284,14 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
                   .ray_query_value = nir_ray_query_value_intersection_type,
                   .committed = true);
 
+   if (c->part == TU_RT_PART_TRAVERSAL) {
+      struct tu_rt_ray masked = *r;
+      masked.miss_index = miss_index;
+      tu_rt_traversal_tail(b, c, rq, committed_type,
+                           nir_load_var(b, committed_hit_kind), &masked);
+      return;
+   }
+
    nir_push_if(b, nir_ine_imm(b, committed_type, 0));
    {
       nir_def *skip_chit =
@@ -1220,6 +1337,129 @@ tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
       tu_rt_dispatch_recursive(b, c, miss.value, MESA_SHADER_MISS, payload, 1, cd);
    }
    nir_pop_if(b, NULL);
+}
+
+static void
+tu_rt_fstore_vec(nir_builder *b, unsigned off, nir_def *v)
+{
+   for (unsigned i = 0; i < v->num_components; i++)
+      tu_rt_fstore(b, off + 4 * i, nir_channel(b, v, i));
+}
+
+static nir_def *
+tu_rt_fload_vec(nir_builder *b, unsigned off, unsigned comps)
+{
+   nir_def *v[4];
+   for (unsigned i = 0; i < comps; i++)
+      v[i] = tu_rt_fload(b, off + 4 * i, 1);
+   return nir_vec(b, v, comps);
+}
+
+static void
+tu_rt_traversal_tail(nir_builder *b, struct tu_rt_compiler *c, nir_def *rq,
+                     nir_def *committed_type, nir_def *committed_hit_kind,
+                     const struct tu_rt_ray *r)
+{
+   struct tu_rt_state *s = &c->state;
+   const uint32_t hit_sbt =
+      offsetof(VkTraceRaysIndirectCommand2KHR, hitShaderBindingTableAddress);
+   const unsigned cls = c->part_payload_size;
+   const uint32_t u = c->part_hit_used;
+
+   nir_push_if(b, nir_ine_imm(b, committed_type, 0));
+   {
+      nir_push_if(b, nir_test_mask(b, r->flags, SpvRayFlagsSkipClosestHitShaderKHRMask));
+      {
+         tu_rt_fstore(b, TU_RT_FRAME_SEL, tu_rt_fload(b, TU_RT_FRAME_RET, 1));
+      }
+      nir_push_else(b, NULL);
+      {
+         uint32_t saved = c->used;
+         c->used = u;
+         tu_rt_load_hit_state(b, c, rq, true);
+         c->used = saved;
+
+         tu_rt_fstore(b, TU_RT_FRAME_TMAX,
+                      nir_rq_load(b, 1, 32, rq,
+                                  .ray_query_value = nir_ray_query_value_intersection_t,
+                                  .committed = true));
+         if (c->has_isec) {
+            nir_push_if(b, nir_ieq_imm(b, committed_type, 1));
+            {
+               nir_store_var(b, s->hit_kind, tu_rt_triangle_hit_kind(b, rq, true), 0x1);
+               tu_rt_store_bary(b, c, rq, true);
+            }
+            nir_push_else(b, NULL);
+            {
+               nir_store_var(b, s->hit_kind, committed_hit_kind, 0x1);
+            }
+            nir_pop_if(b, NULL);
+         } else {
+            nir_store_var(b, s->hit_kind, tu_rt_triangle_hit_kind(b, rq, true), 0x1);
+            tu_rt_store_bary(b, c, rq, true);
+         }
+         tu_rt_fstore(b, TU_RT_FRAME_HIT_KIND, nir_load_var(b, s->hit_kind));
+         for (unsigned i = 0; i < (c->has_isec ? TU_RT_HIT_WORDS : 2); i++)
+            tu_rt_fstore(b, TU_RT_FRAME_HIT_WORDS + 4 * i,
+                         nir_load_deref(b, tu_rt_hw(b, c->hit_words, nir_imm_int(b, i))));
+
+         if (u & TU_RT_USE_INSTANCE_ID)
+            tu_rt_fstore(b, TU_RT_FRAME_INSTANCE_ID, nir_load_var(b, s->instance_id));
+         if (u & TU_RT_USE_CUSTOM_INDEX)
+            tu_rt_fstore(b, TU_RT_FRAME_CUSTOM_INDEX, nir_load_var(b, s->custom_index));
+         if (u & TU_RT_USE_PRIMITIVE_ID)
+            tu_rt_fstore(b, TU_RT_FRAME_PRIMITIVE_ID, nir_load_var(b, s->primitive_id));
+         if (u & TU_RT_USE_GEOMETRY_INDEX)
+            tu_rt_fstore(b, TU_RT_FRAME_GEOMETRY_INDEX, nir_load_var(b, s->geometry_index));
+         if (u & TU_RT_USE_OBJECT_ORIGIN)
+            tu_rt_fstore_vec(b, TU_RT_FRAME_OBJECT_ORIGIN, nir_load_var(b, s->object_origin));
+         if (u & TU_RT_USE_OBJECT_DIR)
+            tu_rt_fstore_vec(b, TU_RT_FRAME_OBJECT_DIR, nir_load_var(b, s->object_dir));
+         for (unsigned col = 0; col < 4; col++) {
+            if (u & TU_RT_USE_WTO)
+               tu_rt_fstore_vec(b, TU_RT_FRAME_WTO + 12 * col, nir_load_var(b, s->wto[col]));
+            if (u & TU_RT_USE_OTW)
+               tu_rt_fstore_vec(b, TU_RT_FRAME_OTW + 12 * col, nir_load_var(b, s->otw[col]));
+         }
+
+         struct tu_rt_sbt_entry chit =
+            tu_rt_load_sbt_entry(b, tu_rt_sbt_index(b, c, rq, true), hit_sbt);
+         tu_rt_fstore(b, TU_RT_FRAME_HANDLE, chit.value);
+         tu_rt_fstore_vec(b, TU_RT_FRAME_RECORD, nir_unpack_64_2x32(b, chit.shader_record_ptr));
+         tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_CHIT(cls)));
+      }
+      nir_pop_if(b, NULL);
+   }
+   nir_push_else(b, NULL);
+   {
+      struct tu_rt_sbt_entry miss = tu_rt_load_sbt_entry(
+         b, r->miss_index,
+         offsetof(VkTraceRaysIndirectCommand2KHR, missShaderBindingTableAddress));
+      tu_rt_fstore(b, TU_RT_FRAME_HANDLE, miss.value);
+      tu_rt_fstore_vec(b, TU_RT_FRAME_RECORD, nir_unpack_64_2x32(b, miss.shader_record_ptr));
+      tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_MISS(cls)));
+   }
+   nir_pop_if(b, NULL);
+}
+
+static void
+tu_rt_trace_ray(nir_builder *b, struct tu_rt_compiler *c,
+                nir_intrinsic_instr *instr)
+{
+   struct tu_rt_ray r = {
+      .accel = instr->src[0].ssa,
+      .flags = instr->src[1].ssa,
+      .cull_mask = instr->src[2].ssa,
+      .sbt_offset = instr->src[3].ssa,
+      .sbt_stride = instr->src[4].ssa,
+      .miss_index = instr->src[5].ssa,
+      .origin = instr->src[6].ssa,
+      .tmin = instr->src[7].ssa,
+      .dir = instr->src[8].ssa,
+      .tmax = instr->src[9].ssa,
+      .payload = instr->src[10].ssa,
+   };
+   tu_rt_trace_ray_emit(b, c, &r);
 }
 
 static void
@@ -1338,6 +1578,129 @@ tu_rt_get_isec_function(nir_builder *b, struct tu_rt_compiler *c, uint32_t group
    return function;
 }
 
+static unsigned tu_rt_natural_field_offset(const struct glsl_type *st,
+                                           unsigned field);
+
+template <typename F>
+static bool
+tu_rt_walk_leaves(nir_builder *b, nir_deref_instr *deref, unsigned offset, F &cb)
+{
+   const struct glsl_type *t = deref->type;
+   if (glsl_type_is_struct_or_ifc(t)) {
+      for (unsigned i = 0; i < glsl_get_length(t); i++) {
+         if (!tu_rt_walk_leaves(b, nir_build_deref_struct(b, deref, i),
+                                offset + tu_rt_natural_field_offset(t, i), cb))
+            return false;
+      }
+      return true;
+   }
+   if (glsl_type_is_array(t) || glsl_type_is_matrix(t)) {
+      const struct glsl_type *et = glsl_type_is_array(t) ?
+         glsl_get_array_element(t) : glsl_get_column_type(t);
+      unsigned n = glsl_type_is_array(t) ? glsl_get_length(t) :
+         glsl_get_matrix_columns(t);
+      unsigned size, al;
+      glsl_get_natural_size_align_bytes(et, &size, &al);
+      unsigned stride = align(size, al);
+      for (unsigned i = 0; i < n; i++) {
+         if (!tu_rt_walk_leaves(b, nir_build_deref_array_imm(b, deref, i),
+                                offset + i * stride, cb))
+            return false;
+      }
+      return true;
+   }
+   if (!glsl_type_is_vector_or_scalar(t))
+      return false;
+   cb(deref, offset);
+   return true;
+}
+
+static bool
+tu_rt_copy_payload(nir_builder *b, nir_deref_instr *deref, unsigned size,
+                   bool to_frame)
+{
+   unsigned nwords = DIV_ROUND_UP(size, 4);
+   if (!nwords)
+      return true;
+   nir_variable *w =
+      nir_local_variable_create(b->impl, glsl_array_type(glsl_uint_type(), nwords, 4),
+                                "tu_rt_pw");
+   if (to_frame) {
+      auto cb = [&](nir_deref_instr *leaf, unsigned off) {
+         nir_def *v = nir_load_deref(b, leaf);
+         for (unsigned comp = 0; comp < v->num_components; comp++)
+            tu_rt_hw_store_comp(b, w, nir_imm_int(b, off), comp, nir_channel(b, v, comp));
+      };
+      if (!tu_rt_walk_leaves(b, deref, 0, cb))
+         return false;
+      for (unsigned i = 0; i < nwords; i++)
+         tu_rt_fstore(b, TU_RT_FRAME_PAYLOAD + 4 * i,
+                      nir_load_deref(b, tu_rt_hw(b, w, nir_imm_int(b, i))));
+   } else {
+      for (unsigned i = 0; i < nwords; i++)
+         nir_store_deref(b, tu_rt_hw(b, w, nir_imm_int(b, i)),
+                         tu_rt_fload(b, TU_RT_FRAME_PAYLOAD + 4 * i, 1), 0x1);
+      auto cb = [&](nir_deref_instr *leaf, unsigned off) {
+         unsigned nc = glsl_get_vector_elements(leaf->type);
+         unsigned bs = glsl_get_bit_size(leaf->type);
+         nir_def *vals[NIR_MAX_VEC_COMPONENTS];
+         for (unsigned comp = 0; comp < nc; comp++)
+            vals[comp] = tu_rt_hw_load_comp(b, w, nir_imm_int(b, off), comp, bs);
+         nir_store_deref(b, leaf, nir_vec(b, vals, nc), nir_component_mask(nc));
+      };
+      if (!tu_rt_walk_leaves(b, deref, 0, cb))
+         return false;
+   }
+   return true;
+}
+
+static void
+tu_rt_part_add_class(struct tu_rt_compiler *c, unsigned size)
+{
+   for (unsigned i = 0; i < c->part_nclasses; i++) {
+      if (c->part_classes[i] == size)
+         return;
+   }
+   if (c->part_nclasses == TU_RT_MAX_CLASSES) {
+      c->part_fail = "too many payload classes";
+      return;
+   }
+   c->part_classes[c->part_nclasses++] = size;
+}
+
+static bool
+tu_rt_part_raygen_trace(nir_builder *b, struct tu_rt_compiler *c,
+                        nir_intrinsic_instr *intr)
+{
+   nir_def *payload = intr->src[10].ssa;
+   nir_deref_instr *pd = NULL;
+   unsigned size = 0;
+   if (nir_def_is_deref(payload)) {
+      unsigned al;
+      pd = nir_def_as_deref(payload);
+      glsl_get_natural_size_align_bytes(pd->type, &size, &al);
+   }
+   if (size > TU_RT_PAYLOAD_MAX) {
+      c->part_fail = "payload too large";
+      return false;
+   }
+   tu_rt_part_add_class(c, size);
+
+   b->cursor = nir_before_instr(&intr->instr);
+   if (pd && !tu_rt_copy_payload(b, pd, size, true))
+      c->part_fail = "payload type";
+   tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_TRAV(size)));
+   if (!c->part_dummy)
+      c->part_dummy = nir_variable_create(b->shader, nir_var_shader_call_data,
+                                          glsl_uint_type(), "tu_rt_no_payload");
+   nir_src_rewrite(&intr->src[10], &nir_build_deref_var(b, c->part_dummy)->def);
+
+   b->cursor = nir_after_instr(&intr->instr);
+   if (pd && !tu_rt_copy_payload(b, pd, size, false))
+      c->part_fail = "payload type";
+   return true;
+}
+
 static bool
 tu_rt_lower_instr(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -1361,12 +1724,17 @@ tu_rt_lower_instr(nir_builder *b, nir_instr *instr, void *data)
 
    switch (intr->intrinsic) {
    case nir_intrinsic_execute_callable:
-      if (tu_rt_ctx(c, b->impl->function)->call_depth < c->max_call_depth)
+      if (c->part != TU_RT_PART_NONE && c->part != TU_RT_PART_WHOLE)
+         c->part_fail = "callable";
+      else if (tu_rt_ctx(c, b->impl->function)->call_depth < c->max_call_depth)
          tu_rt_execute_callable(b, c, intr);
       break;
    case nir_intrinsic_trace_ray:
-      if (tu_rt_ctx(c, b->impl->function)->ray_depth == 0)
+      if (tu_rt_ctx(c, b->impl->function)->ray_depth == 0) {
+         if (c->part == TU_RT_PART_RAYGEN)
+            return tu_rt_part_raygen_trace(b, c, intr);
          tu_rt_trace_ray(b, c, intr);
+      }
       break;
    case nir_intrinsic_ignore_ray_intersection:
       nir_store_var(b, s->accept, nir_imm_false(b), 0x1);
@@ -1382,6 +1750,8 @@ tu_rt_lower_instr(nir_builder *b, nir_instr *instr, void *data)
       nir_pop_if(b, NULL);
       break;
    case nir_intrinsic_load_ray_launch_id:
+      if (c->part != TU_RT_PART_NONE)
+         return false;
       def = nir_load_global_invocation_id(b, 32);
       break;
    case nir_intrinsic_load_ray_launch_size:
@@ -1579,7 +1949,8 @@ static nir_shader *
 tu_rt_build_shader(struct tu_device *dev,
                    struct tu_ray_tracing_pipeline *pipeline,
                    const VkRayTracingPipelineCreateInfoKHR *create_info,
-                   VkPipelineCreateFlags2KHR flags, int only_raygen)
+                   VkPipelineCreateFlags2KHR flags, int only_raygen,
+                   enum tu_rt_part_kind part = TU_RT_PART_NONE)
 {
    nir_builder _b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, ir3_get_compiler_options(dev->compiler),
@@ -1594,6 +1965,7 @@ tu_rt_build_shader(struct tu_device *dev,
    c.pipeline = pipeline;
    c.flags = flags;
    c.only_raygen = only_raygen;
+   c.part = part;
    c.fn_ctx = _mesa_pointer_hash_table_create(NULL);
    c.fn_cache = (nir_function **)
       calloc(MAX2(pipeline->stage_count, 1) * 2 * (TU_RT_MAX_CALL_DEPTH + 1),
@@ -1787,6 +2159,1701 @@ tu_rt_build_shader(struct tu_device *dev,
    tu_rt_prof_mark("post-optloop", b->shader);
 
    return b->shader;
+}
+
+enum {
+   TU_RT_LINK_OFF = 0,
+   TU_RT_LINK_WHOLE,
+   TU_RT_LINK_FORCE,
+   TU_RT_LINK_AUTO,
+};
+
+static unsigned
+tu_rt_link_mode(void)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *v = os_get_option("TU_RT_LINK");
+      int m = TU_RT_LINK_OFF;
+      if (v && !strcmp(v, "whole"))
+         m = TU_RT_LINK_WHOLE;
+      else if (v && !strcmp(v, "force"))
+         m = TU_RT_LINK_FORCE;
+      else if (v && !strcmp(v, "auto"))
+         m = TU_RT_LINK_AUTO;
+      mode = m;
+   }
+   return mode;
+}
+
+static bool
+tu_rt_log_enabled(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = debug_get_bool_option("TU_RT_LOG", false);
+   return on;
+}
+
+static const char tu_rt_abi_tag[] = "tu-rt-abi-1";
+
+static void
+tu_rt_hash_abi(struct mesa_blake3 *h)
+{
+   _mesa_blake3_update(h, tu_rt_abi_tag, sizeof(tu_rt_abi_tag));
+   const uint32_t abi[] = {
+      TU_RT_FRAME_PAYLOAD, TU_RT_PAYLOAD_MAX, TU_RT_FRAME_STACK,
+      TU_RT_STACK_MAX, TU_RT_FRAME_CALLEE, TU_RT_FRAME_WHOLE,
+      (uint32_t) tu_rt_use_case_tree(),
+   };
+   _mesa_blake3_update(h, abi, sizeof(abi));
+}
+
+struct tu_rt_part_bin {
+   uint32_t count;
+   int32_t max_reg;
+   int32_t max_half_reg;
+   uint32_t branchstack;
+   uint32_t per_wave;
+   uint32_t bindless;
+   uint32_t pvtmem_size;
+   uint32_t constlen;
+   uint32_t num_samp;
+   uint32_t num_uavs;
+   uint32_t push_offset;
+   uint32_t push_size;
+   uint32_t instrs_count;
+   uint32_t nops_count;
+   uint32_t stp_count;
+   uint32_t ldp_count;
+   const uint64_t *instrs;
+};
+
+#define TU_RT_PART_BIN_HDR offsetof(struct tu_rt_part_bin, instrs)
+
+struct tu_rt_partset {
+   struct vk_pipeline_cache_object base;
+   uint32_t kind;
+   uint32_t nparts;
+   uint32_t nclasses;
+   uint32_t classes[TU_RT_MAX_CLASSES];
+   uint32_t payload_size;
+   uint32_t has_payload;
+   uint32_t used;
+   uint32_t scratch;
+   uint32_t active_desc_sets;
+   uint32_t nwords;
+   struct tu_rt_part_bin *parts;
+   uint64_t *words;
+};
+
+static bool tu_rt_partset_serialize(struct vk_pipeline_cache_object *object,
+                                    struct blob *blob);
+static struct vk_pipeline_cache_object *
+tu_rt_partset_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
+                          size_t key_size, struct blob_reader *blob);
+
+static void
+tu_rt_partset_destroy(struct vk_device *vk,
+                      struct vk_pipeline_cache_object *object)
+{
+   struct tu_rt_partset *ps = container_of(object, struct tu_rt_partset, base);
+   vk_pipeline_cache_object_finish(&ps->base);
+   vk_free(&vk->alloc, ps);
+}
+
+static const struct vk_pipeline_cache_object_ops tu_rt_partset_ops = {
+   .serialize = tu_rt_partset_serialize,
+   .deserialize = tu_rt_partset_deserialize,
+   .destroy = tu_rt_partset_destroy,
+};
+
+static struct tu_rt_partset *
+tu_rt_partset_alloc(struct vk_device *vk, const void *key, size_t key_size,
+                    uint32_t nparts, uint32_t nwords)
+{
+   size_t size = sizeof(struct tu_rt_partset) +
+                 MAX2(nparts, 1) * sizeof(struct tu_rt_part_bin) +
+                 (size_t) nwords * sizeof(uint64_t) + key_size;
+   char *mem = (char *) vk_zalloc(&vk->alloc, size, 8,
+                                  VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!mem)
+      return NULL;
+   struct tu_rt_partset *ps = (struct tu_rt_partset *) mem;
+   char *p = mem + sizeof(*ps);
+   ps->parts = (struct tu_rt_part_bin *) p;
+   p += MAX2(nparts, 1) * sizeof(struct tu_rt_part_bin);
+   ps->words = (uint64_t *) p;
+   p += (size_t) nwords * sizeof(uint64_t);
+   memcpy(p, key, key_size);
+   vk_pipeline_cache_object_init(vk, &ps->base, &tu_rt_partset_ops, p, key_size);
+   ps->nparts = nparts;
+   ps->nwords = nwords;
+   return ps;
+}
+
+static void
+tu_rt_partset_fix_ptrs(struct tu_rt_partset *ps)
+{
+   uint32_t off = 0;
+   for (uint32_t i = 0; i < ps->nparts; i++) {
+      ps->parts[i].instrs = ps->words + off;
+      off += ps->parts[i].count;
+   }
+}
+
+static bool
+tu_rt_partset_serialize(struct vk_pipeline_cache_object *object,
+                        struct blob *blob)
+{
+   struct tu_rt_partset *ps = container_of(object, struct tu_rt_partset, base);
+   blob_write_uint32(blob, ps->kind);
+   blob_write_uint32(blob, ps->nparts);
+   blob_write_uint32(blob, ps->nwords);
+   blob_write_uint32(blob, ps->nclasses);
+   blob_write_bytes(blob, ps->classes, sizeof(ps->classes));
+   blob_write_uint32(blob, ps->payload_size);
+   blob_write_uint32(blob, ps->has_payload);
+   blob_write_uint32(blob, ps->used);
+   blob_write_uint32(blob, ps->scratch);
+   blob_write_uint32(blob, ps->active_desc_sets);
+   for (uint32_t i = 0; i < ps->nparts; i++)
+      blob_write_bytes(blob, &ps->parts[i], TU_RT_PART_BIN_HDR);
+   blob_write_bytes(blob, ps->words, (size_t) ps->nwords * sizeof(uint64_t));
+   return true;
+}
+
+static struct vk_pipeline_cache_object *
+tu_rt_partset_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
+                          size_t key_size, struct blob_reader *blob)
+{
+   uint32_t kind = blob_read_uint32(blob);
+   uint32_t nparts = blob_read_uint32(blob);
+   uint32_t nwords = blob_read_uint32(blob);
+   if (blob->overrun || nparts > 4096)
+      return NULL;
+   struct tu_rt_partset *ps =
+      tu_rt_partset_alloc(cache->base.device, key_data, key_size, nparts, nwords);
+   if (!ps)
+      return NULL;
+   ps->kind = kind;
+   ps->nclasses = blob_read_uint32(blob);
+   blob_copy_bytes(blob, ps->classes, sizeof(ps->classes));
+   ps->payload_size = blob_read_uint32(blob);
+   ps->has_payload = blob_read_uint32(blob);
+   ps->used = blob_read_uint32(blob);
+   ps->scratch = blob_read_uint32(blob);
+   ps->active_desc_sets = blob_read_uint32(blob);
+   for (uint32_t i = 0; i < nparts; i++)
+      blob_copy_bytes(blob, &ps->parts[i], TU_RT_PART_BIN_HDR);
+   blob_copy_bytes(blob, ps->words, (size_t) nwords * sizeof(uint64_t));
+   if (blob->overrun) {
+      tu_rt_partset_destroy(cache->base.device, &ps->base);
+      return NULL;
+   }
+   tu_rt_partset_fix_ptrs(ps);
+   return &ps->base;
+}
+
+static struct tu_rt_partset *
+tu_rt_partset_lookup(struct vk_pipeline_cache *cache, const unsigned char *key)
+{
+   bool hit = false;
+   struct vk_pipeline_cache_object *obj =
+      vk_pipeline_cache_lookup_object(cache, key, BLAKE3_KEY_LEN,
+                                      &tu_rt_partset_ops, &hit);
+   return obj ? container_of(obj, struct tu_rt_partset, base) : NULL;
+}
+
+static struct tu_rt_partset *
+tu_rt_partset_insert(struct vk_pipeline_cache *cache, struct tu_rt_partset *ps)
+{
+   struct vk_pipeline_cache_object *obj =
+      vk_pipeline_cache_add_object(cache, &ps->base);
+   return container_of(obj, struct tu_rt_partset, base);
+}
+
+static void
+tu_rt_partset_unref(struct tu_device *dev, struct tu_rt_partset *ps)
+{
+   if (ps)
+      vk_pipeline_cache_object_unref(&dev->vk, &ps->base);
+}
+
+static bool
+tu_rt_lower_part_abi_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *def;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ray_launch_id:
+      def = tu_rt_fload_vec(b, TU_RT_FRAME_LAUNCH_ID, 3);
+      break;
+   case nir_intrinsic_load_rt_cmd_addr_ir3:
+      def = tu_rt_fload_vec(b, TU_RT_FRAME_CMD, 2);
+      break;
+   default:
+      return false;
+   }
+   nir_def_replace(&intr->def, def);
+   return true;
+}
+
+static const char *
+tu_rt_part_check(const struct tu_shader *sh)
+{
+   const struct ir3_shader_variant *v = sh->variant;
+   const struct ir3_const_state *cs = ir3_const_state(v);
+   if (v->inputs_count)
+      return "sysval inputs";
+   if (v->constant_data_size)
+      return "constant data";
+   if (cs->consts_ubo.idx >= 0 || cs->driver_params_ubo.idx >= 0 ||
+       cs->primitive_map_ubo.idx >= 0 || cs->primitive_param_ubo.idx >= 0)
+      return "driver ubo";
+   if (cs->ubo_state.num_enabled)
+      return "ubo ranges";
+   if (v->imm_state.count)
+      return "imm consts";
+   if (sh->const_state.dynamic_offsets_ubo.idx >= 0 ||
+       sh->const_state.inline_uniforms_ubo.idx >= 0 ||
+       sh->const_state.bindless_base_addrs_ubo.idx >= 0 ||
+       sh->const_state.fdm_ubo.idx >= 0)
+      return "tu driver ubo";
+   if (v->info.double_threadsize)
+      return "wave128";
+   if (v->info.preamble_instrs_count || v->early_preamble)
+      return "preamble";
+   if (v->shared_size || v->has_barrier)
+      return "shared";
+   return NULL;
+}
+
+static const char *
+tu_rt_part_compile(struct tu_device *dev, struct tu_pipeline_layout *layout,
+                   const struct tu_shader_key *key, nir_shader *nir,
+                   unsigned scratch_base, struct tu_rt_part_bin *out,
+                   uint64_t **words, uint32_t *desc_sets)
+{
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, tu_rt_lower_part_abi_instr,
+            nir_metadata_control_flow, NULL);
+   nir->scratch_size = MAX2(nir->scratch_size, scratch_base);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   struct ir3_shader_key ir3_key = {};
+   struct tu_shader_info info = {};
+   tu_lower_nir(dev, nir, key, &ir3_key, &info);
+
+   static const char part_key[] = "tu-rt-part";
+   struct tu_rt_shader_opts opts = {};
+   opts.part = true;
+   struct tu_shader *sh = NULL;
+   tu_shader_create(dev, &sh, nir, key, &info, &ir3_key, part_key,
+                    sizeof(part_key), layout, false, &opts);
+   if (!sh || !sh->variant) {
+      if (sh)
+         vk_pipeline_cache_object_unref(&dev->vk, &sh->base);
+      return "compile";
+   }
+
+   const char *reason = tu_rt_part_check(sh);
+   if (!reason) {
+      const struct ir3_shader_variant *v = sh->variant;
+      const uint64_t *bin = (const uint64_t *) v->bin;
+      uint32_t n = v->info.size / 8;
+      while (n && !bin[n - 1])
+         n--;
+      *words = (uint64_t *) malloc(MAX2(n, 1) * sizeof(uint64_t));
+      memcpy(*words, bin, n * sizeof(uint64_t));
+      const struct ir3_const_state *cs = ir3_const_state(v);
+      out->count = n;
+      out->max_reg = v->info.max_reg;
+      out->max_half_reg = v->info.max_half_reg;
+      out->branchstack = v->branchstack;
+      out->per_wave = v->pvtmem_per_wave;
+      out->bindless = (v->bindless_tex ? 1 : 0) | (v->bindless_samp ? 2 : 0) |
+                      (v->bindless_ibo ? 4 : 0) | (v->bindless_ubo ? 8 : 0) |
+                      (v->has_ssbo ? 16 : 0);
+      out->pvtmem_size = v->pvtmem_size;
+      out->constlen = v->constlen;
+      out->num_samp = MAX2(v->num_samp, 0);
+      out->num_uavs = v->num_uavs;
+      out->push_offset = cs->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS].offset_vec4;
+      out->push_size = cs->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS].size_vec4;
+      out->instrs_count = v->info.instrs_count;
+      out->nops_count = v->info.nops_count;
+      out->stp_count = v->info.stp_count;
+      out->ldp_count = v->info.ldp_count;
+      *desc_sets |= sh->active_desc_sets;
+   }
+   vk_pipeline_cache_object_unref(&dev->vk, &sh->base);
+   return reason;
+}
+
+static struct tu_rt_partset *
+tu_rt_partset_from_bins(struct tu_device *dev, const unsigned char *pkey,
+                        uint32_t kind, uint32_t nparts,
+                        struct tu_rt_part_bin *bins, uint64_t **words)
+{
+   uint32_t nwords = 0;
+   for (uint32_t i = 0; i < nparts; i++)
+      nwords += bins[i].count;
+   struct tu_rt_partset *ps =
+      tu_rt_partset_alloc(&dev->vk, pkey, BLAKE3_KEY_LEN, nparts, nwords);
+   if (!ps)
+      return NULL;
+   ps->kind = kind;
+   uint32_t off = 0;
+   for (uint32_t i = 0; i < nparts; i++) {
+      ps->parts[i] = bins[i];
+      memcpy(ps->words + off, words[i], bins[i].count * sizeof(uint64_t));
+      off += bins[i].count;
+   }
+   tu_rt_partset_fix_ptrs(ps);
+   return ps;
+}
+
+struct tu_rt_fake_pipeline {
+   struct tu_ray_tracing_pipeline p;
+   nir_shader *stages[1];
+};
+
+static void
+tu_rt_fake_pipeline_init(struct tu_rt_fake_pipeline *f, nir_shader *stage)
+{
+   memset(f, 0, sizeof(*f));
+   f->stages[0] = stage;
+   f->p.stages = f->stages;
+   f->p.stage_count = 1;
+   f->p.group_count = 0;
+}
+
+static void
+tu_rt_part_compiler_init(struct tu_rt_compiler *c, nir_shader *nir,
+                         struct tu_ray_tracing_pipeline *pipeline,
+                         VkPipelineCreateFlags2KHR flags,
+                         enum tu_rt_part_kind kind)
+{
+   memset(c, 0, sizeof(*c));
+   c->pipeline = pipeline;
+   c->flags = flags;
+   c->part = kind;
+   c->only_raygen = -1;
+   c->fn_ctx = _mesa_pointer_hash_table_create(NULL);
+   c->fn_cache = (nir_function **)
+      calloc(MAX2(pipeline->stage_count, 1) * 2 * (TU_RT_MAX_CALL_DEPTH + 1),
+             sizeof(nir_function *));
+   c->isec_cache = (nir_function **)
+      calloc(MAX2(pipeline->group_count, 1) * (TU_RT_MAX_CALL_DEPTH + 1),
+             sizeof(nir_function *));
+   tu_rt_state_init(nir, &c->state);
+   c->hit_words = tu_rt_hit_words_var(nir);
+}
+
+static void
+tu_rt_part_compiler_fini(struct tu_rt_compiler *c)
+{
+   ralloc_free(c->fn_ctx);
+   free(c->fn_cache);
+   free(c->isec_cache);
+}
+
+static nir_builder
+tu_rt_part_builder(struct tu_device *dev, const char *name,
+                   mesa_shader_stage stage = MESA_SHADER_COMPUTE)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      stage, ir3_get_compiler_options(dev->compiler), "%s", name);
+   b.shader->info.workgroup_size[0] = 8;
+   b.shader->info.workgroup_size[1] = 8;
+   b.shader->info.workgroup_size[2] = 1;
+   return b;
+}
+
+static void
+tu_rt_part_lower_common(nir_shader *nir, struct tu_rt_compiler *c)
+{
+   nir_shader_instructions_pass(nir, tu_rt_lower_instr, nir_metadata_none, c);
+   NIR_PASS(_, nir, nir_lower_continue_constructs);
+   NIR_PASS(_, nir, nir_lower_returns);
+   NIR_PASS(_, nir, nir_inline_functions);
+   nir_remove_non_entrypoints(nir);
+   NIR_PASS(_, nir, nir_opt_deref);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_deref);
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   tu_rt_pun_mismatched_vars(nir);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_opt_ray_queries);
+   NIR_PASS(_, nir, tu_nir_lower_ray_queries);
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_lower_system_values);
+}
+
+static uint64_t
+tu_rt_count_instrs(nir_shader *nir)
+{
+   uint64_t n = 0;
+   nir_foreach_function_impl (impl, nir)
+      nir_foreach_block (block, impl)
+         nir_foreach_instr (instr, block)
+            n++;
+   return n;
+}
+
+static bool
+tu_rt_should_remat(nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_rt_cmd_addr_ir3:
+      return true;
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+      return (nir_intrinsic_access(intr) & ACCESS_CAN_REORDER) != 0;
+   default:
+      return false;
+   }
+}
+
+static bool
+tu_rt_lower_rt_call(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const char **fail = (const char **) data;
+   if (intr->intrinsic == nir_intrinsic_rt_resume) {
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   if (intr->intrinsic == nir_intrinsic_rt_execute_callable) {
+      *fail = "callable";
+      return false;
+   }
+   if (intr->intrinsic != nir_intrinsic_rt_trace_ray)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *accel = intr->src[0].ssa;
+   if (accel->bit_size == 64 && accel->num_components == 1)
+      accel = nir_unpack_64_2x32(b, accel);
+   else if (!(accel->bit_size == 32 && accel->num_components == 2))
+      *fail = "accel struct form";
+   if (accel->num_components == 2)
+      tu_rt_fstore_vec(b, TU_RT_FRAME_ACCEL, accel);
+   tu_rt_fstore(b, TU_RT_FRAME_FLAGS, intr->src[1].ssa);
+   tu_rt_fstore(b, TU_RT_FRAME_CULL, intr->src[2].ssa);
+   tu_rt_fstore(b, TU_RT_FRAME_SBT_OFFSET, nir_iand_imm(b, intr->src[3].ssa, 0xF));
+   tu_rt_fstore(b, TU_RT_FRAME_SBT_STRIDE, nir_iand_imm(b, intr->src[4].ssa, 0xF));
+   tu_rt_fstore(b, TU_RT_FRAME_MISS_INDEX, nir_iand_imm(b, intr->src[5].ssa, 0xFFFF));
+   tu_rt_fstore_vec(b, TU_RT_FRAME_ORIGIN, intr->src[6].ssa);
+   tu_rt_fstore(b, TU_RT_FRAME_TMIN, intr->src[7].ssa);
+   tu_rt_fstore_vec(b, TU_RT_FRAME_DIR, intr->src[8].ssa);
+   tu_rt_fstore(b, TU_RT_FRAME_TMAX, intr->src[9].ssa);
+   tu_rt_fstore(b, TU_RT_FRAME_RET,
+                nir_imm_int(b, TU_RT_SEL_RG(nir_intrinsic_call_idx(intr) + 1)));
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static bool
+tu_rt_halt_to_return(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_jump)
+      return false;
+   nir_jump_instr *jump = nir_instr_as_jump(instr);
+   if (jump->type != nir_jump_halt)
+      return false;
+   jump->type = nir_jump_return;
+   return true;
+}
+
+static const char *
+tu_rt_finish_raygen_part(nir_shader *nir)
+{
+   const char *fail = NULL;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   tu_rt_fstore(&b, TU_RT_FRAME_SEL, nir_imm_int(&b, TU_RT_SEL_DONE));
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, tu_rt_lower_rt_call,
+            nir_metadata_control_flow, &fail);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, tu_rt_halt_to_return,
+            nir_metadata_none, NULL);
+   NIR_PASS(_, nir, nir_lower_returns);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_derefs);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_call_data, NULL);
+   nir->info.stage = MESA_SHADER_COMPUTE;
+   return fail;
+}
+
+struct tu_rt_part_env {
+   struct tu_device *dev;
+   struct tu_pipeline_layout *layout;
+   const struct tu_shader_key *key;
+   VkPipelineCreateFlags2KHR flags;
+};
+
+static const char *
+tu_rt_build_raygen_parts(const struct tu_rt_part_env *env, nir_shader *stage,
+                         const unsigned char *pkey, struct tu_rt_partset **out,
+                         int64_t *probe)
+{
+   struct tu_device *dev = env->dev;
+   struct tu_rt_fake_pipeline fake;
+   tu_rt_fake_pipeline_init(&fake, stage);
+
+   nir_builder _b = tu_rt_part_builder(dev, "tu rt raygen part", MESA_SHADER_CALLABLE);
+   nir_builder *b = &_b;
+   struct tu_rt_compiler c;
+   tu_rt_part_compiler_init(&c, b->shader, &fake.p, env->flags, TU_RT_PART_RAYGEN);
+
+   struct tu_rt_sbt_entry raygen = tu_rt_load_sbt_entry(
+      b, NULL, offsetof(VkTraceRaysIndirectCommand2KHR, raygenShaderRecordAddress));
+   nir_store_var(b, c.state.shader_record_ptr, raygen.shader_record_ptr, 0x1);
+   tu_rt_call_stage(b, &c, stage, nir_undef(b, 1, 32), 0, 0);
+   tu_rt_part_lower_common(b->shader, &c);
+   const char *fail = c.part_fail;
+   unsigned nclasses = c.part_nclasses;
+   uint32_t classes[TU_RT_MAX_CLASSES];
+   memcpy(classes, c.part_classes, sizeof(classes));
+   tu_rt_part_compiler_fini(&c);
+   if (fail) {
+      ralloc_free(b->shader);
+      return fail;
+   }
+
+   nir_shader *nir = b->shader;
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_deref);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_derefs);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
+   if (tu_rt_log_enabled() && debug_get_bool_option("TU_RT_PROBE_VARS", false)) {
+      nir_foreach_function_temp_variable (var, nir_shader_get_entrypoint(nir)) {
+         unsigned size, al;
+         glsl_get_natural_size_align_bytes(var->type, &size, &al);
+         mesa_logi("tu-rt-probe:   local %s %s %u bytes", var->name ? var->name : "?",
+                   glsl_get_type_name(var->type), size);
+      }
+   }
+   nir->scratch_size = TU_RT_FRAME_STACK;
+   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_function_temp,
+            glsl_get_natural_size_align_bytes);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_function_temp,
+            nir_address_format_32bit_offset);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   struct ir3_optimize_options optimize_options = {};
+   ir3_optimize_loop(dev->compiler, &optimize_options, nir);
+   unsigned locals = nir->scratch_size - TU_RT_FRAME_STACK;
+   uint64_t pre = tu_rt_count_instrs(nir);
+
+   nir_lower_shader_calls_options opts = {};
+   opts.address_format = nir_address_format_32bit_offset;
+   opts.stack_alignment = 4;
+   opts.localized_loads = true;
+   opts.should_remat_callback = tu_rt_should_remat;
+   void *mem_ctx = ralloc_context(NULL);
+   nir_shader **resume = NULL;
+   uint32_t nresume = 0;
+   nir_lower_shader_calls(nir, &opts, &resume, &nresume, mem_ctx);
+
+   uint32_t nparts = 1 + nresume;
+   nir_shader **shaders = (nir_shader **) calloc(nparts, sizeof(nir_shader *));
+   shaders[0] = nir;
+   for (uint32_t i = 0; i < nresume; i++) {
+      shaders[1 + i] = resume[i];
+      ralloc_steal(NULL, resume[i]);
+      resume[i]->info.name = ralloc_strdup(resume[i], resume[i]->info.name);
+   }
+   ralloc_free(mem_ctx);
+
+   unsigned scratch = 0;
+   uint64_t post = 0;
+   for (uint32_t i = 0; i < nparts && !fail; i++) {
+      scratch = MAX2(scratch, shaders[i]->scratch_size);
+      fail = tu_rt_finish_raygen_part(shaders[i]);
+      post += tu_rt_count_instrs(shaders[i]);
+   }
+   if (!fail && scratch > TU_RT_FRAME_CALLEE)
+      fail = "stack too large";
+
+   if (probe) {
+      probe[0] = nparts;
+      probe[1] = scratch > TU_RT_FRAME_STACK ? scratch - TU_RT_FRAME_STACK : 0;
+      probe[2] = locals;
+      probe[3] = pre;
+      probe[4] = post;
+      probe[5] = nclasses;
+   }
+
+   struct tu_rt_part_bin *bins = (struct tu_rt_part_bin *)
+      calloc(nparts, sizeof(struct tu_rt_part_bin));
+   uint64_t **words = (uint64_t **) calloc(nparts, sizeof(uint64_t *));
+   uint32_t sets = 0;
+   uint32_t i = 0;
+   for (; i < nparts && !fail; i++) {
+      nir_shader *s = shaders[i];
+      shaders[i] = NULL;
+      fail = tu_rt_part_compile(dev, env->layout, env->key, s, 0, &bins[i],
+                                &words[i], &sets);
+   }
+   for (; i < nparts; i++)
+      ralloc_free(shaders[i]);
+   free(shaders);
+
+   if (!fail) {
+      *out = tu_rt_partset_from_bins(dev, pkey, TU_RT_PART_RAYGEN, nparts, bins, words);
+      if (!*out) {
+         fail = "oom";
+      } else {
+         (*out)->nclasses = nclasses;
+         memcpy((*out)->classes, classes, sizeof(classes));
+         (*out)->scratch = scratch;
+         (*out)->active_desc_sets = sets;
+      }
+   }
+   for (uint32_t j = 0; j < nparts; j++)
+      free(words[j]);
+   free(words);
+   free(bins);
+   return fail;
+}
+
+static const char *
+tu_rt_build_callee_part(const struct tu_rt_part_env *env, nir_shader *stage,
+                        const unsigned char *pkey, struct tu_rt_partset **out)
+{
+   struct tu_device *dev = env->dev;
+   struct tu_rt_fake_pipeline fake;
+   tu_rt_fake_pipeline_init(&fake, stage);
+
+   nir_builder _b = tu_rt_part_builder(dev, "tu rt callee part");
+   nir_builder *b = &_b;
+   struct tu_rt_compiler c;
+   tu_rt_part_compiler_init(&c, b->shader, &fake.p, env->flags, TU_RT_PART_CALLEE);
+   struct tu_rt_state *s = &c.state;
+
+   bool has = false;
+   unsigned size = tu_rt_call_data_size(stage, &has);
+   const char *fail = size > TU_RT_PAYLOAD_MAX ? "payload too large" : NULL;
+   uint32_t used = tu_rt_scan_used(stage);
+
+   nir_store_var(b, s->flags, tu_rt_fload(b, TU_RT_FRAME_FLAGS, 1), 0x1);
+   nir_store_var(b, s->cull_mask, tu_rt_fload(b, TU_RT_FRAME_CULL, 1), 0x1);
+   nir_store_var(b, s->origin, tu_rt_fload_vec(b, TU_RT_FRAME_ORIGIN, 3), 0x7);
+   nir_store_var(b, s->tmin, tu_rt_fload(b, TU_RT_FRAME_TMIN, 1), 0x1);
+   nir_store_var(b, s->dir, tu_rt_fload_vec(b, TU_RT_FRAME_DIR, 3), 0x7);
+   nir_store_var(b, s->tmax, tu_rt_fload(b, TU_RT_FRAME_TMAX, 1), 0x1);
+   nir_store_var(b, s->shader_record_ptr,
+                 nir_pack_64_2x32(b, tu_rt_fload_vec(b, TU_RT_FRAME_RECORD, 2)), 0x1);
+   if (stage->info.stage == MESA_SHADER_CLOSEST_HIT) {
+      nir_store_var(b, s->hit_kind, tu_rt_fload(b, TU_RT_FRAME_HIT_KIND, 1), 0x1);
+      if (used & TU_RT_USE_INSTANCE_ID)
+         nir_store_var(b, s->instance_id, tu_rt_fload(b, TU_RT_FRAME_INSTANCE_ID, 1), 0x1);
+      if (used & TU_RT_USE_CUSTOM_INDEX)
+         nir_store_var(b, s->custom_index, tu_rt_fload(b, TU_RT_FRAME_CUSTOM_INDEX, 1), 0x1);
+      if (used & TU_RT_USE_PRIMITIVE_ID)
+         nir_store_var(b, s->primitive_id, tu_rt_fload(b, TU_RT_FRAME_PRIMITIVE_ID, 1), 0x1);
+      if (used & TU_RT_USE_GEOMETRY_INDEX)
+         nir_store_var(b, s->geometry_index, tu_rt_fload(b, TU_RT_FRAME_GEOMETRY_INDEX, 1), 0x1);
+      if (used & TU_RT_USE_OBJECT_ORIGIN)
+         nir_store_var(b, s->object_origin, tu_rt_fload_vec(b, TU_RT_FRAME_OBJECT_ORIGIN, 3), 0x7);
+      if (used & TU_RT_USE_OBJECT_DIR)
+         nir_store_var(b, s->object_dir, tu_rt_fload_vec(b, TU_RT_FRAME_OBJECT_DIR, 3), 0x7);
+      for (unsigned col = 0; col < 4; col++) {
+         if (used & TU_RT_USE_WTO)
+            nir_store_var(b, s->wto[col], tu_rt_fload_vec(b, TU_RT_FRAME_WTO + 12 * col, 3), 0x7);
+         if (used & TU_RT_USE_OTW)
+            nir_store_var(b, s->otw[col], tu_rt_fload_vec(b, TU_RT_FRAME_OTW + 12 * col, 3), 0x7);
+      }
+      for (unsigned i = 0; i < TU_RT_HIT_WORDS; i++)
+         nir_store_deref(b, tu_rt_hw(b, c.hit_words, nir_imm_int(b, i)),
+                         tu_rt_fload(b, TU_RT_FRAME_HIT_WORDS + 4 * i, 1), 0x1);
+   }
+
+   nir_def *arg = NULL;
+   nir_deref_instr *pd = NULL;
+   if (has) {
+      nir_variable *pvar = NULL;
+      nir_foreach_variable_with_modes (var, stage, nir_var_shader_call_data) {
+         pvar = nir_local_variable_create(b->impl, var->type, "tu_rt_payload");
+         break;
+      }
+      pd = nir_build_deref_var(b, pvar);
+      if (!tu_rt_copy_payload(b, pd, size, false))
+         fail = "payload type";
+      arg = &pd->def;
+   } else {
+      arg = nir_undef(b, 1, 32);
+   }
+   tu_rt_call_stage(b, &c, stage, arg, 1, 0);
+   if (pd && !tu_rt_copy_payload(b, nir_build_deref_var(b, pd->var), size, true))
+      fail = "payload type";
+   tu_rt_fstore(b, TU_RT_FRAME_SEL, tu_rt_fload(b, TU_RT_FRAME_RET, 1));
+
+   tu_rt_part_lower_common(b->shader, &c);
+   if (!fail)
+      fail = c.part_fail;
+   tu_rt_part_compiler_fini(&c);
+   if (fail) {
+      ralloc_free(b->shader);
+      return fail;
+   }
+
+   nir_shader *nir = b->shader;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   struct ir3_optimize_options optimize_options = {};
+   ir3_optimize_loop(dev->compiler, &optimize_options, nir);
+
+   struct tu_rt_part_bin bin = {};
+   uint64_t *words = NULL;
+   uint32_t sets = 0;
+   fail = tu_rt_part_compile(dev, env->layout, env->key, nir, TU_RT_FRAME_CALLEE,
+                             &bin, &words, &sets);
+   if (!fail) {
+      *out = tu_rt_partset_from_bins(dev, pkey, TU_RT_PART_CALLEE, 1, &bin, &words);
+      if (!*out) {
+         fail = "oom";
+      } else {
+         (*out)->payload_size = size;
+         (*out)->has_payload = has;
+         (*out)->used = used;
+         (*out)->active_desc_sets = sets;
+      }
+   }
+   free(words);
+   return fail;
+}
+
+struct tu_rt_trav_desc {
+   unsigned cls;
+   uint32_t used;
+   uint32_t used_chit;
+   bool has_ahit;
+   bool has_isec;
+};
+
+static const char *
+tu_rt_build_traversal_part(const struct tu_rt_part_env *env,
+                           struct tu_ray_tracing_pipeline *pipeline,
+                           const struct tu_rt_trav_desc *d,
+                           const unsigned char *pkey, struct tu_rt_partset **out)
+{
+   struct tu_device *dev = env->dev;
+   nir_builder _b = tu_rt_part_builder(dev, "tu rt traversal part");
+   nir_builder *b = &_b;
+   struct tu_rt_compiler c;
+   tu_rt_part_compiler_init(&c, b->shader, pipeline, env->flags, TU_RT_PART_TRAVERSAL);
+   c.part_payload_size = d->cls;
+   c.part_hit_used = d->used_chit;
+   c.used = d->used;
+   c.has_ahit = d->has_ahit;
+   c.has_isec = d->has_isec;
+
+   unsigned nwords = MAX2(DIV_ROUND_UP(d->cls, 4), 1);
+   nir_variable *w =
+      nir_local_variable_create(b->impl, glsl_array_type(glsl_uint_type(), nwords, 4),
+                                "tu_rt_trav_payload");
+   for (unsigned i = 0; i < DIV_ROUND_UP(d->cls, 4); i++)
+      nir_store_deref(b, tu_rt_hw(b, w, nir_imm_int(b, i)),
+                      tu_rt_fload(b, TU_RT_FRAME_PAYLOAD + 4 * i, 1), 0x1);
+
+   struct tu_rt_ray r = {};
+   r.accel = nir_pack_64_2x32(b, tu_rt_fload_vec(b, TU_RT_FRAME_ACCEL, 2));
+   r.flags = tu_rt_fload(b, TU_RT_FRAME_FLAGS, 1);
+   r.cull_mask = tu_rt_fload(b, TU_RT_FRAME_CULL, 1);
+   r.sbt_offset = tu_rt_fload(b, TU_RT_FRAME_SBT_OFFSET, 1);
+   r.sbt_stride = tu_rt_fload(b, TU_RT_FRAME_SBT_STRIDE, 1);
+   r.miss_index = tu_rt_fload(b, TU_RT_FRAME_MISS_INDEX, 1);
+   r.origin = tu_rt_fload_vec(b, TU_RT_FRAME_ORIGIN, 3);
+   r.tmin = tu_rt_fload(b, TU_RT_FRAME_TMIN, 1);
+   r.dir = tu_rt_fload_vec(b, TU_RT_FRAME_DIR, 3);
+   r.tmax = tu_rt_fload(b, TU_RT_FRAME_TMAX, 1);
+   r.payload = &nir_build_deref_var(b, w)->def;
+   tu_rt_trace_ray_emit(b, &c, &r);
+
+   for (unsigned i = 0; i < DIV_ROUND_UP(d->cls, 4); i++)
+      tu_rt_fstore(b, TU_RT_FRAME_PAYLOAD + 4 * i,
+                   nir_load_deref(b, tu_rt_hw(b, w, nir_imm_int(b, i))));
+
+   tu_rt_part_lower_common(b->shader, &c);
+   const char *fail = c.part_fail;
+   tu_rt_part_compiler_fini(&c);
+   if (fail) {
+      ralloc_free(b->shader);
+      return fail;
+   }
+
+   nir_shader *nir = b->shader;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   struct ir3_optimize_options optimize_options = {};
+   ir3_optimize_loop(dev->compiler, &optimize_options, nir);
+
+   struct tu_rt_part_bin bin = {};
+   uint64_t *words = NULL;
+   uint32_t sets = 0;
+   fail = tu_rt_part_compile(dev, env->layout, env->key, nir, TU_RT_FRAME_CALLEE,
+                             &bin, &words, &sets);
+   if (!fail) {
+      *out = tu_rt_partset_from_bins(dev, pkey, TU_RT_PART_TRAVERSAL, 1, &bin, &words);
+      if (!*out) {
+         fail = "oom";
+      } else {
+         (*out)->payload_size = d->cls;
+         (*out)->used = d->used;
+         (*out)->active_desc_sets = sets;
+      }
+   }
+   free(words);
+   return fail;
+}
+
+struct tu_rt_link_merge {
+   const struct tu_rt_part_bin **parts;
+   uint32_t nparts;
+   const char *fail;
+};
+
+static void
+tu_rt_link_fixup(struct ir3_shader_variant *v, void *data)
+{
+   struct tu_rt_link_merge *m = (struct tu_rt_link_merge *) data;
+   const struct ir3_compiler *compiler = v->compiler;
+   const struct ir3_const_state *cs = ir3_const_state(v);
+   const struct ir3_const_allocation *push =
+      &cs->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS];
+
+   if (v->rt_blob_live_fail) {
+      m->fail = "live across blob";
+      return;
+   }
+   if (v->info.double_threadsize) {
+      m->fail = "host wave128";
+      return;
+   }
+
+   int max_reg = v->info.max_reg, max_half_reg = v->info.max_half_reg;
+   unsigned bs = 0, pvt = v->pvtmem_size, constlen = v->constlen;
+   bool per_wave = v->pvtmem_per_wave;
+   for (uint32_t i = 0; i < m->nparts; i++) {
+      const struct tu_rt_part_bin *p = m->parts[i];
+      if (p->push_size && (p->push_offset != push->offset_vec4 ||
+                           p->push_size != push->size_vec4)) {
+         m->fail = "push const layout";
+         return;
+      }
+      max_reg = MAX2(max_reg, p->max_reg);
+      max_half_reg = MAX2(max_half_reg, p->max_half_reg);
+      bs = MAX2(bs, p->branchstack);
+      pvt = MAX2(pvt, p->pvtmem_size);
+      constlen = MAX2(constlen, p->constlen);
+      per_wave = per_wave && p->per_wave;
+      v->bindless_tex |= !!(p->bindless & 1);
+      v->bindless_samp |= !!(p->bindless & 2);
+      v->bindless_ibo |= !!(p->bindless & 4);
+      v->bindless_ubo |= !!(p->bindless & 8);
+      v->has_ssbo |= !!(p->bindless & 16);
+      v->num_samp = MAX2(v->num_samp, (int) p->num_samp);
+      v->num_uavs = MAX2(v->num_uavs, p->num_uavs);
+   }
+   v->info.max_reg = max_reg;
+   v->info.max_half_reg = max_half_reg;
+   v->branchstack += bs;
+   v->pvtmem_size = align(pvt, compiler->pvtmem_per_fiber_align);
+   v->pvtmem_per_wave = per_wave;
+   v->constlen = constlen;
+   v->info.constlen = constlen;
+
+   ir3_update_max_waves(v);
+}
+
+static void
+tu_rt_emit_blob(nir_builder *b, uint32_t idx)
+{
+   nir_rt_blob_ir3(b, .base = idx);
+}
+
+struct tu_rt_glue_class {
+   uint32_t cls;
+   uint32_t trav_blob;
+   struct tu_rt_case *chit;
+   uint32_t nchit;
+   struct tu_rt_case *miss;
+   uint32_t nmiss;
+};
+
+static nir_shader *
+tu_rt_build_glue(struct tu_device *dev, bool whole, uint32_t handle,
+                 uint32_t nrg, struct tu_rt_glue_class *classes,
+                 uint32_t nclasses)
+{
+   nir_builder _b = tu_rt_part_builder(dev, "tu rt link");
+   nir_builder *b = &_b;
+
+   nir_def *launch_id = nir_load_global_invocation_id(b, 32);
+   nir_def *launch_size =
+      tu_rt_load_cmd(b, offsetof(VkTraceRaysIndirectCommand2KHR, width), 3);
+   nir_def *oob = nir_ige(b, nir_channel(b, launch_id, 0), nir_channel(b, launch_size, 0));
+   oob = nir_ior(b, oob, nir_ige(b, nir_channel(b, launch_id, 1), nir_channel(b, launch_size, 1)));
+   oob = nir_ior(b, oob, nir_ige(b, nir_channel(b, launch_id, 2), nir_channel(b, launch_size, 2)));
+   nir_push_if(b, nir_inot(b, oob));
+   tu_rt_fstore_vec(b, TU_RT_FRAME_LAUNCH_ID, launch_id);
+   tu_rt_fstore_vec(b, TU_RT_FRAME_CMD, nir_load_rt_cmd_addr_ir3(b));
+
+   if (whole) {
+      tu_rt_emit_blob(b, 0);
+   } else {
+      struct tu_rt_sbt_entry raygen = tu_rt_load_sbt_entry(
+         b, NULL, offsetof(VkTraceRaysIndirectCommand2KHR, raygenShaderRecordAddress));
+      tu_rt_fstore(b, TU_RT_FRAME_SEL,
+                   nir_bcsel(b, nir_ieq_imm(b, raygen.value, handle),
+                             nir_imm_int(b, TU_RT_SEL_RG(0)),
+                             nir_imm_int(b, TU_RT_SEL_DONE)));
+
+      uint32_t ncases = nrg + 3 * nclasses;
+      struct tu_rt_case *cases =
+         (struct tu_rt_case *) calloc(MAX2(ncases, 1), sizeof(struct tu_rt_case));
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < nrg; i++)
+         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_RG(i), i };
+      for (uint32_t i = 0; i < nclasses; i++) {
+         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_TRAV(classes[i].cls), 0x10000 | i };
+         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_CHIT(classes[i].cls), 0x20000 | i };
+         cases[n++] = (struct tu_rt_case) { TU_RT_SEL_MISS(classes[i].cls), 0x30000 | i };
+      }
+
+      nir_loop *loop = nir_push_loop(b);
+      {
+         nir_def *sel = tu_rt_fload(b, TU_RT_FRAME_SEL, 1);
+         nir_break_if(b, nir_ieq_imm(b, sel, TU_RT_SEL_DONE));
+         tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_DONE));
+         tu_rt_emit_cases(b, sel, cases, n, [&](const struct tu_rt_case &cs) {
+            uint32_t kind = cs.group >> 16, idx = cs.group & 0xffff;
+            if (kind == 0) {
+               tu_rt_emit_blob(b, idx);
+            } else if (kind == 1) {
+               tu_rt_emit_blob(b, classes[idx].trav_blob);
+            } else {
+               struct tu_rt_case *hc = kind == 2 ? classes[idx].chit : classes[idx].miss;
+               uint32_t hn = kind == 2 ? classes[idx].nchit : classes[idx].nmiss;
+               tu_rt_fstore(b, TU_RT_FRAME_SEL, tu_rt_fload(b, TU_RT_FRAME_RET, 1));
+               nir_def *h = tu_rt_fload(b, TU_RT_FRAME_HANDLE, 1);
+               tu_rt_emit_cases(b, h, hc, hn, [&](const struct tu_rt_case &hcs) {
+                  tu_rt_emit_blob(b, hcs.group);
+               });
+            }
+         });
+      }
+      nir_pop_loop(b, loop);
+      free(cases);
+   }
+   nir_pop_if(b, NULL);
+
+   nir_shader *nir = b->shader;
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   nir->scratch_size = TU_RT_FRAME_PAYLOAD;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   struct ir3_optimize_options optimize_options = {};
+   ir3_optimize_loop(dev->compiler, &optimize_options, nir);
+   return nir;
+}
+
+static const char *
+tu_rt_link_one(struct tu_device *dev, struct tu_pipeline_layout *layout,
+               const struct tu_shader_key *key, nir_shader *glue,
+               const struct ir3_rt_blobs *blobs,
+               const struct tu_rt_part_bin **parts, uint32_t nparts,
+               uint32_t desc_sets, const unsigned char *link_key,
+               struct vk_pipeline_cache *cache, struct tu_shader **out)
+{
+   struct tu_rt_link_merge merge = { parts, nparts, NULL };
+   struct tu_rt_shader_opts opts = {};
+   opts.blobs = blobs;
+   opts.fixup = tu_rt_link_fixup;
+   opts.fixup_data = &merge;
+
+   struct ir3_shader_key ir3_key = {};
+   struct tu_shader_info info = {};
+   tu_lower_nir(dev, glue, key, &ir3_key, &info);
+   struct tu_shader *sh = NULL;
+   tu_shader_create(dev, &sh, glue, key, &info, &ir3_key, link_key,
+                    BLAKE3_KEY_LEN, layout, false, &opts);
+   if (!sh)
+      return "host compile";
+   static const char *dump_dir = os_get_option("TU_RT_LINK_DISASM");
+   if (dump_dir) {
+      char path[512], hex[17];
+      tu_keylog_hex(hex, link_key, 8);
+      snprintf(path, sizeof(path), "%s/link_%s.txt", dump_dir, hex);
+      FILE *f = fopen(path, "w");
+      if (f) {
+         fprintf(f, "; blobs=%u regs=%d half=%d bs=%u pvt=%u perwave=%d constlen=%u instrlen=%u\n",
+                 blobs->count, sh->variant->info.max_reg + 1, sh->variant->info.max_half_reg + 1,
+                 sh->variant->branchstack, sh->variant->pvtmem_size,
+                 sh->variant->pvtmem_per_wave, sh->variant->constlen, sh->variant->instrlen);
+         if (merge.fail)
+            fprintf(f, "; FAIL %s\n", merge.fail);
+         ir3_rt_disasm(sh->variant, f);
+         fclose(f);
+      }
+   }
+   if (merge.fail) {
+      vk_pipeline_cache_object_unref(&dev->vk, &sh->base);
+      return merge.fail;
+   }
+   sh->active_desc_sets |= desc_sets;
+   *out = container_of(vk_pipeline_cache_add_object(cache, &sh->base),
+                       struct tu_shader, base);
+   return NULL;
+}
+
+struct tu_rt_par_job {
+   std::atomic<uint32_t> next;
+   uint32_t count;
+   void (*fn)(void *ctx, uint32_t i);
+   void *ctx;
+};
+
+static void *
+tu_rt_par_worker(void *data)
+{
+   struct tu_rt_par_job *job = (struct tu_rt_par_job *) data;
+   for (;;) {
+      uint32_t i = job->next.fetch_add(1);
+      if (i >= job->count)
+         break;
+      job->fn(job->ctx, i);
+   }
+   return NULL;
+}
+
+static void
+tu_rt_par_run(uint32_t count, void (*fn)(void *ctx, uint32_t i), void *ctx)
+{
+   if (!count)
+      return;
+   struct tu_rt_par_job job;
+   job.next.store(0);
+   job.count = count;
+   job.fn = fn;
+   job.ctx = ctx;
+   static const unsigned max_jobs = debug_get_num_option("TU_RT_JOBS", 4);
+   unsigned nthreads = MIN3(MAX2(max_jobs, 1u), count, 16u);
+   pthread_t threads[16];
+   unsigned started = 0;
+   for (unsigned t = 1; t < nthreads; t++) {
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, 256u << 20);
+      if (pthread_create(&threads[started], &attr, tu_rt_par_worker, &job) == 0)
+         started++;
+      pthread_attr_destroy(&attr);
+   }
+   tu_rt_par_worker(&job);
+   for (unsigned t = 0; t < started; t++)
+      pthread_join(threads[t], NULL);
+}
+
+static void
+tu_rt_part_key(unsigned char *out, const char *tag, const unsigned char *stage_hash,
+               const struct tu_shader_key *key, struct tu_pipeline_layout *layout)
+{
+   struct mesa_blake3 h;
+   _mesa_blake3_init(&h);
+   _mesa_blake3_update(&h, tag, strlen(tag) + 1);
+   tu_rt_hash_abi(&h);
+   if (stage_hash)
+      _mesa_blake3_update(&h, stage_hash, BLAKE3_KEY_LEN);
+   _mesa_blake3_update(&h, key, sizeof(*key));
+   enum ir3_shader_debug dbg = ir3_shader_debug_hash_key();
+   _mesa_blake3_update(&h, &dbg, sizeof(dbg));
+   if (layout)
+      _mesa_blake3_update(&h, layout->blake3, sizeof(layout->blake3));
+   _mesa_blake3_final(&h, out);
+}
+
+struct tu_rt_link_ctx {
+   struct tu_rt_part_env env;
+   struct vk_pipeline_cache *cache;
+   struct tu_ray_tracing_pipeline *pipeline;
+   const VkRayTracingPipelineCreateInfoKHR *create_info;
+   const uint32_t *groups;
+   const unsigned char *link_keys;
+   bool whole;
+
+   struct tu_rt_partset **rg_sets;
+   uint32_t *rg_stage;
+
+   uint32_t *callee_stages;
+   uint32_t ncallee;
+   struct tu_rt_partset **callee_sets;
+   int32_t *stage_to_callee;
+
+   uint32_t classes[64];
+   uint32_t nclasses;
+   struct tu_rt_trav_desc trav[64];
+   struct tu_rt_partset *trav_sets[64];
+
+   std::atomic<int> fail_count;
+   const char *fail;
+   simple_mtx_t lock;
+
+   int64_t t_rg, t_callee, t_trav, t_link, t_link_max;
+   std::atomic<int64_t> a_rg, a_callee, a_trav, a_link, a_link_max;
+   std::atomic<uint32_t> n_rg_built, n_callee_built, n_trav_built;
+   int64_t probe[6];
+   std::atomic<int64_t> probe_acc[8];
+};
+
+static void
+tu_rt_link_note_fail(struct tu_rt_link_ctx *lc, const char *why)
+{
+   simple_mtx_lock(&lc->lock);
+   if (!lc->fail)
+      lc->fail = why;
+   simple_mtx_unlock(&lc->lock);
+   lc->fail_count.fetch_add(1);
+}
+
+static void
+tu_rt_link_rg_job(void *data, uint32_t v)
+{
+   struct tu_rt_link_ctx *lc = (struct tu_rt_link_ctx *) data;
+   if (lc->fail_count.load() || lc->pipeline->variants[v].shader)
+      return;
+   uint32_t s = lc->rg_stage[v];
+   unsigned char pkey[BLAKE3_KEY_LEN];
+   tu_rt_part_key(pkey, "tu-rt-part-rg-1", lc->pipeline->stage_hashes + s * BLAKE3_KEY_LEN,
+                  lc->env.key, lc->env.layout);
+   struct tu_rt_partset *ps = tu_rt_partset_lookup(lc->cache, pkey);
+   if (!ps) {
+      int64_t t0 = os_time_get_nano();
+      int64_t probe[6] = {};
+      const char *why = tu_rt_build_raygen_parts(&lc->env, lc->pipeline->stages[s],
+                                                 pkey, &ps, probe);
+      int64_t dt = os_time_get_nano() - t0;
+      lc->a_rg.fetch_add(dt);
+      if (why) {
+         tu_rt_link_note_fail(lc, why);
+         return;
+      }
+      ps = tu_rt_partset_insert(lc->cache, ps);
+      lc->n_rg_built.fetch_add(1);
+      for (unsigned i = 0; i < 6; i++)
+         lc->probe_acc[i].fetch_add(probe[i]);
+      if (tu_rt_log_enabled()) {
+         uint32_t instrs = 0, regs = 0, stp = 0, ldp = 0;
+         for (uint32_t i = 0; i < ps->nparts; i++) {
+            instrs += ps->parts[i].instrs_count;
+            regs = MAX2(regs, (uint32_t) (ps->parts[i].max_reg + 1));
+            stp += ps->parts[i].stp_count;
+            ldp += ps->parts[i].ldp_count;
+         }
+         mesa_logi("tu-rt-probe: raygen handle=0x%x parts=%" PRId64 " stack=%" PRId64
+                   " locals=%" PRId64 " nir=%" PRId64 "->%" PRId64 " classes=%" PRId64
+                   " ir3=%u regs=%u stp=%u ldp=%u %.1f ms",
+                   lc->pipeline->groups[lc->groups[v]].handle, probe[0], probe[1],
+                   probe[2], probe[3], probe[4], probe[5], instrs, regs, stp, ldp,
+                   dt / 1e6);
+      }
+   }
+   lc->rg_sets[v] = ps;
+}
+
+static void
+tu_rt_link_callee_job(void *data, uint32_t i)
+{
+   struct tu_rt_link_ctx *lc = (struct tu_rt_link_ctx *) data;
+   if (lc->fail_count.load())
+      return;
+   if (i >= lc->ncallee) {
+      uint32_t k = i - lc->ncallee;
+      const struct tu_rt_trav_desc *d = &lc->trav[k];
+      unsigned char pkey[BLAKE3_KEY_LEN];
+      struct mesa_blake3 h;
+      _mesa_blake3_init(&h);
+      static const char tag[] = "tu-rt-part-trav-1";
+      _mesa_blake3_update(&h, tag, sizeof(tag));
+      tu_rt_hash_abi(&h);
+      _mesa_blake3_update(&h, lc->env.key, sizeof(*lc->env.key));
+      enum ir3_shader_debug dbg = ir3_shader_debug_hash_key();
+      _mesa_blake3_update(&h, &dbg, sizeof(dbg));
+      if (lc->env.layout)
+         _mesa_blake3_update(&h, lc->env.layout->blake3, sizeof(lc->env.layout->blake3));
+      VkPipelineCreateFlags2KHR hflags = lc->env.flags &
+         (VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR |
+          VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR);
+      _mesa_blake3_update(&h, &hflags, sizeof(hflags));
+      uint32_t desc[5] = { d->cls, d->used, d->used_chit, d->has_ahit, d->has_isec };
+      _mesa_blake3_update(&h, desc, sizeof(desc));
+      struct tu_ray_tracing_pipeline *p = lc->pipeline;
+      struct tu_rt_case *cases = (struct tu_rt_case *)
+         calloc(MAX2(p->group_count, 1), sizeof(struct tu_rt_case));
+      uint32_t n = 0;
+      struct tu_rt_compiler tmp = {};
+      tmp.pipeline = p;
+      tmp.part = TU_RT_PART_TRAVERSAL;
+      tmp.part_payload_size = d->cls;
+      for (uint32_t g = 0; g < p->group_count; g++) {
+         const struct tu_rt_group *grp = p->groups + g;
+         if (grp->isec_index != VK_SHADER_UNUSED_KHR) {
+            if (!tu_rt_handle_seen(&tmp, g, grp->handle, 2))
+               cases[n++] = (struct tu_rt_case) { grp->handle, g };
+         } else if (grp->ahit_index != VK_SHADER_UNUSED_KHR) {
+            if (!tu_rt_handle_seen(&tmp, g, grp->handle, 1) &&
+                tu_rt_compat(&tmp, p->stages[grp->ahit_index], NULL))
+               cases[n++] = (struct tu_rt_case) { grp->handle, g };
+         }
+      }
+      qsort(cases, n, sizeof(*cases), tu_rt_case_cmp);
+      for (uint32_t j = 0; j < n; j++) {
+         const struct tu_rt_group *grp = p->groups + cases[j].group;
+         _mesa_blake3_update(&h, &grp->handle, sizeof(grp->handle));
+         uint32_t idx[2] = { grp->ahit_index, grp->isec_index };
+         for (unsigned k2 = 0; k2 < 2; k2++) {
+            if (idx[k2] == VK_SHADER_UNUSED_KHR) {
+               uint32_t none = ~0u;
+               _mesa_blake3_update(&h, &none, sizeof(none));
+            } else {
+               _mesa_blake3_update(&h, p->stage_hashes + idx[k2] * BLAKE3_KEY_LEN,
+                                   BLAKE3_KEY_LEN);
+            }
+         }
+      }
+      free(cases);
+      _mesa_blake3_final(&h, pkey);
+
+      struct tu_rt_partset *ps = tu_rt_partset_lookup(lc->cache, pkey);
+      if (!ps) {
+         int64_t t0 = os_time_get_nano();
+         const char *why = tu_rt_build_traversal_part(&lc->env, p, d, pkey, &ps);
+         int64_t dt = os_time_get_nano() - t0;
+         lc->a_trav.fetch_add(dt);
+         if (why) {
+            tu_rt_link_note_fail(lc, why);
+            return;
+         }
+         ps = tu_rt_partset_insert(lc->cache, ps);
+         lc->n_trav_built.fetch_add(1);
+         if (tu_rt_log_enabled())
+            mesa_logi("tu-rt-probe: traversal class=%u ahit=%d isec=%d used=0x%x ir3=%u regs=%u "
+                      "stp=%u ldp=%u pvt=%u %.1f ms",
+                      d->cls, d->has_ahit, d->has_isec, d->used, ps->parts[0].instrs_count,
+                      ps->parts[0].max_reg + 1, ps->parts[0].stp_count,
+                      ps->parts[0].ldp_count, ps->parts[0].pvtmem_size, dt / 1e6);
+      }
+      lc->trav_sets[k] = ps;
+      return;
+   }
+
+   uint32_t s = lc->callee_stages[i];
+   unsigned char pkey[BLAKE3_KEY_LEN];
+   tu_rt_part_key(pkey, "tu-rt-part-callee-1", lc->pipeline->stage_hashes + s * BLAKE3_KEY_LEN,
+                  lc->env.key, lc->env.layout);
+   struct tu_rt_partset *ps = tu_rt_partset_lookup(lc->cache, pkey);
+   if (!ps) {
+      int64_t t0 = os_time_get_nano();
+      const char *why = tu_rt_build_callee_part(&lc->env, lc->pipeline->stages[s], pkey, &ps);
+      lc->a_callee.fetch_add(os_time_get_nano() - t0);
+      if (why) {
+         tu_rt_link_note_fail(lc, why);
+         return;
+      }
+      ps = tu_rt_partset_insert(lc->cache, ps);
+      lc->n_callee_built.fetch_add(1);
+   }
+   lc->callee_sets[i] = ps;
+}
+
+static bool
+tu_rt_callee_compat(const struct tu_rt_partset *ps, uint32_t cls)
+{
+   return !ps->has_payload || ps->payload_size == cls;
+}
+
+static void
+tu_rt_link_variant_job(void *data, uint32_t v)
+{
+   struct tu_rt_link_ctx *lc = (struct tu_rt_link_ctx *) data;
+   struct tu_ray_tracing_pipeline *p = lc->pipeline;
+   if (lc->fail_count.load() || p->variants[v].shader)
+      return;
+   int64_t t0 = os_time_get_nano();
+
+   const struct tu_rt_partset *rg = lc->rg_sets[v];
+   uint32_t nblobs = rg->nparts;
+   uint32_t cap = rg->nparts + lc->nclasses + lc->ncallee;
+   struct ir3_rt_blob *blobs =
+      (struct ir3_rt_blob *) calloc(cap, sizeof(struct ir3_rt_blob));
+   const struct tu_rt_part_bin **bins =
+      (const struct tu_rt_part_bin **) calloc(cap, sizeof(void *));
+   int32_t *callee_blob = (int32_t *) malloc(MAX2(lc->ncallee, 1) * sizeof(int32_t));
+   for (uint32_t i = 0; i < lc->ncallee; i++)
+      callee_blob[i] = -1;
+   uint32_t sets = rg->active_desc_sets;
+   for (uint32_t i = 0; i < rg->nparts; i++) {
+      blobs[i] = (struct ir3_rt_blob) { rg->parts[i].instrs, rg->parts[i].count };
+      bins[i] = &rg->parts[i];
+   }
+
+   struct tu_rt_glue_class gc[TU_RT_MAX_CLASSES] = {};
+   struct tu_rt_compiler tmp = {};
+   tmp.pipeline = p;
+   for (uint32_t ci = 0; ci < rg->nclasses; ci++) {
+      uint32_t cls = rg->classes[ci];
+      uint32_t k = 0;
+      while (k < lc->nclasses && lc->classes[k] != cls)
+         k++;
+      assert(k < lc->nclasses);
+      const struct tu_rt_partset *tr = lc->trav_sets[k];
+      gc[ci].cls = cls;
+      gc[ci].trav_blob = nblobs;
+      blobs[nblobs] = (struct ir3_rt_blob) { tr->parts[0].instrs, tr->parts[0].count };
+      bins[nblobs++] = &tr->parts[0];
+      sets |= tr->active_desc_sets;
+      gc[ci].chit = (struct tu_rt_case *) calloc(MAX2(p->group_count, 1), sizeof(struct tu_rt_case));
+      gc[ci].miss = (struct tu_rt_case *) calloc(MAX2(p->group_count, 1), sizeof(struct tu_rt_case));
+      for (uint32_t g = 0; g < p->group_count; g++) {
+         const struct tu_rt_group *grp = p->groups + g;
+         if (grp->recursive_index == VK_SHADER_UNUSED_KHR)
+            continue;
+         uint8_t st = p->stage_types[grp->recursive_index];
+         if (st != MESA_SHADER_CLOSEST_HIT && st != MESA_SHADER_MISS)
+            continue;
+         if (tu_rt_handle_seen(&tmp, g, grp->handle, 0))
+            continue;
+         int32_t ce = lc->stage_to_callee[grp->recursive_index];
+         const struct tu_rt_partset *ps = lc->callee_sets[ce];
+         if (!tu_rt_callee_compat(ps, cls))
+            continue;
+         if (callee_blob[ce] < 0) {
+            callee_blob[ce] = nblobs;
+            blobs[nblobs] = (struct ir3_rt_blob) { ps->parts[0].instrs, ps->parts[0].count };
+            bins[nblobs++] = &ps->parts[0];
+            sets |= ps->active_desc_sets;
+         }
+         struct tu_rt_case cs = { grp->handle, (uint32_t) callee_blob[ce] };
+         if (st == MESA_SHADER_CLOSEST_HIT)
+            gc[ci].chit[gc[ci].nchit++] = cs;
+         else
+            gc[ci].miss[gc[ci].nmiss++] = cs;
+      }
+   }
+
+   nir_shader *glue = tu_rt_build_glue(lc->env.dev, false, p->variants[v].handle,
+                                       rg->nparts, gc, rg->nclasses);
+   for (uint32_t ci = 0; ci < rg->nclasses; ci++) {
+      free(gc[ci].chit);
+      free(gc[ci].miss);
+   }
+   struct ir3_rt_blobs bl = { nblobs, blobs };
+   struct tu_shader *sh = NULL;
+   const char *why = tu_rt_link_one(lc->env.dev, lc->env.layout, lc->env.key, glue, &bl,
+                                    bins, nblobs, sets,
+                                    lc->link_keys + v * BLAKE3_KEY_LEN, lc->cache, &sh);
+   free(blobs);
+   free(bins);
+   free(callee_blob);
+   int64_t dt = os_time_get_nano() - t0;
+   lc->a_link.fetch_add(dt);
+   int64_t prev = lc->a_link_max.load();
+   while (dt > prev && !lc->a_link_max.compare_exchange_weak(prev, dt))
+      ;
+   if (why) {
+      tu_rt_link_note_fail(lc, why);
+      return;
+   }
+   p->variants[v].shader = sh;
+}
+
+static void
+tu_rt_link_whole_job(void *data, uint32_t v)
+{
+   struct tu_rt_link_ctx *lc = (struct tu_rt_link_ctx *) data;
+   struct tu_ray_tracing_pipeline *p = lc->pipeline;
+   if (lc->fail_count.load() || p->variants[v].shader)
+      return;
+   int64_t t0 = os_time_get_nano();
+   nir_shader *nir = tu_rt_build_shader(lc->env.dev, p, lc->create_info, lc->env.flags,
+                                        (int) lc->groups[v], TU_RT_PART_WHOLE);
+   if (!nir) {
+      tu_rt_link_note_fail(lc, "build");
+      return;
+   }
+   struct tu_rt_part_bin bin = {};
+   uint64_t *words = NULL;
+   uint32_t sets = 0;
+   const char *why = tu_rt_part_compile(lc->env.dev, lc->env.layout, lc->env.key, nir,
+                                        TU_RT_FRAME_WHOLE, &bin, &words, &sets);
+   int64_t t1 = os_time_get_nano();
+   lc->a_rg.fetch_add(t1 - t0);
+   if (why) {
+      tu_rt_link_note_fail(lc, why);
+      return;
+   }
+   bin.instrs = words;
+   struct ir3_rt_blob blob = { words, bin.count };
+   struct ir3_rt_blobs bl = { 1, &blob };
+   const struct tu_rt_part_bin *bins[1] = { &bin };
+   nir_shader *glue = tu_rt_build_glue(lc->env.dev, true, 0, 0, NULL, 0);
+   struct tu_shader *sh = NULL;
+   why = tu_rt_link_one(lc->env.dev, lc->env.layout, lc->env.key, glue, &bl, bins, 1,
+                        sets, lc->link_keys + v * BLAKE3_KEY_LEN, lc->cache, &sh);
+   free(words);
+   int64_t dt = os_time_get_nano() - t1;
+   lc->a_link.fetch_add(dt);
+   int64_t prev = lc->a_link_max.load();
+   while (dt > prev && !lc->a_link_max.compare_exchange_weak(prev, dt))
+      ;
+   if (why) {
+      tu_rt_link_note_fail(lc, why);
+      return;
+   }
+   p->variants[v].shader = sh;
+}
+
+static VkResult
+tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
+                    struct tu_ray_tracing_pipeline *pipeline,
+                    const VkRayTracingPipelineCreateInfoKHR *create_info,
+                    VkPipelineCreateFlags2KHR flags,
+                    struct tu_pipeline_layout *layout,
+                    const struct tu_shader_key *key,
+                    const unsigned char *base_blake3,
+                    const uint32_t *groups, uint32_t count, bool whole)
+{
+   int64_t t_start = os_time_get_nano();
+   cache = cache ? cache : dev->mem_cache;
+   pipeline->variant_count = count;
+   pipeline->variants = rzalloc_array(pipeline->mem_ctx, struct tu_rt_variant, count);
+   unsigned char *keys = rzalloc_array(pipeline->mem_ctx, unsigned char,
+                                       count * BLAKE3_KEY_LEN);
+   uint32_t missing = 0;
+   for (uint32_t v = 0; v < count; v++) {
+      const struct tu_rt_group *g = pipeline->groups + groups[v];
+      pipeline->variants[v].handle = g->handle;
+      struct mesa_blake3 h;
+      _mesa_blake3_init(&h);
+      _mesa_blake3_update(&h, base_blake3, BLAKE3_KEY_LEN);
+      static const char tag[] = "tu-rt-link-1";
+      _mesa_blake3_update(&h, tag, sizeof(tag));
+      uint32_t mode = whole ? 1 : 2;
+      _mesa_blake3_update(&h, &mode, sizeof(mode));
+      tu_rt_hash_abi(&h);
+      _mesa_blake3_update(&h, &g->handle, sizeof(g->handle));
+      _mesa_blake3_final(&h, keys + v * BLAKE3_KEY_LEN);
+      pipeline->variants[v].shader =
+         tu_compute_pipeline_cache_lookup(dev, cache, keys + v * BLAKE3_KEY_LEN);
+      if (!pipeline->variants[v].shader)
+         missing++;
+   }
+
+   if (!missing)
+      goto done;
+   if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
+      return VK_PIPELINE_COMPILE_REQUIRED;
+
+   {
+      void *nir_ctx = ralloc_context(NULL);
+      VkResult result = tu_rt_compile_stages(dev, cache, pipeline, create_info,
+                                             flags, key, nir_ctx);
+      if (result != VK_SUCCESS) {
+         ralloc_free(nir_ctx);
+         return result;
+      }
+
+      for (uint32_t s = 0; s < pipeline->stage_count; s++) {
+         if (pipeline->stage_types[s] == MESA_SHADER_CALLABLE) {
+            ralloc_free(nir_ctx);
+            memset(pipeline->stages, 0, pipeline->stage_count * sizeof(pipeline->stages[0]));
+            mesa_logw("tu-rt: link: callable stages, using inline path");
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+         }
+      }
+
+      struct tu_rt_link_ctx *lc = new tu_rt_link_ctx();
+      lc->env.dev = dev;
+      lc->env.layout = layout;
+      lc->env.key = key;
+      lc->env.flags = flags;
+      lc->cache = cache;
+      lc->pipeline = pipeline;
+      lc->create_info = create_info;
+      lc->groups = groups;
+      lc->link_keys = keys;
+      lc->whole = whole;
+      lc->fail_count.store(0);
+      lc->fail = NULL;
+      simple_mtx_init(&lc->lock, mtx_plain);
+      for (unsigned i = 0; i < 8; i++)
+         lc->probe_acc[i].store(0);
+      lc->a_rg.store(0);
+      lc->a_callee.store(0);
+      lc->a_trav.store(0);
+      lc->a_link.store(0);
+      lc->a_link_max.store(0);
+      lc->n_rg_built.store(0);
+      lc->n_callee_built.store(0);
+      lc->n_trav_built.store(0);
+
+      int64_t t0 = os_time_get_nano(), t1 = t0, t2 = t0;
+      if (whole) {
+         tu_rt_par_run(count, tu_rt_link_whole_job, lc);
+      } else {
+         lc->rg_sets = (struct tu_rt_partset **) calloc(count, sizeof(void *));
+         lc->rg_stage = (uint32_t *) calloc(count, sizeof(uint32_t));
+         for (uint32_t v = 0; v < count; v++)
+            lc->rg_stage[v] = pipeline->groups[groups[v]].recursive_index;
+         tu_rt_par_run(count, tu_rt_link_rg_job, lc);
+         t1 = os_time_get_nano();
+
+         lc->stage_to_callee = (int32_t *) malloc(MAX2(pipeline->stage_count, 1) * sizeof(int32_t));
+         lc->callee_stages = (uint32_t *) malloc(MAX2(pipeline->stage_count, 1) * sizeof(uint32_t));
+         lc->ncallee = 0;
+         for (uint32_t s = 0; s < pipeline->stage_count; s++) {
+            lc->stage_to_callee[s] = -1;
+            if (pipeline->stage_types[s] == MESA_SHADER_CLOSEST_HIT ||
+                pipeline->stage_types[s] == MESA_SHADER_MISS) {
+               lc->stage_to_callee[s] = lc->ncallee;
+               lc->callee_stages[lc->ncallee++] = s;
+            }
+         }
+         lc->callee_sets = (struct tu_rt_partset **) calloc(MAX2(lc->ncallee, 1), sizeof(void *));
+
+         lc->nclasses = 0;
+         if (!lc->fail_count.load()) {
+            for (uint32_t v = 0; v < count; v++) {
+               const struct tu_rt_partset *rg = lc->rg_sets[v];
+               if (!rg)
+                  continue;
+               for (uint32_t ci = 0; ci < rg->nclasses; ci++) {
+                  uint32_t k = 0;
+                  while (k < lc->nclasses && lc->classes[k] != rg->classes[ci])
+                     k++;
+                  if (k == lc->nclasses) {
+                     if (lc->nclasses == ARRAY_SIZE(lc->classes)) {
+                        tu_rt_link_note_fail(lc, "too many classes");
+                        break;
+                     }
+                     lc->classes[lc->nclasses++] = rg->classes[ci];
+                  }
+               }
+            }
+         }
+
+         bool has_ahit = false, has_isec = false;
+         for (uint32_t g = 0; g < pipeline->group_count; g++) {
+            if (pipeline->groups[g].ahit_index != VK_SHADER_UNUSED_KHR)
+               has_ahit = true;
+            if (pipeline->groups[g].isec_index != VK_SHADER_UNUSED_KHR)
+               has_isec = true;
+         }
+         for (uint32_t k = 0; k < lc->nclasses; k++) {
+            struct tu_rt_trav_desc *d = &lc->trav[k];
+            d->cls = lc->classes[k];
+            d->has_ahit = has_ahit;
+            d->has_isec = has_isec;
+            d->used = 0;
+            d->used_chit = 0;
+            struct tu_rt_compiler tmp = {};
+            tmp.pipeline = pipeline;
+            tmp.part = TU_RT_PART_TRAVERSAL;
+            tmp.part_payload_size = d->cls;
+            for (uint32_t g = 0; g < pipeline->group_count; g++) {
+               const struct tu_rt_group *grp = pipeline->groups + g;
+               if (grp->ahit_index != VK_SHADER_UNUSED_KHR)
+                  d->used |= tu_rt_scan_used(pipeline->stages[grp->ahit_index]);
+               if (grp->isec_index != VK_SHADER_UNUSED_KHR)
+                  d->used |= tu_rt_scan_used(pipeline->stages[grp->isec_index]);
+               if (grp->recursive_index != VK_SHADER_UNUSED_KHR &&
+                   pipeline->stage_types[grp->recursive_index] == MESA_SHADER_CLOSEST_HIT &&
+                   tu_rt_compat(&tmp, pipeline->stages[grp->recursive_index], NULL))
+                  d->used_chit |= tu_rt_scan_used(pipeline->stages[grp->recursive_index]);
+            }
+            d->used |= d->used_chit;
+         }
+
+         if (!lc->fail_count.load())
+            tu_rt_par_run(lc->ncallee + lc->nclasses, tu_rt_link_callee_job, lc);
+         t2 = os_time_get_nano();
+         if (!lc->fail_count.load())
+            tu_rt_par_run(count, tu_rt_link_variant_job, lc);
+      }
+      int64_t t3 = os_time_get_nano();
+
+      ralloc_free(nir_ctx);
+      memset(pipeline->stages, 0, pipeline->stage_count * sizeof(pipeline->stages[0]));
+
+      const char *fail = lc->fail;
+      if (tu_rt_log_enabled()) {
+         mesa_logi("tu-rt-link: %s %u variants (%u to link) stages=%u groups=%u classes=%u "
+                   "callees=%u | rg parts built=%u %.1f ms cpu, callee built=%u %.1f ms cpu, "
+                   "trav built=%u %.1f ms cpu, link %.1f ms cpu (max %.2f ms) | wall rg=%.1f "
+                   "callee+trav=%.1f link=%.1f ms%s%s",
+                   whole ? "whole" : "force", count, missing, pipeline->stage_count,
+                   pipeline->group_count, lc->nclasses, lc->ncallee,
+                   lc->n_rg_built.load(), lc->a_rg.load() / 1e6,
+                   lc->n_callee_built.load(), lc->a_callee.load() / 1e6,
+                   lc->n_trav_built.load(), lc->a_trav.load() / 1e6,
+                   lc->a_link.load() / 1e6, lc->a_link_max.load() / 1e6,
+                   (t1 - t0) / 1e6, (t2 - t1) / 1e6, (t3 - t2) / 1e6,
+                   fail ? " FAIL: " : "", fail ? fail : "");
+         if (!whole && lc->n_rg_built.load()) {
+            mesa_logi("tu-rt-probe: raygens built=%u parts=%" PRId64 " stack_bytes=%" PRId64
+                      " locals=%" PRId64 " nir_pre=%" PRId64 " nir_post=%" PRId64,
+                      lc->n_rg_built.load(), lc->probe_acc[0].load(), lc->probe_acc[1].load(),
+                      lc->probe_acc[2].load(), lc->probe_acc[3].load(),
+                      lc->probe_acc[4].load());
+         }
+      }
+
+      if (!whole) {
+         for (uint32_t v = 0; v < count; v++)
+            tu_rt_partset_unref(dev, lc->rg_sets[v]);
+         for (uint32_t i = 0; i < lc->ncallee; i++)
+            tu_rt_partset_unref(dev, lc->callee_sets[i]);
+         for (uint32_t k = 0; k < lc->nclasses; k++)
+            tu_rt_partset_unref(dev, lc->trav_sets[k]);
+         free(lc->rg_sets);
+         free(lc->rg_stage);
+         free(lc->stage_to_callee);
+         free(lc->callee_stages);
+         free(lc->callee_sets);
+      }
+      simple_mtx_destroy(&lc->lock);
+      delete lc;
+
+      if (fail) {
+         mesa_logw("tu-rt: link failed (%s), using inline path", fail);
+         for (uint32_t v = 0; v < count; v++) {
+            if (pipeline->variants[v].shader)
+               vk_pipeline_cache_object_unref(&dev->vk, &pipeline->variants[v].shader->base);
+            pipeline->variants[v].shader = NULL;
+         }
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+   }
+
+done:
+   if (tu_rt_log_enabled()) {
+      uint64_t instrs = 0;
+      unsigned max_regs = 0;
+      for (uint32_t v = 0; v < count; v++) {
+         instrs += pipeline->variants[v].shader->variant->info.instrs_count;
+         max_regs = MAX2(max_regs, pipeline->variants[v].shader->variant->info.max_reg + 1u);
+      }
+      mesa_logi("tu-rt: %u raygen variants (%u linked) total instrs=%" PRIu64
+                " max regs=%u %.1f ms",
+                count, missing, instrs, max_regs, (os_time_get_nano() - t_start) / 1e6);
+   }
+   return VK_SUCCESS;
 }
 
 struct tu_rt_variant_job {
@@ -2142,8 +4209,18 @@ tu_rt_pipeline_create(struct tu_device *dev,
       struct tu_shader *shader = NULL;
       nir_shader *nir = NULL;
       if (rg_count > 1 && !debug_get_bool_option("TU_RT_NO_VARIANTS", false)) {
-         result = tu_rt_build_variants(dev, cache, pipeline, create_info, flags,
-                                       layout, &key, blake3, rg_groups, rg_count);
+         result = VK_ERROR_FEATURE_NOT_PRESENT;
+         const unsigned link_mode = tu_rt_link_mode();
+         if (link_mode != TU_RT_LINK_OFF && dev->physical_device->info->chip >= 7 &&
+             !(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR) &&
+             (link_mode != TU_RT_LINK_AUTO || pipeline->stage_count >= 50)) {
+            result = tu_rt_link_variants(dev, cache, pipeline, create_info, flags,
+                                         layout, &key, blake3, rg_groups, rg_count,
+                                         link_mode == TU_RT_LINK_WHOLE);
+         }
+         if (result == VK_ERROR_FEATURE_NOT_PRESENT)
+            result = tu_rt_build_variants(dev, cache, pipeline, create_info, flags,
+                                          layout, &key, blake3, rg_groups, rg_count);
          if (result != VK_SUCCESS)
             goto fail;
          shader = pipeline->variants[0].shader;

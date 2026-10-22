@@ -1687,6 +1687,7 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
             uint32_t read_only_input_attachments,
             bool dynamic_renderpass,
             bool ray_tracing,
+            bool keep_push_consts,
             struct ir3_const_allocations *const_allocs)
 {
    /* Allocate driver params as early as possible as a workaround for the
@@ -1723,7 +1724,7 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
        * is often the case under zink, then we could additionally skip
        * emitting SP_SHARED_CONSTANT_GFX entirely.
        */
-      if (!shader_uses_push_consts(shader))
+      if (!keep_push_consts && !shader_uses_push_consts(shader))
          const_state->push_consts = (struct tu_push_constant_range) {};
    }
 
@@ -3941,7 +3942,8 @@ tu_shader_create(struct tu_device *dev,
                  const void *key_data,
                  size_t key_size,
                  struct tu_pipeline_layout *layout,
-                 bool executable_info)
+                 bool executable_info,
+                 const struct tu_rt_shader_opts *rt)
 {
    struct tu_shader *shader = tu_shader_init(dev, key_data, key_size);
 
@@ -3971,7 +3973,7 @@ tu_shader_create(struct tu_device *dev,
    struct ir3_const_allocations const_allocs = {};
    NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
             key->read_only_input_attachments, key->dynamic_renderpass,
-            key->ray_tracing, &const_allocs);
+            key->ray_tracing, rt != NULL, &const_allocs);
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
@@ -4005,13 +4007,15 @@ tu_shader_create(struct tu_device *dev,
 
    const struct ir3_shader_options options = {
       .api_wavesize = key->api_wavesize,
-      .real_wavesize = key->real_wavesize,
+      .real_wavesize = rt ? IR3_SINGLE_ONLY : key->real_wavesize,
       .push_consts_type = shader->const_state.push_consts.type,
       .push_consts_base = shader->const_state.push_consts.lo_dwords,
       .push_consts_dwords = shader->const_state.push_consts.dwords,
       .const_allocs = const_allocs,
       .nir_options = nir_options,
       .no_early_preamble = shader->push_ubo_speculated,
+      .rt_part = rt && rt->part,
+      .rt_blobs = rt ? rt->blobs : NULL,
    };
 
    static const char *ir3_dump_dir = os_get_option("TU_IR3_DUMP");
@@ -4043,9 +4047,14 @@ tu_shader_create(struct tu_device *dev,
 
    struct ir3_shader_variant *variant =
       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
-   if (variant)
+   if (variant && !rt)
       variant = tu_skytrace_variant(ir3_shader, ir3_key, executable_info,
                                     variant);
+   if (variant && rt) {
+      variant->shader_options.rt_blobs = NULL;
+      if (rt->fixup)
+         rt->fixup(variant, rt->fixup_data);
+   }
    shader->variant = variant;
 
    static const bool log_hashes =
@@ -4131,6 +4140,11 @@ tu_shader_create(struct tu_device *dev,
    }
    default:
       break;
+   }
+
+   if (rt && rt->part) {
+      *shader_out = shader;
+      return VK_SUCCESS;
    }
 
    VkResult result = tu_upload_shader(dev, shader);

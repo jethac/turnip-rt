@@ -239,6 +239,13 @@ tu_lower_nir(struct tu_device *dev,
              const struct ir3_shader_key *ir3_key,
              struct tu_shader_info *info);
 
+struct tu_rt_shader_opts {
+   bool part;
+   const struct ir3_rt_blobs *blobs;
+   void (*fixup)(struct ir3_shader_variant *v, void *data);
+   void *fixup_data;
+};
+
 VkResult
 tu_shader_create(struct tu_device *dev,
                  struct tu_shader **shader_out,
@@ -249,7 +256,8 @@ tu_shader_create(struct tu_device *dev,
                  const void *key_data,
                  size_t key_size,
                  struct tu_pipeline_layout *layout,
-                 bool executable_info);
+                 bool executable_info,
+                 const struct tu_rt_shader_opts *rt = NULL);
 
 void
 tu_shader_key_subgroup_size(struct tu_shader_key *key,
