@@ -2278,7 +2278,7 @@ tu_rt_log_enabled(void)
    return on;
 }
 
-static const char tu_rt_abi_tag[] = "tu-rt-abi-9";
+static const char tu_rt_abi_tag[] = "tu-rt-abi-10";
 
 static void
 tu_rt_hash_abi(struct mesa_blake3 *h)
@@ -2349,6 +2349,7 @@ struct tu_rt_part_bin {
    uint32_t nops_count;
    uint32_t stp_count;
    uint32_t ldp_count;
+   uint32_t uses_rt;
    const uint64_t *instrs;
 };
 
@@ -2651,6 +2652,7 @@ tu_rt_part_compile(struct tu_device *dev, struct tu_pipeline_layout *layout,
       out->nops_count = v->info.nops_count;
       out->stp_count = v->info.stp_count;
       out->ldp_count = v->info.ldp_count;
+      out->uses_rt = v->info.uses_ray_intersection;
       *desc_sets |= sh->active_desc_sets;
    }
    vk_pipeline_cache_object_unref(&dev->vk, &sh->base);
@@ -3379,6 +3381,7 @@ tu_rt_link_fixup(struct ir3_shader_variant *v, void *data)
       v->num_uavs = MAX2(v->num_uavs, p->num_uavs);
       v->info.stp_count += p->stp_count;
       v->info.ldp_count += p->ldp_count;
+      v->info.uses_ray_intersection |= !!p->uses_rt;
    }
    v->info.max_reg = max_reg;
    v->info.max_half_reg = max_half_reg;
