@@ -19,8 +19,10 @@ struct tu_rt_task {
    const uint8_t *env;
    uint32_t env_count;
    double ccost;
-   uint32_t need_sets;
-   uint32_t have_sets;
+   const uint64_t *need;
+   uint32_t need_count;
+   const uint64_t *have;
+   uint32_t have_count;
    bool coalesced;
 
    struct tu_shader *shader;

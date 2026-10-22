@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <atomic>
 #include <algorithm>
+#include <vector>
 #include <malloc.h>
 #include <math.h>
 #include <sys/prctl.h>
@@ -477,6 +478,7 @@ tu_rt_blob_unref(struct tu_rt_stage_blob *sb)
 {
    if (sb && p_atomic_dec_zero(&sb->refcnt)) {
       free(sb->sum.site_psize);
+      free(sb->sum.bindings);
       free(sb);
    }
 }
@@ -593,6 +595,11 @@ tu_rt_collect_sums(struct tu_device *dev,
             if (!sums[i].site_psize)
                return false;
             memcpy(sums[i].site_psize, sb->sum.site_psize, sb->sum.n_sites * sizeof(uint32_t));
+            sums[i].bindings = ralloc_array(pipeline->mem_ctx, uint64_t,
+                                            MAX2(sb->sum.n_bindings, 1));
+            if (!sums[i].bindings)
+               return false;
+            memcpy(sums[i].bindings, sb->sum.bindings, sb->sum.n_bindings * sizeof(uint64_t));
          }
       }
    }
@@ -776,6 +783,12 @@ tu_rt_scan_used(nir_shader *nir)
 
 #define TU_RT_PSIZE_NONE UINT32_MAX
 
+static uint64_t
+tu_rt_binding_id(uint32_t set, uint32_t binding)
+{
+   return ((uint64_t) set << 32) | binding;
+}
+
 static uint32_t
 tu_rt_def_psize(nir_def *arg)
 {
@@ -798,6 +811,7 @@ tu_rt_summarize_stage(nir_shader *nir, struct tu_rt_stage_sum *sum, void *mem_ct
       break;
    }
    sum->used = tu_rt_scan_used(nir);
+   std::vector<uint64_t> bindings;
    nir_foreach_function_impl (impl, nir) {
       nir_foreach_block (block, impl) {
          nir_foreach_instr (instr, block) {
@@ -807,7 +821,8 @@ tu_rt_summarize_stage(nir_shader *nir, struct tu_rt_stage_sum *sum, void *mem_ct
                if (d->deref_type == nir_deref_type_var &&
                    (d->var->data.mode & (nir_var_uniform | nir_var_image |
                                          nir_var_mem_ubo | nir_var_mem_ssbo)))
-                  sum->set_mask |= 1u << MIN2(d->var->data.descriptor_set, 31u);
+                  bindings.push_back(tu_rt_binding_id(d->var->data.descriptor_set,
+                                                      d->var->data.binding));
                continue;
             }
             if (instr->type != nir_instr_type_intrinsic)
@@ -817,16 +832,30 @@ tu_rt_summarize_stage(nir_shader *nir, struct tu_rt_stage_sum *sum, void *mem_ct
             sum->n_sites += op == nir_intrinsic_trace_ray;
             sum->n_calls += op == nir_intrinsic_execute_callable;
             if (op == nir_intrinsic_vulkan_resource_index)
-               sum->set_mask |= 1u << MIN2(nir_intrinsic_desc_set(intr), 31u);
+               bindings.push_back(tu_rt_binding_id(nir_intrinsic_desc_set(intr),
+                                                   nir_intrinsic_binding(intr)));
          }
       }
    }
+   std::sort(bindings.begin(), bindings.end());
+   bindings.erase(std::unique(bindings.begin(), bindings.end()), bindings.end());
+   sum->n_bindings = bindings.size();
+   sum->bindings = mem_ctx ? ralloc_array(mem_ctx, uint64_t, MAX2(sum->n_bindings, 1)) :
+                             (uint64_t *) malloc(MAX2(sum->n_bindings, 1) * sizeof(uint64_t));
    sum->site_psize = mem_ctx ? ralloc_array(mem_ctx, uint32_t, MAX2(sum->n_sites, 1)) :
                                (uint32_t *) malloc(MAX2(sum->n_sites, 1) * sizeof(uint32_t));
-   if (!sum->site_psize) {
+   if (!sum->site_psize || !sum->bindings) {
+      if (!mem_ctx) {
+         free(sum->site_psize);
+         free(sum->bindings);
+      }
+      sum->site_psize = NULL;
+      sum->bindings = NULL;
       sum->n_sites = 0;
+      sum->n_bindings = 0;
       return;
    }
+   std::copy(bindings.begin(), bindings.end(), sum->bindings);
    unsigned k = 0;
    nir_foreach_function_impl (impl, nir) {
       nir_foreach_block (block, impl) {
@@ -1929,7 +1958,8 @@ struct tu_rt_class {
    uint64_t total;
    uint8_t ckey[BLAKE3_KEY_LEN];
    uint8_t *env_hashes;
-   uint32_t set_mask;
+   uint64_t *need;
+   uint32_t need_count;
 };
 
 static nir_shader *
@@ -2435,12 +2465,10 @@ tu_rt_classify(const struct tu_ray_tracing_pipeline *pipeline,
    }
    uint64_t total = rs->instrs;
    uint32_t used_all = rs->used, used_miss = rs->used;
-   cls->set_mask = rs->set_mask;
    for (uint32_t i = 0; i < pipeline->stage_count; i++) {
       if (!stage_mark[i])
          continue;
       total += sums[i].instrs;
-      cls->set_mask |= sums[i].set_mask;
       used_all |= sums[i].used;
       if (stage_mark[i] & TU_RT_MARK_MISS)
          used_miss |= sums[i].used;
@@ -2572,6 +2600,20 @@ tu_rt_ca_variant_keys(struct tu_ray_tracing_pipeline *pipeline,
                return memcmp(a, b, BLAKE3_KEY_LEN);
             });
          }
+         const uint32_t r = pipeline->groups[rg].recursive_index;
+         std::vector<uint64_t> need(sums[r].bindings, sums[r].bindings + sums[r].n_bindings);
+         for (uint32_t i = 0; i < pipeline->stage_count; i++)
+            if (stage_mark[i])
+               need.insert(need.end(), sums[i].bindings, sums[i].bindings + sums[i].n_bindings);
+         std::sort(need.begin(), need.end());
+         need.erase(std::unique(need.begin(), need.end()), need.end());
+         cls.need = ralloc_array(pipeline->mem_ctx, uint64_t, MAX2(need.size(), 1));
+         if (cls.need) {
+            std::copy(need.begin(), need.end(), cls.need);
+            cls.need_count = need.size();
+         } else {
+            cls.env_hashes = NULL;
+         }
       }
       classes[v] = cls;
    }
@@ -2601,6 +2643,15 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
                                classes, hashes);
    }
    pipeline->ca_variants = 0;
+   std::vector<uint64_t> have;
+   const bool ss = classes && tu_rt_superset_mode() > 0;
+   if (ss) {
+      for (uint32_t i = 0; i < pipeline->stage_count; i++)
+         have.insert(have.end(), pipeline->stage_sums[i].bindings,
+                     pipeline->stage_sums[i].bindings + pipeline->stage_sums[i].n_bindings);
+      std::sort(have.begin(), have.end());
+      have.erase(std::unique(have.begin(), have.end()), have.end());
+   }
    for (uint32_t v = 0; v < count; v++) {
       const struct tu_rt_group *g = pipeline->groups + groups[v];
       pipeline->variants[v].handle = g->handle;
@@ -2701,9 +2752,6 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
          const bool can_cache =
             !(flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
          uint32_t *pool_map = rzalloc_array(nir_ctx, uint32_t, missing);
-         uint32_t pipe_sets = 0;
-         for (uint32_t i = 0; pipeline->stage_sums && i < pipeline->stage_count; i++)
-            pipe_sets |= pipeline->stage_sums[i].set_mask;
          struct tu_rt_task *tasks = rzalloc_array(nir_ctx, struct tu_rt_task, missing);
          uint32_t n = 0;
          for (uint32_t v = 0; v < count; v++) {
@@ -2712,10 +2760,12 @@ tu_rt_build_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
             pool_map[n] = v;
             tasks[n].key = can_cache ? hashes + v * BLAKE3_KEY_LEN : NULL;
             tasks[n].cost = predicted ? predicted[v] : 0;
-            if (classes && classes[v].ca && !classes[v].nohit && classes[v].env_hashes &&
-                tu_rt_superset_mode() > 0) {
-               tasks[n].need_sets = classes[v].set_mask;
-               tasks[n].have_sets = pipe_sets;
+            if (ss && classes[v].ca && !classes[v].nohit && classes[v].env_hashes &&
+                classes[v].need) {
+               tasks[n].need = classes[v].need;
+               tasks[n].need_count = classes[v].need_count;
+               tasks[n].have = have.data();
+               tasks[n].have_count = have.size();
                tasks[n].ckey = classes[v].ckey;
                tasks[n].env = classes[v].env_hashes;
                tasks[n].env_count = classes[v].env_count;

@@ -37,8 +37,8 @@ struct tu_rt_pool_entry {
 
 struct tu_rt_done_rec {
    std::vector<uint8_t> env;
+   std::vector<uint64_t> need;
    double ccost;
-   uint32_t need_sets;
    struct tu_shader *shader;
 };
 
@@ -87,6 +87,18 @@ tu_rt_superset_ratio(void)
    static const double r =
       debug_get_num_option("TU_RT_SUPERSET_RATIO_PCT", 125) / 100.0;
    return r;
+}
+
+static bool
+tu_rt_sorted_subset(const uint64_t *a, uint32_t na, const uint64_t *b, uint32_t nb)
+{
+   return std::includes(b, b + nb, a, a + na);
+}
+
+static bool
+tu_rt_need_ok(const uint64_t *need, uint32_t need_count, const struct tu_rt_task *t)
+{
+   return tu_rt_sorted_subset(need, need_count, t->have, t->have_count);
 }
 
 static bool
@@ -210,8 +222,8 @@ tu_rt_pool_complete_locked(struct tu_device *dev, struct tu_rt_pool *pool,
    if (t->ckey && t->shader && tu_rt_superset_mode() >= 1) {
       struct tu_rt_done_rec rec;
       rec.env.assign(t->env, t->env + t->env_count * BLAKE3_KEY_LEN);
+      rec.need.assign(t->need, t->need + t->need_count);
       rec.ccost = t->ccost;
-      rec.need_sets = t->need_sets;
       vk_pipeline_cache_object_ref(&t->shader->base);
       rec.shader = t->shader;
       pool->done_by_rg[tu_rt_ckey(t)].push_back(std::move(rec));
@@ -377,7 +389,8 @@ tu_rt_pool_coalesce_locked(struct tu_rt_pool *pool, struct tu_rt_task *t)
    if (dit != pool->done_by_rg.end()) {
       struct tu_rt_done_rec *best = NULL;
       for (struct tu_rt_done_rec &rec : dit->second) {
-         if ((rec.need_sets & ~t->have_sets) || !tu_rt_cost_ok(t->ccost, rec.ccost) ||
+         if (!tu_rt_need_ok(rec.need.data(), rec.need.size(), t) ||
+             !tu_rt_cost_ok(t->ccost, rec.ccost) ||
              !tu_rt_env_subset(t->env, t->env_count, rec.env.data(),
                                rec.env.size() / BLAKE3_KEY_LEN))
             continue;
@@ -401,7 +414,7 @@ tu_rt_pool_coalesce_locked(struct tu_rt_pool *pool, struct tu_rt_task *t)
       for (struct tu_rt_task *s : it->second) {
          if (s == t || (s->state != TU_RT_TASK_PENDING && s->state != TU_RT_TASK_RUNNING) ||
              !s->entry || !tu_rt_cost_ok(t->ccost, s->ccost) ||
-             (s->need_sets & ~t->have_sets) ||
+             !tu_rt_need_ok(s->need, s->need_count, t) ||
              !tu_rt_env_subset(t->env, t->env_count, s->env, s->env_count))
             continue;
          if (!best || s->ccost < best->ccost)
@@ -428,13 +441,13 @@ tu_rt_pool_retarget_locked(struct tu_rt_pool *pool, struct tu_rt_task *sup)
    std::vector<struct tu_rt_task *> moved;
    for (struct tu_rt_task *u : it->second) {
       if (u == sup || u->state != TU_RT_TASK_PENDING || !u->entry ||
-          (sup->need_sets & ~u->have_sets) ||
+          !tu_rt_need_ok(sup->need, sup->need_count, u) ||
           !tu_rt_env_subset(u->env, u->env_count, sup->env, sup->env_count))
          continue;
       struct tu_rt_pool_entry *ue = (struct tu_rt_pool_entry *) u->entry;
       bool ok = tu_rt_cost_ok(u->ccost, sup->ccost);
       for (struct tu_rt_task *w : ue->waiters)
-         ok = ok && !(sup->need_sets & ~w->have_sets) &&
+         ok = ok && tu_rt_need_ok(sup->need, sup->need_count, w) &&
               (w->ccost <= 0 || tu_rt_cost_ok(w->ccost, sup->ccost));
       if (!ok)
          continue;

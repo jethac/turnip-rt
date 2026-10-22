@@ -284,11 +284,12 @@ struct tu_rt_group {
 struct tu_rt_stage_sum {
    uint32_t instrs;
    uint32_t used;
-   uint32_t set_mask;
    uint32_t psize;
    uint32_t n_sites;
    uint32_t n_calls;
+   uint32_t n_bindings;
    uint32_t *site_psize;
+   uint64_t *bindings;
 };
 
 struct tu_rt_stage_blob {
