@@ -673,6 +673,13 @@ enum {
 #define TU_RT_SEL_TRAV(c) (0x1000000u | (c))
 #define TU_RT_SEL_CHIT(c) (0x2000000u | (c))
 #define TU_RT_SEL_MISS(c) (0x3000000u | (c))
+#define TU_RT_CLASS_SKIP_CHIT 0x10000u
+
+static inline unsigned
+tu_rt_class_size(uint32_t cls)
+{
+   return cls & 0xffff;
+}
 
 static nir_def *
 tu_rt_fload(nir_builder *b, unsigned off, unsigned comps)
@@ -897,7 +904,7 @@ tu_rt_compat(struct tu_rt_compiler *c, nir_shader *stage, nir_def *arg)
    if (c->part == TU_RT_PART_TRAVERSAL) {
       bool has;
       unsigned size = tu_rt_call_data_size(stage, &has);
-      return !has || size == c->part_payload_size;
+      return !has || size == tu_rt_class_size(c->part_payload_size);
    }
    return tu_rt_payload_compatible(stage, arg);
 }
@@ -1708,12 +1715,16 @@ tu_rt_part_raygen_trace(nir_builder *b, struct tu_rt_compiler *c,
       c->part_fail = "payload too large";
       return false;
    }
-   tu_rt_part_add_class(c, size);
+   uint32_t cls = size;
+   if (nir_src_is_const(intr->src[1]) &&
+       (nir_src_as_uint(intr->src[1]) & SpvRayFlagsSkipClosestHitShaderKHRMask))
+      cls |= TU_RT_CLASS_SKIP_CHIT;
+   tu_rt_part_add_class(c, cls);
 
    b->cursor = nir_before_instr(&intr->instr);
    if (pd && !tu_rt_copy_payload(b, pd, size, true))
       c->part_fail = "payload type";
-   tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_TRAV(size)));
+   tu_rt_fstore(b, TU_RT_FRAME_SEL, nir_imm_int(b, TU_RT_SEL_TRAV(cls)));
    if (!c->part_dummy)
       c->part_dummy = nir_variable_create(b->shader, nir_var_shader_call_data,
                                           glsl_uint_type(), "tu_rt_no_payload");
@@ -2219,7 +2230,7 @@ tu_rt_log_enabled(void)
    return on;
 }
 
-static const char tu_rt_abi_tag[] = "tu-rt-abi-1";
+static const char tu_rt_abi_tag[] = "tu-rt-abi-2";
 
 static void
 tu_rt_hash_abi(struct mesa_blake3 *h)
@@ -3062,11 +3073,12 @@ tu_rt_build_traversal_part(const struct tu_rt_part_env *env,
    c.has_ahit = d->has_ahit;
    c.has_isec = d->has_isec;
 
-   unsigned nwords = MAX2(DIV_ROUND_UP(d->cls, 4), 1);
+   const unsigned psize = tu_rt_class_size(d->cls);
+   unsigned nwords = MAX2(DIV_ROUND_UP(psize, 4), 1);
    nir_variable *w =
       nir_local_variable_create(b->impl, glsl_array_type(glsl_uint_type(), nwords, 4),
                                 "tu_rt_trav_payload");
-   for (unsigned i = 0; i < DIV_ROUND_UP(d->cls, 4); i++)
+   for (unsigned i = 0; i < DIV_ROUND_UP(psize, 4); i++)
       nir_store_deref(b, tu_rt_hw(b, w, nir_imm_int(b, i)),
                       tu_rt_fload(b, TU_RT_FRAME_PAYLOAD + 4 * i, 1), 0x1);
 
@@ -3088,7 +3100,7 @@ tu_rt_build_traversal_part(const struct tu_rt_part_env *env,
    tu_rt_traversal_miss(b, &c, nir_iand_imm(b, r.miss_index, 0xFFFF));
    nir_pop_if(b, NULL);
 
-   for (unsigned i = 0; i < DIV_ROUND_UP(d->cls, 4); i++)
+   for (unsigned i = 0; i < DIV_ROUND_UP(psize, 4); i++)
       tu_rt_fstore(b, TU_RT_FRAME_PAYLOAD + 4 * i,
                    nir_load_deref(b, tu_rt_hw(b, w, nir_imm_int(b, i))));
 
@@ -3115,7 +3127,7 @@ tu_rt_build_traversal_part(const struct tu_rt_part_env *env,
       if (!*out) {
          fail = "oom";
       } else {
-         (*out)->payload_size = d->cls;
+         (*out)->payload_size = psize;
          (*out)->used = d->used;
          (*out)->active_desc_sets = sets;
       }
@@ -3658,7 +3670,10 @@ tu_rt_link_dispatch_job(void *data, uint32_t k)
          continue;
       int32_t ce = lc->stage_to_callee[grp->recursive_index];
       const struct tu_rt_partset *ps = lc->callee_sets[ce];
-      if (!tu_rt_callee_compat(ps, cls))
+      if (!tu_rt_callee_compat(ps, tu_rt_class_size(cls)))
+         continue;
+      if (p->stage_types[grp->recursive_index] == MESA_SHADER_CLOSEST_HIT &&
+          (cls & TU_RT_CLASS_SKIP_CHIT))
          continue;
       if (callee_blob[ce] < 0) {
          callee_blob[ce] = nblobs;
@@ -3961,7 +3976,8 @@ tu_rt_link_variants(struct tu_device *dev, struct vk_pipeline_cache *cache,
                   d->used |= tu_rt_scan_used(pipeline->stages[grp->isec_index]);
                if (grp->recursive_index != VK_SHADER_UNUSED_KHR &&
                    pipeline->stage_types[grp->recursive_index] == MESA_SHADER_CLOSEST_HIT &&
-                   tu_rt_compat(&tmp, pipeline->stages[grp->recursive_index], NULL)) {
+                   tu_rt_compat(&tmp, pipeline->stages[grp->recursive_index], NULL) &&
+                   !(d->cls & TU_RT_CLASS_SKIP_CHIT)) {
                   d->used_chit |= tu_rt_scan_used(pipeline->stages[grp->recursive_index]);
                   d->has_chit = true;
                }
