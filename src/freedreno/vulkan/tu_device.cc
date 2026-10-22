@@ -2884,6 +2884,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    struct tu_device *device;
    bool border_color_without_format = false;
    bool autotune_disable_preempt_optimize = false;
+   uint32_t tail_pad;
 
    vk_foreach_struct_const (sType, ext, pCreateInfo->pNext) {
       switch (sType) {
@@ -2966,6 +2967,18 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    tu_free_log_device_init();
+
+   device->bo_va_guard = (uint32_t) align64(
+      CLAMP(debug_get_num_option("TU_BO_GUARD", 0), 0, 1 << 30), os_page_size);
+   device->bo_va_guard_all =
+      device->bo_va_guard && debug_get_bool_option("TU_BO_GUARD_ALL", false);
+   tail_pad = (uint32_t) align64(
+      CLAMP(debug_get_num_option("TU_BO_TAILPAD", 0), 0, 1 << 30), os_page_size);
+   if (device->bo_va_guard || tail_pad) {
+      mesa_logi("tu: TU_BO_GUARD=0x%x TU_BO_GUARD_ALL=%u TU_BO_TAILPAD=0x%x",
+                device->bo_va_guard, (unsigned) device->bo_va_guard_all,
+                tail_pad);
+   }
 
    device->vk.command_buffer_ops = &tu_cmd_buffer_ops;
    device->vk.as_build_ops = &tu_as_build_ops;
@@ -3128,8 +3141,11 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       static_cast<enum tu_bo_alloc_flags>(TU_BO_ALLOC_GPU_READ_ONLY |
                                           TU_BO_ALLOC_ALLOW_DUMP |
                                           TU_BO_ALLOC_INTERNAL_RESOURCE |
-                                          tu_bo_ib_flags(device)),
+                                          tu_bo_ib_flags(device) |
+                                          (device->bo_va_guard ?
+                                           TU_BO_ALLOC_VA_GUARD : 0)),
       "pipeline_suballoc");
+   device->pipeline_suballoc.tail_pad = tail_pad;
    if (is_kgsl(physical_device->instance)) {
       tu_bo_suballocator_init(&device->kgsl_profiling_suballoc, device,
                               128 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE,

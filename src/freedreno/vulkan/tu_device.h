@@ -360,6 +360,9 @@ struct tu_device
    struct tu_suballocator pipeline_suballoc;
    mtx_t pipeline_mutex;
 
+   uint32_t bo_va_guard;
+   bool bo_va_guard_all;
+
    /* KGSL requires a small chunk of GPU mem to retrieve raw GPU time on
     * each submission.
     */

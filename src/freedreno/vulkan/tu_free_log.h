@@ -15,6 +15,7 @@ void tu_free_log_device_finish(void);
 
 void tu_free_log_bo_alloc(struct tu_bo *bo, uint32_t flags, const char *name);
 void tu_free_log_bo_free(const struct tu_bo *bo);
+void tu_free_log_suballoc_bo(const struct tu_bo *bo);
 void tu_free_log_vma(const char *op, uint64_t iova, uint64_t size,
                      uint32_t flags);
 void tu_free_log_free_memory(const void *mem, uint64_t iova, uint64_t size,

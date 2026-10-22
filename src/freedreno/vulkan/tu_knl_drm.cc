@@ -92,7 +92,7 @@ tu_bo_make_zombie(struct tu_device *dev, struct tu_bo *bo)
    vma->res_id = bo->res_id;
 #endif
    vma->iova = bo->iova;
-   vma->size = bo->size;
+   vma->size = bo->size + bo->va_guard;
    if (dev->queue_count[0] > 0)
       vma->fence = p_atomic_read(&dev->queues[0]->fence);
    else

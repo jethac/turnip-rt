@@ -288,9 +288,21 @@ tu_free_log_bo_alloc(struct tu_bo *bo, uint32_t flags, const char *name)
    bo->free_log_name = fl_intern(name);
    bo->free_log_flags = flags;
    fl_line("bo_alloc iova=0x%" PRIx64 " size=0x%" PRIx64
-           " end=0x%" PRIx64 " gem=%u name=%s flags=0x%x lazy=%u",
+           " end=0x%" PRIx64 " gem=%u name=%s flags=0x%x lazy=%u guard=0x%x",
            bo->iova, bo->size, bo->iova + bo->size, bo->gem_handle,
-           bo->free_log_name, flags, (unsigned) bo->lazy);
+           bo->free_log_name, flags, (unsigned) bo->lazy, bo->va_guard);
+}
+
+void
+tu_free_log_suballoc_bo(const struct tu_bo *bo)
+{
+   fl_line("suballoc_bo iova=0x%" PRIx64 " size=0x%" PRIx64
+           " end=0x%" PRIx64 " data_end=0x%" PRIx64 " gem=%u name=%s"
+           " pad=0x%x guard=0x%x",
+           bo->iova, bo->size, bo->iova + bo->size,
+           bo->iova + bo->size - bo->tail_pad, bo->gem_handle,
+           bo->free_log_name ? bo->free_log_name : "?", bo->tail_pad,
+           bo->va_guard);
 }
 
 void
@@ -299,11 +311,13 @@ tu_free_log_bo_free(const struct tu_bo *bo)
    char line[TU_FREE_LOG_LINE_SIZE];
    int len = fl_printf(line, sizeof(line), 0,
                        "bo_free iova=0x%" PRIx64 " size=0x%" PRIx64
-                       " end=0x%" PRIx64 " gem=%u name=%s flags=0x%x lazy=%u",
+                       " end=0x%" PRIx64 " gem=%u name=%s flags=0x%x lazy=%u"
+                       " guard=0x%x pad=0x%x",
                        bo->iova, bo->size, bo->iova + bo->size,
                        bo->gem_handle,
                        bo->free_log_name ? bo->free_log_name : "?",
-                       bo->free_log_flags, (unsigned) bo->lazy);
+                       bo->free_log_flags, (unsigned) bo->lazy,
+                       bo->va_guard, bo->tail_pad);
    if (bo->free_log_flags & TU_BO_ALLOC_INTERNAL_RESOURCE)
       len = fl_backtrace(line, sizeof(line), len);
    fl_append(line, len);

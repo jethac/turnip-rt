@@ -653,11 +653,18 @@ msm_bo_init(struct tu_device *dev,
    MESA_TRACE_FUNC();
    VkResult result = VK_SUCCESS;
    uint64_t iova;
+   uint32_t guard = 0;
+
+   if (unlikely(dev->bo_va_guard) && !lazy_vma &&
+       !(flags & TU_BO_ALLOC_REPLAYABLE) &&
+       ((flags & TU_BO_ALLOC_VA_GUARD) || dev->bo_va_guard_all))
+      guard = dev->bo_va_guard;
 
    if (lazy_vma)
       iova = lazy_vma->msm.iova;
    else
-      result = tu_allocate_iova(dev, 0, size, align, client_iova, flags, &iova);
+      result = tu_allocate_iova(dev, 0, size + guard, align, client_iova,
+                                flags, &iova);
 
    if (result != VK_SUCCESS)
       return result;
@@ -684,7 +691,7 @@ msm_bo_init(struct tu_device *dev,
    int ret = msm_common_gem_new(dev->fd, size, msm_flags, &gem_handle);
    if (ret) {
       if (!lazy_vma)
-         tu_free_iova(dev, iova, size);
+         tu_free_iova(dev, iova, size + guard);
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
 
@@ -697,6 +704,7 @@ msm_bo_init(struct tu_device *dev,
 
    if (result == VK_SUCCESS) {
       *out_bo = bo;
+      bo->va_guard = guard;
       if (flags & TU_BO_ALLOC_INTERNAL_RESOURCE) {
          TU_RMV(internal_resource_create, dev, bo);
          TU_RMV(resource_name, dev, bo, name);
@@ -709,7 +717,7 @@ msm_bo_init(struct tu_device *dev,
          tu_free_log_bo_alloc(bo, flags, name);
    } else {
       if (!lazy_vma)
-         tu_free_iova(dev, iova, size);
+         tu_free_iova(dev, iova, size + guard);
       memset(bo, 0, sizeof(*bo));
    }
 
@@ -900,7 +908,7 @@ msm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
       if (!bo->lazy) {
          tu_map_vm_bind(dev, MSM_VM_BIND_OP_UNMAP, 0, bo->iova, 0, 0,
                         bo->size);
-         tu_free_iova(dev, bo->iova, bo->size);
+         tu_free_iova(dev, bo->iova, bo->size + bo->va_guard);
       }
 
       msm_bo_gem_close(dev, bo);

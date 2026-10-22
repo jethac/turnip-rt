@@ -22,6 +22,8 @@
 
 #include "tu_suballoc.h"
 
+#include "tu_free_log.h"
+
 /* Initializes a BO sub-allocator using refcounts on BOs.
  */
 void
@@ -33,6 +35,7 @@ tu_bo_suballocator_init(struct tu_suballocator *suballoc,
 {
    suballoc->dev = dev;
    suballoc->default_size = default_size;
+   suballoc->tail_pad = 0;
    suballoc->flags = flags;
    suballoc->bo = NULL;
    suballoc->cached_bo = NULL;
@@ -56,7 +59,7 @@ tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
    struct tu_bo *bo = suballoc->bo;
    if (bo) {
       uint32_t offset = align(suballoc->next_offset, alignment);
-      if (offset + size <= bo->size) {
+      if (offset + size <= bo->size - bo->tail_pad) {
          suballoc_bo->bo = tu_bo_get_ref(bo);
          suballoc_bo->iova = bo->iova + offset;
          suballoc_bo->size = size;
@@ -69,7 +72,7 @@ tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
       }
    }
 
-   uint32_t alloc_size = MAX2(size, suballoc->default_size);
+   uint32_t alloc_size = MAX2(size, suballoc->default_size) + suballoc->tail_pad;
 
    /* Reuse a recycled suballoc BO if we have one and it's big enough, otherwise free it. */
    if (suballoc->cached_bo) {
@@ -81,12 +84,15 @@ tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
    }
 
    /* Allocate the new BO if we didn't have one cached. */
+   bool fresh = false;
    if (!suballoc->bo) {
       VkResult result = tu_bo_init_new(suballoc->dev, NULL,
                                        &suballoc->bo, alloc_size,
                                        suballoc->flags, suballoc->name);
       if (result != VK_SUCCESS)
          return result;
+      suballoc->bo->tail_pad = suballoc->tail_pad;
+      fresh = true;
    }
 
    VkResult result = tu_bo_map(suballoc->dev, suballoc->bo, NULL);
@@ -94,6 +100,16 @@ tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
       tu_bo_finish(suballoc->dev, suballoc->bo);
       suballoc->bo = NULL;
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   if (fresh) {
+      if (suballoc->bo->tail_pad) {
+         memset(static_cast<char *>(suballoc->bo->map) + suballoc->bo->size -
+                   suballoc->bo->tail_pad,
+                0, suballoc->bo->tail_pad);
+      }
+      if (unlikely(tu_free_log_on))
+         tu_free_log_suballoc_bo(suballoc->bo);
    }
 
    suballoc_bo->bo = tu_bo_get_ref(suballoc->bo);

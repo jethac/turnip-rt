@@ -30,6 +30,7 @@ enum tu_bo_alloc_flags {
    TU_BO_ALLOC_SHAREABLE = 1 << 5,
    TU_BO_ALLOC_IMPLICIT_SYNC = 1 << 6,
    TU_BO_ALLOC_NO_32B_ROLLOVER = 1 << 7,
+   TU_BO_ALLOC_VA_GUARD = 1 << 8,
 };
 
 enum tu_mem_sync_op {
@@ -81,6 +82,9 @@ struct tu_bo {
 
    const char *free_log_name;
    uint32_t free_log_flags;
+
+   uint32_t va_guard;
+   uint32_t tail_pad;
 };
 
 enum tu_sparse_vma_flags {
