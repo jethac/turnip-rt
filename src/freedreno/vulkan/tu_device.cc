@@ -3130,6 +3130,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
                                           TU_BO_ALLOC_INTERNAL_RESOURCE |
                                           tu_bo_ib_flags(device)),
       "pipeline_suballoc");
+   device->pipeline_suballoc.tail_pad = os_page_size;
    if (is_kgsl(physical_device->instance)) {
       tu_bo_suballocator_init(&device->kgsl_profiling_suballoc, device,
                               128 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE,

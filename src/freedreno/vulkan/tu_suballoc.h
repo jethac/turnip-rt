@@ -20,6 +20,7 @@ struct tu_suballocator
    struct tu_device *dev;
 
    uint32_t default_size;
+   uint32_t tail_pad;
    enum tu_bo_alloc_flags flags;
 
    /** Current BO we're suballocating out of. */
