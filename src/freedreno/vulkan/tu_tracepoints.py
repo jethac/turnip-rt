@@ -308,6 +308,21 @@ singular_tp('cmd_buffer_insert_label',
             toggle_name='cmd_buffer_annotation',
             queue_tp=False)
 
+singular_tp('rt_trace_rays',
+            args=[Arg(type='uint32_t', var='seq', c_format='%u'),
+                  Arg(type='uint32_t', var='variants', c_format='%u'),
+                  Arg(type='uint32_t', var='width', c_format='%u', is_indirect=True),
+                  Arg(type='uint32_t', var='height', c_format='%u', is_indirect=True),
+                  Arg(type='uint32_t', var='depth', c_format='%u', is_indirect=True),],
+            toggle_name='rt_label',
+            queue_tp=False)
+
+singular_tp('rt_trace_rays_end',
+            args=[Arg(type='uint32_t', var='seq', c_format='%u'),
+                  Arg(type='uint32_t', var='handle', c_format='0x%x', is_indirect=True),],
+            toggle_name='rt_label',
+            queue_tp=False)
+
 # Annotations for Cmd(Begin|End)DebugUtilsLabelEXT
 for suffix in ["", "_rp"]:
     begin_end_tp('cmd_buffer_annotation' + suffix,

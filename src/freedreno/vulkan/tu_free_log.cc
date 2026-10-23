@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -35,6 +36,7 @@
 #define TU_FREE_LOG_BT_DEPTH 14
 
 bool tu_free_log_on;
+bool tu_rt_label_on;
 
 struct tu_free_log_as {
    uint64_t va;
@@ -55,6 +57,8 @@ static char *fl_buf;
 static size_t fl_len;
 static std::unordered_set<std::string> *fl_names;
 static std::unordered_map<uintptr_t, struct tu_free_log_as> *fl_as;
+static std::unordered_map<uint32_t, std::string> *fl_rt_names;
+static std::atomic<uint32_t> fl_rt_seq;
 
 static void
 fl_flush_locked(void)
@@ -168,8 +172,13 @@ static void
 fl_init_once(void)
 {
    const char *prefix = debug_get_option("TU_FREE_LOG", NULL);
-   if (!prefix || !*prefix)
+   const char *rt_label = debug_get_option("TU_RT_LABEL", NULL);
+   bool free_log = prefix && *prefix;
+   bool label = rt_label && *rt_label;
+   if (!free_log && !label)
       return;
+   if (!free_log)
+      prefix = rt_label;
 
    fl_prefix = strdup(prefix);
    fl_buf = static_cast<char *>(malloc(TU_FREE_LOG_BUF_SIZE));
@@ -178,6 +187,7 @@ fl_init_once(void)
 
    fl_names = new std::unordered_set<std::string>;
    fl_as = new std::unordered_map<uintptr_t, struct tu_free_log_as>;
+   fl_rt_names = new std::unordered_map<uint32_t, std::string>;
    mtx_init(&fl_life, mtx_plain);
    mtx_init(&fl_lock, mtx_plain);
    cnd_init(&fl_cond);
@@ -187,14 +197,15 @@ fl_init_once(void)
    backtrace(warm, ARRAY_SIZE(warm));
 #endif
 
-   tu_free_log_on = true;
+   tu_free_log_on = free_log;
+   tu_rt_label_on = label;
 }
 
 void
 tu_free_log_device_init(void)
 {
    call_once(&fl_once, fl_init_once);
-   if (!tu_free_log_on)
+   if (!tu_free_log_on && !tu_rt_label_on)
       return;
 
    const char *so = "?";
@@ -233,7 +244,7 @@ tu_free_log_device_init(void)
 void
 tu_free_log_device_finish(void)
 {
-   if (!tu_free_log_on)
+   if (!tu_free_log_on && !tu_rt_label_on)
       return;
 
    mtx_lock(&fl_life);
@@ -383,4 +394,88 @@ tu_free_log_destroy_as(const void *as, uint64_t addr, uint64_t size)
    fl_line("destroy_as as=%p va=0x%" PRIx64 " size=0x%" PRIx64
            " end=0x%" PRIx64 " known=%u",
            as, va, size, va + size, (unsigned) known);
+}
+
+static std::string
+fl_spirv_name(const uint32_t *spirv, size_t size)
+{
+   size_t n = size / sizeof(uint32_t);
+   std::string first;
+   if (n < 5 || spirv[0] != 0x07230203)
+      return first;
+   for (size_t i = 5; i < n;) {
+      uint32_t op = spirv[i] & 0xffff, len = spirv[i] >> 16;
+      if (!len || i + len > n)
+         break;
+      if (op == 7 && len > 2) {
+         const char *str = reinterpret_cast<const char *>(spirv + i + 2);
+         std::string val(str, strnlen(str, (len - 2) * sizeof(uint32_t)));
+         if (val.size() > 5 && val.compare(val.size() - 5, 5, ".dxil") == 0)
+            return val;
+         if (first.empty())
+            first = val;
+      } else if (op == 54) {
+         break;
+      }
+      i += len;
+   }
+   return first;
+}
+
+void
+tu_free_log_rt_stage(uint32_t handle, const char *stage, const uint32_t *spirv,
+                     size_t size, const char *entry)
+{
+   std::string name = spirv ? fl_spirv_name(spirv, size) : std::string();
+   if (name.empty())
+      name = entry ? entry : "?";
+   for (char &c : name) {
+      if (c == ' ' || c == '\t' || c == '\n')
+         c = '_';
+   }
+   mtx_lock(&fl_lock);
+   (*fl_rt_names)[handle] = name;
+   mtx_unlock(&fl_lock);
+   fl_line("rt_stage handle=0x%x stage=%s name=%s entry=%s", handle, stage,
+           name.c_str(), entry ? entry : "?");
+}
+
+void
+tu_free_log_rt_pipeline(const void *pipeline, bool library,
+                        uint32_t stage_count, uint32_t group_count,
+                        uint32_t variant_count)
+{
+   fl_line("rt_pipeline pipe=%p kind=%s stages=%u groups=%u variants=%u",
+           pipeline, library ? "library" : "final", stage_count, group_count,
+           variant_count);
+}
+
+void
+tu_free_log_rt_variant(const void *pipeline, uint32_t index, uint32_t count,
+                       uint32_t handle, const char *blake3)
+{
+   std::string name = "?";
+   mtx_lock(&fl_lock);
+   auto it = fl_rt_names->find(handle);
+   if (it != fl_rt_names->end())
+      name = it->second;
+   mtx_unlock(&fl_lock);
+   fl_line("rt_variant pipe=%p v=%u/%u handle=0x%x blake3=%s name=%s",
+           pipeline, index, count, handle, blake3 ? blake3 : "?",
+           name.c_str());
+}
+
+uint32_t
+tu_free_log_rt_dispatch(const void *cmd, const void *pipeline,
+                        uint32_t variant_count, const uint32_t *dims,
+                        uint64_t cmd_va, uint64_t raygen_va)
+{
+   uint32_t seq = fl_rt_seq.fetch_add(1, std::memory_order_relaxed);
+   fl_line("rt_dispatch seq=%u cmd=%p pipe=%p variants=%u kind=%s "
+           "dims=%ux%ux%u cmd_va=0x%" PRIx64 " raygen_va=0x%" PRIx64,
+           seq, cmd, pipeline, variant_count,
+           dims ? "direct" : (raygen_va ? "indirect" : "indirect2"),
+           dims ? dims[0] : 0, dims ? dims[1] : 0, dims ? dims[2] : 0,
+           cmd_va, raygen_va);
+   return seq;
 }
