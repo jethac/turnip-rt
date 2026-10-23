@@ -28,6 +28,7 @@
 #include "tu_cmd_buffer.h"
 #include "tu_cs.h"
 #include "tu_device.h"
+#include "tu_foveate.h"
 #include "tu_formats.h"
 #include "tu_knl.h"
 #include "tu_lrz.h"
@@ -5002,24 +5003,30 @@ tu_CreateGraphicsPipelines(VkDevice device,
 }
 TU_GENX(tu_CreateGraphicsPipelines);
 
+static const uint32_t *
+tu_stage_spirv_words(const VkPipelineShaderStageCreateInfo *stage,
+                     size_t *size)
+{
+   VK_FROM_HANDLE(vk_shader_module, module, stage->module);
+   if (module) {
+      *size = module->size;
+      return (const uint32_t *) module->data;
+   }
+   const VkShaderModuleCreateInfo *mci =
+      vk_find_struct_const(stage->pNext, SHADER_MODULE_CREATE_INFO);
+   if (mci) {
+      *size = mci->codeSize;
+      return mci->pCode;
+   }
+   return NULL;
+}
+
 static bool
 tu_stage_has_module_processed(const VkPipelineShaderStageCreateInfo *stage,
                               const char *tag)
 {
-   const uint32_t *words = NULL;
    size_t size = 0;
-   VK_FROM_HANDLE(vk_shader_module, module, stage->module);
-   if (module) {
-      words = (const uint32_t *) module->data;
-      size = module->size;
-   } else {
-      const VkShaderModuleCreateInfo *mci =
-         vk_find_struct_const(stage->pNext, SHADER_MODULE_CREATE_INFO);
-      if (mci) {
-         words = mci->pCode;
-         size = mci->codeSize;
-      }
-   }
+   const uint32_t *words = tu_stage_spirv_words(stage, &size);
    if (!words)
       return false;
 
@@ -5033,6 +5040,36 @@ tu_stage_has_module_processed(const VkPipelineShaderStageCreateInfo *stage,
       if (op == SpvOpModuleProcessed && (len - 1) * 4 > tag_len &&
           !memcmp(&words[i + 1], tag, tag_len + 1))
          return true;
+      i += len;
+   }
+   return false;
+}
+
+static bool
+tu_stage_gaze_ubo(const VkPipelineShaderStageCreateInfo *stage,
+                  unsigned *set, unsigned *binding)
+{
+   static const char prefix[] = "turnip.gaze_ubo=";
+   size_t size = 0;
+   const uint32_t *words = tu_stage_spirv_words(stage, &size);
+   if (!words)
+      return false;
+
+   const size_t count = size / 4;
+   for (size_t i = 5; i < count;) {
+      const uint32_t op = words[i] & SpvOpCodeMask;
+      const uint32_t len = words[i] >> SpvWordCountShift;
+      if (!len || len > count - i || op == SpvOpFunction)
+         break;
+      if (op == SpvOpModuleProcessed &&
+          memchr(&words[i + 1], 0, (len - 1) * 4) &&
+          !strncmp((const char *) &words[i + 1], prefix, sizeof(prefix) - 1)) {
+         char tail;
+         if (sscanf((const char *) &words[i + 1] + sizeof(prefix) - 1,
+                    "%u:%u%c", set, binding, &tail) == 2 &&
+             *set < 32 && *binding < (1u << 15))
+            return true;
+      }
       i += len;
    }
    return false;
@@ -5103,6 +5140,14 @@ tu_compute_pipeline_create(VkDevice device,
    tu_shader_key_subgroup_size(&key, allow_varying_subgroup_size,
                                require_full_subgroups, subgroup_info,
                                dev);
+
+   unsigned gaze_set, gaze_binding;
+   if (tu_gaze_block_enabled() &&
+       tu_stage_gaze_ubo(stage_info, &gaze_set, &gaze_binding)) {
+      key.gaze_ubo = true;
+      key.gaze_set = gaze_set;
+      key.gaze_binding = gaze_binding;
+   }
 
    struct vk_pipeline_robustness_state rs;
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &rs, pCreateInfo->pNext, stage_info->pNext);

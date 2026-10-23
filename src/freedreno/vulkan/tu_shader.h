@@ -57,6 +57,7 @@ struct tu_const_state
    struct ir3_driver_ubo dynamic_offsets_ubo;
    struct ir3_driver_ubo inline_uniforms_ubo;
    struct ir3_driver_ubo bindless_base_addrs_ubo;
+   struct ir3_driver_ubo gaze_ubo;
 };
 
 struct tu_shader
@@ -144,7 +145,9 @@ struct tu_shader_key {
    bool emulate_alpha_to_coverage : 1;
    bool fast_math : 1;
    bool ray_tracing : 1;
-   uint32_t padding : 21;
+   bool gaze_ubo : 1;
+   uint32_t gaze_set : 5;
+   uint32_t gaze_binding : 15;
 
    enum ir3_wavesize_option api_wavesize, real_wavesize;
 

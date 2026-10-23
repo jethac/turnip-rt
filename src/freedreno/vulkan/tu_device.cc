@@ -38,6 +38,7 @@
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
 #include "tu_dynamic_rendering.h"
+#include "tu_foveate.h"
 #include "tu_free_log.h"
 #include "tu_image.h"
 #include "tu_pass.h"
@@ -137,6 +138,8 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
       debug_get_bool_option("TU_FOVEATE", false),
    };
    _mesa_blake3_update(&ctx, env_flags, sizeof(env_flags));
+   if (tu_gaze_block_enabled())
+      _mesa_blake3_update(&ctx, "TU_GAZE_BLOCK", 13);
    const uint64_t cs_constlen_cap =
       (uint64_t) debug_get_num_option("TU_CS_CONSTLEN_CAP", 0);
    _mesa_blake3_update(&ctx, &cs_constlen_cap, sizeof(cs_constlen_cap));

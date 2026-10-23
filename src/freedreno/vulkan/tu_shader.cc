@@ -23,6 +23,7 @@
 #include "ir3/ir3_replay.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
+#include "tu_foveate.h"
 #include "tu_lrz.h"
 #include "tu_pipeline.h"
 #include "tu_rmv.h"
@@ -3635,6 +3636,7 @@ tu_shader_init(struct tu_device *dev, const void *key_data, size_t key_size)
    shader->const_state.dynamic_offsets_ubo.idx = -1;
    shader->const_state.inline_uniforms_ubo.idx = -1;
    shader->const_state.bindless_base_addrs_ubo.idx = -1;
+   shader->const_state.gaze_ubo.idx = -1;
 
    return shader;
 }
@@ -3932,6 +3934,82 @@ tu_skytrace_variant(struct ir3_shader *ir3_shader,
    return t;
 }
 
+struct lower_gaze_ubo_params {
+   struct tu_shader *shader;
+   const struct tu_shader_key *key;
+};
+
+static bool
+is_gaze_descriptor(nir_def *def, const struct tu_shader_key *key)
+{
+   nir_scalar desc = nir_scalar_chase_movs(nir_get_scalar(def, 0));
+   if (!nir_scalar_is_intrinsic(desc) ||
+       nir_scalar_intrinsic_op(desc) != nir_intrinsic_load_vulkan_descriptor)
+      return false;
+
+   nir_intrinsic_instr *load_desc =
+      nir_instr_as_intrinsic(nir_def_instr(desc.def));
+   nir_scalar res =
+      nir_scalar_chase_movs(nir_get_scalar(load_desc->src[0].ssa, 0));
+   if (!nir_scalar_is_intrinsic(res) ||
+       nir_scalar_intrinsic_op(res) != nir_intrinsic_vulkan_resource_index)
+      return false;
+
+   nir_intrinsic_instr *res_idx =
+      nir_instr_as_intrinsic(nir_def_instr(res.def));
+   return nir_intrinsic_desc_set(res_idx) == key->gaze_set &&
+          nir_intrinsic_binding(res_idx) == key->gaze_binding;
+}
+
+static bool
+lower_gaze_ubo_instr(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+{
+   const struct lower_gaze_ubo_params *params =
+      (const struct lower_gaze_ubo_params *) data;
+   if (intrin->intrinsic != nir_intrinsic_load_ubo ||
+       !is_gaze_descriptor(intrin->src[0].ssa, params->key))
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   struct ir3_driver_ubo *ubo = &params->shader->const_state.gaze_ubo;
+   ubo->size = MAX2(ubo->size, TU_GAZE_BLOCK_DWORDS);
+   nir_src_rewrite(&intrin->src[0], ir3_get_driver_ubo(b, ubo));
+   nir_intrinsic_set_access(intrin,
+                            (enum gl_access_qualifier)
+                            (nir_intrinsic_access(intrin) |
+                             ACCESS_CAN_SPECULATE));
+   return true;
+}
+
+static bool
+lower_gaze_descriptor_instr(nir_builder *b, nir_intrinsic_instr *intrin,
+                            void *data)
+{
+   const struct lower_gaze_ubo_params *params =
+      (const struct lower_gaze_ubo_params *) data;
+   if (intrin->intrinsic != nir_intrinsic_load_vulkan_descriptor ||
+       !is_gaze_descriptor(&intrin->def, params->key))
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def_replace(&intrin->def, nir_imm_zero(b, 3, 32));
+   return true;
+}
+
+static bool
+tu_lower_gaze_ubo(nir_shader *nir, struct tu_shader *shader,
+                  const struct tu_shader_key *key)
+{
+   struct lower_gaze_ubo_params params = { shader, key };
+   if (!nir_shader_intrinsics_pass(nir, lower_gaze_ubo_instr,
+                                   nir_metadata_control_flow, &params))
+      return false;
+
+   nir_shader_intrinsics_pass(nir, lower_gaze_descriptor_instr,
+                              nir_metadata_control_flow, &params);
+   return true;
+}
+
 VkResult
 tu_shader_create(struct tu_device *dev,
                  struct tu_shader **shader_out,
@@ -3968,6 +4046,14 @@ tu_shader_create(struct tu_device *dev,
       } else {
          shader->dynamic_descriptor_sizes[i] = -1;
       }
+   }
+
+   if (key->gaze_ubo &&
+       dev->compiler->info->props.load_shader_consts_via_preamble) {
+      bool progress = false;
+      NIR_PASS(progress, nir, tu_lower_gaze_ubo, shader, key);
+      if (progress)
+         NIR_PASS(_, nir, nir_opt_dce);
    }
 
    struct ir3_const_allocations const_allocs = {};

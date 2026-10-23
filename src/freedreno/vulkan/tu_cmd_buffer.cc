@@ -7959,6 +7959,9 @@ tu6_user_consts_size(const struct tu_const_state *const_state,
       }
    }
 
+   if (load_shader_consts_via_preamble && const_state->gaze_ubo.idx >= 0)
+      dwords += 6 + (TU_GAZE_BLOCK_DWORDS + 4);
+
    return dwords;
 }
 
@@ -8250,6 +8253,34 @@ tu_emit_bindless_base_addresses(struct tu_cs *cs,
    }
 }
 
+static void
+tu7_emit_gaze_ubo(struct tu_cmd_buffer *cmd,
+                  struct tu_cs *cs,
+                  const struct tu_const_state *const_state,
+                  mesa_shader_stage type)
+{
+   int ubo_offset = const_state->gaze_ubo.idx;
+   if (ubo_offset < 0)
+      return;
+
+   struct tu_gaze_block blk;
+   tu_foveate_gaze_block(cmd->device, &blk);
+
+   uint64_t iova = tu_cs_emit_data_nop(
+      cs, reinterpret_cast<uint32_t *>(&blk), TU_GAZE_BLOCK_DWORDS, 4);
+
+   tu_cs_emit_pkt7(cs, tu6_stage2opcode(type), 5);
+   tu_cs_emit(cs, CP_LOAD_STATE6_0_DST_OFF(ubo_offset) |
+            CP_LOAD_STATE6_0_STATE_TYPE(ST6_UBO) |
+            CP_LOAD_STATE6_0_STATE_SRC(SS6_DIRECT) |
+            CP_LOAD_STATE6_0_STATE_BLOCK(tu6_stage2shadersb(type)) |
+            CP_LOAD_STATE6_0_NUM_UNIT(1));
+   tu_cs_emit(cs, CP_LOAD_STATE6_1_EXT_SRC_ADDR(0));
+   tu_cs_emit(cs, CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(0));
+   tu_cs_emit_qw(cs, iova | (static_cast<uint64_t>(A6XX_UBO_1_SIZE(
+                                DIV_ROUND_UP(TU_GAZE_BLOCK_DWORDS, 4))) << 32));
+}
+
 template <chip CHIP>
 static struct tu_draw_state
 tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
@@ -8289,6 +8320,9 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
          cmd->state.shaders[MESA_SHADER_COMPUTE]->variant->const_state,
          MESA_SHADER_COMPUTE,
          tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
+      tu7_emit_gaze_ubo(
+         cmd, &cs, &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state,
+         MESA_SHADER_COMPUTE);
    } else {
       struct tu_descriptor_state *descriptors =
          tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
