@@ -59,6 +59,19 @@ struct tu_rt_fov_block {
 
 uint32_t tu_foveate_rt_mode(void);
 
+#define TU_GAZE_BLOCK_DWORDS 8
+
+struct tu_gaze_block {
+   float centre[2][2];
+   uint32_t valid;
+   uint32_t seq;
+   uint32_t pad[2];
+};
+
+bool tu_gaze_block_enabled(void);
+
+void tu_foveate_gaze_block(struct tu_device *dev, struct tu_gaze_block *blk);
+
 void tu_foveate_rt_fill(struct tu_device *dev, struct tu_rt_fov_block *blk);
 
 void tu_foveate_frag_area(struct tu_cmd_buffer *cmd,

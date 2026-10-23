@@ -67,10 +67,11 @@ static int64_t shm_retry_ns;
 struct tu_gaze_latch {
    uint64_t key;
    float uv[2][2];
+   bool valid[2];
 };
 
 static simple_mtx_t latch_mtx = SIMPLE_MTX_INITIALIZER;
-static struct tu_gaze_latch latch = { UINT64_MAX, {} };
+static struct tu_gaze_latch latch = { UINT64_MAX, {}, {} };
 
 static uint32_t stat_tiles[3];
 static uint32_t stat_vetoed;
@@ -259,14 +260,14 @@ tu_foveate_map(void)
    return p;
 }
 
-static void
+static bool
 tu_foveate_gaze_shm(unsigned eye, float *gx, float *gy)
 {
    *gx = cfg.fixed_x;
    *gy = cfg.fixed_y;
    const struct tu_gaze_shm *p = tu_foveate_map();
    if (!p)
-      return;
+      return false;
    float cx = p->center[eye][0], cy = p->center[eye][1];
    if (cx > 0.f && cx < 1.f && cy > 0.f && cy < 1.f) {
       *gx = cx;
@@ -279,13 +280,14 @@ tu_foveate_gaze_shm(unsigned eye, float *gx, float *gy)
    uint64_t t = p->time_ns;
    __atomic_thread_fence(__ATOMIC_ACQUIRE);
    if (s0 != p->seq || (s0 & 1) || !valid)
-      return;
+      return false;
    if ((uint64_t) os_time_get_nano() - t > cfg.stale_ns)
-      return;
+      return false;
    if (!(x >= 0.f && x <= 1.f && y >= 0.f && y <= 1.f))
-      return;
+      return false;
    *gx = x;
    *gy = y;
+   return true;
 }
 
 static void
@@ -355,24 +357,57 @@ tu_foveate_log(uint64_t frame)
              p_atomic_xchg(&stat_tiles[2], 0), p_atomic_xchg(&stat_vetoed, 0));
 }
 
-static void
-tu_foveate_gaze_dev(struct tu_device *dev, unsigned eye, float *gx, float *gy)
+static uint64_t
+tu_foveate_latch(struct tu_device *dev)
 {
    uint64_t frame = tu_foveate_frame(dev);
-   simple_mtx_lock(&latch_mtx);
    if (latch.key != frame) {
       if (latch.key != UINT64_MAX)
          tu_foveate_log(latch.key);
       latch.key = frame;
       for (unsigned e = 0; e < 2; e++) {
-         if (cfg.src == TU_GAZE_SHM)
-            tu_foveate_gaze_shm(e, &latch.uv[e][0], &latch.uv[e][1]);
-         else
+         if (cfg.src == TU_GAZE_SHM) {
+            latch.valid[e] =
+               tu_foveate_gaze_shm(e, &latch.uv[e][0], &latch.uv[e][1]);
+         } else {
             tu_foveate_gaze_synth(frame, &latch.uv[e][0], &latch.uv[e][1]);
+            latch.valid[e] = true;
+         }
       }
    }
+   return frame;
+}
+
+static void
+tu_foveate_gaze_dev(struct tu_device *dev, unsigned eye, float *gx, float *gy)
+{
+   simple_mtx_lock(&latch_mtx);
+   tu_foveate_latch(dev);
    *gx = latch.uv[eye & 1][0];
    *gy = latch.uv[eye & 1][1];
+   simple_mtx_unlock(&latch_mtx);
+}
+
+bool
+tu_gaze_block_enabled(void)
+{
+   static const bool enabled = debug_get_bool_option("TU_GAZE_BLOCK", false);
+   return enabled;
+}
+
+void
+tu_foveate_gaze_block(struct tu_device *dev, struct tu_gaze_block *blk)
+{
+   tu_foveate_init();
+   memset(blk, 0, sizeof(*blk));
+   simple_mtx_lock(&latch_mtx);
+   uint64_t frame = tu_foveate_latch(dev);
+   for (unsigned e = 0; e < 2; e++) {
+      blk->centre[e][0] = latch.uv[e][0];
+      blk->centre[e][1] = latch.uv[e][1];
+   }
+   blk->valid = latch.valid[0] && latch.valid[1];
+   blk->seq = (uint32_t) frame;
    simple_mtx_unlock(&latch_mtx);
 }
 
