@@ -132,7 +132,7 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
       debug_get_bool_option("TU_RT_BST", true),
       debug_get_bool_option("TU_FP16_DENORM_FLUSH", false),
       debug_get_bool_option("TU_PUSH_UBO_SPECULATE", false),
-      debug_get_bool_option("TU_ATOMIC_EARLY_OUT", false),
+      debug_get_bool_option("TU_ATOMIC_EARLY_OUT", true),
       debug_get_bool_option("TU_LANE_SHUFFLE", false),
       debug_get_bool_option("TU_FOVEATE", false),
    };
@@ -3089,7 +3089,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
          .storage_8bit = physical_device->info->props.storage_8bit,
          .shared_push_consts = !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
          .atomic_early_out =
-            debug_get_bool_option("TU_ATOMIC_EARLY_OUT", false),
+            debug_get_bool_option("TU_ATOMIC_EARLY_OUT", true),
          .uche_trap_base = physical_device->uche_trap_base,
       };
       device->compiler = ir3_compiler_create(
