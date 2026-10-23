@@ -27,6 +27,7 @@
 #include "tu_shader.h"
 #include "tu_rt_prof.h"
 #include "tu_foveate.h"
+#include "tu_free_log.h"
 #include "ir3/ir3_nir.h"
 #include "bvh/tu_bvh_defines.h"
 
@@ -88,6 +89,25 @@ tu_keylog_enabled(void)
 }
 
 static void
+tu_rt_label_stage(uint32_t handle, const VkPipelineShaderStageCreateInfo *st)
+{
+   VK_FROM_HANDLE(vk_shader_module, module, st->module);
+   const VkShaderModuleCreateInfo *minfo =
+      (const VkShaderModuleCreateInfo *) vk_find_struct_const(st->pNext, SHADER_MODULE_CREATE_INFO);
+   const uint32_t *code = NULL;
+   size_t size = 0;
+   if (module) {
+      code = (const uint32_t *) module->data;
+      size = module->size;
+   } else if (minfo) {
+      code = minfo->pCode;
+      size = minfo->codeSize;
+   }
+   tu_free_log_rt_stage(handle, _mesa_shader_stage_to_abbrev(vk_to_mesa_shader_stage(st->stage)),
+                        code, size, st->pName);
+}
+
+static void
 tu_rt_init_groups(struct tu_device *dev,
                   struct tu_ray_tracing_pipeline *pipeline,
                   const VkRayTracingPipelineCreateInfoKHR *create_info)
@@ -138,6 +158,10 @@ tu_rt_init_groups(struct tu_device *dev,
       memcpy(&dst->handle, out, sizeof(dst->handle));
       if (!dst->handle)
          dst->handle = 1;
+      if (unlikely(tu_rt_label_on) &&
+          group_info->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR &&
+          dst->recursive_index < create_info->stageCount)
+         tu_rt_label_stage(dst->handle, create_info->pStages + dst->recursive_index);
    }
 
    if (!create_info->pLibraryInfo)
@@ -5116,6 +5140,29 @@ tu_rt_pipeline_create(struct tu_device *dev,
                    iv->info.max_half_reg + 1, iv->info.stp_count, iv->info.ldp_count,
                    iv->info.loops, iv->info.max_waves, iv->info.double_threadsize ? 128 : 64,
                    iv->pvtmem_size, iv->pvtmem_per_wave, iv->branchstack, iv->info.size / 8);
+      }
+   }
+
+   if (unlikely(tu_rt_label_on)) {
+      const struct tu_shader *sh = pipeline->base.base.shaders[MESA_SHADER_COMPUTE];
+      const bool library = flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR;
+      uint32_t logged = pipeline->variants ? pipeline->variant_count : (sh ? 1 : 0);
+      tu_free_log_rt_pipeline(pipeline, library, pipeline->stage_count,
+                              pipeline->group_count, logged);
+      for (uint32_t v = 0; v < logged; v++) {
+         const struct ir3_shader_variant *iv =
+            pipeline->variants ? pipeline->variants[v].shader->variant : sh->variant;
+         uint32_t handle = pipeline->variants ? pipeline->variants[v].handle : 0;
+         if (!pipeline->variants) {
+            for (uint32_t g = 0; g < pipeline->group_count; g++) {
+               uint32_t si = pipeline->groups[g].recursive_index;
+               if (si != VK_SHADER_UNUSED_KHR && pipeline->stage_types[si] == MESA_SHADER_RAYGEN) {
+                  handle = pipeline->groups[g].handle;
+                  break;
+               }
+            }
+         }
+         tu_free_log_rt_variant(pipeline, v, logged, handle, iv->blake3_str);
       }
    }
 

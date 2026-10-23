@@ -25,6 +25,7 @@
 #include "tu_clear_blit.h"
 #include "tu_cs.h"
 #include "tu_event.h"
+#include "tu_free_log.h"
 #include "tu_image.h"
 #include "tu_knl.h"
 #include "tu_perfetto.h"
@@ -10424,6 +10425,26 @@ tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
    struct tu_shader *rt_shader = pipeline->shaders[MESA_SHADER_COMPUTE];
    struct tu_ray_tracing_pipeline *rtp = tu_pipeline_to_ray_tracing(pipeline);
 
+   uint32_t label_seq = 0;
+   struct tu_cs_memory label_slot = {};
+   if (unlikely(tu_rt_label_on)) {
+      label_seq = tu_free_log_rt_dispatch(cmd, rtp, rtp->variant_count, dims,
+                                          rt_cmd_iova, raygen_iova);
+      tu_cs_set_writeable(&cmd->sub_cs, true);
+      VkResult r = tu_cs_alloc(&cmd->sub_cs, 1, 4, &label_slot);
+      tu_cs_set_writeable(&cmd->sub_cs, false);
+      if (r != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, r);
+         return;
+      }
+      label_slot.map[0] = 0;
+      const uint64_t d = rt_cmd_iova + offsetof(VkTraceRaysIndirectCommand2KHR, width);
+      trace_rt_trace_rays(&cmd->trace, cs, cmd, label_seq, rtp->variant_count,
+                          (struct u_trace_address) { .bo = NULL, .offset = d },
+                          (struct u_trace_address) { .bo = NULL, .offset = d + 4 },
+                          (struct u_trace_address) { .bo = NULL, .offset = d + 8 });
+   }
+
    struct tu_descriptor_state tmp = cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE];
    cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE] = cmd->descriptors[TU_BIND_POINT_RT];
    cmd->descriptors[TU_BIND_POINT_RT] = tmp;
@@ -10460,6 +10481,8 @@ tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
          tu_cs_emit(cs, 4);
       }
       tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+      if (unlikely(tu_rt_label_on))
+         cs->reg_to_mem(label_slot.iova, tu_scratch_reg<CHIP>(TU_RT_RAYGEN_SCRATCH));
       for (uint32_t v = 0; v < rtp->variant_count; v++) {
          struct tu_shader *vs = rtp->variants[v].shader;
          tu_cond_exec_start_imm(cs,
@@ -10476,6 +10499,12 @@ tu_trace_rays(struct tu_cmd_buffer *cmd, uint64_t rt_cmd_iova,
       cmd->state.shaders[MESA_SHADER_COMPUTE] = rt_shader;
       tu_cs_emit_state_ib(cs, rt_shader->state);
       tu_dispatch<CHIP>(cmd, &info);
+   }
+
+   if (unlikely(tu_rt_label_on)) {
+      tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+      trace_rt_trace_rays_end(&cmd->trace, cs, cmd, label_seq,
+                              (struct u_trace_address) { .bo = NULL, .offset = label_slot.iova });
    }
 
    tmp = cmd->descriptors[VK_PIPELINE_BIND_POINT_COMPUTE];
