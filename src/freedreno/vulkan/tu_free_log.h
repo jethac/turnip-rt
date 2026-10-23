@@ -15,6 +15,10 @@ void tu_free_log_device_finish(void);
 
 void tu_free_log_bo_alloc(struct tu_bo *bo, uint32_t flags, const char *name);
 void tu_free_log_bo_free(const struct tu_bo *bo);
+void tu_free_log_config(bool epw_broad, bool cs_isz_wa,
+                        uint32_t cs_isz_restore);
+void tu_free_log_cs_isz(const char *bin, uint32_t instrlen, bool wa,
+                        uint32_t restore, uint32_t cond);
 void tu_free_log_vma(const char *op, uint64_t iova, uint64_t size,
                      uint32_t flags);
 void tu_free_log_free_memory(const void *mem, uint64_t iova, uint64_t size,

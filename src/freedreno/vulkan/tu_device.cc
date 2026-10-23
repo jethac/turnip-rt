@@ -2967,6 +2967,18 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    tu_free_log_device_init();
 
+   device->cs_isz_wa = debug_get_bool_option("TU_CS_ISZ_WA", true);
+   device->cs_isz_restore = (uint32_t)
+      CLAMP(debug_get_num_option("TU_CS_ISZ_RESTORE", 0), 0, 0xfffffff);
+   if (!device->cs_isz_wa || device->cs_isz_restore) {
+      mesa_logi("tu: TU_CS_ISZ_WA=%u TU_CS_ISZ_RESTORE=0x%x",
+                (unsigned) device->cs_isz_wa, device->cs_isz_restore);
+   }
+   if (unlikely(tu_free_log_on)) {
+      tu_free_log_config(debug_get_bool_option("TU_EPW_BROAD", false),
+                         device->cs_isz_wa, device->cs_isz_restore);
+   }
+
    device->vk.command_buffer_ops = &tu_cmd_buffer_ops;
    device->vk.as_build_ops = &tu_as_build_ops;
    device->vk.check_status = tu_device_check_status;

@@ -294,6 +294,21 @@ tu_free_log_bo_alloc(struct tu_bo *bo, uint32_t flags, const char *name)
 }
 
 void
+tu_free_log_config(bool epw_broad, bool cs_isz_wa, uint32_t cs_isz_restore)
+{
+   fl_line("cfg epw_broad=%u cs_isz_wa=%u cs_isz_restore=0x%x",
+           (unsigned) epw_broad, (unsigned) cs_isz_wa, cs_isz_restore);
+}
+
+void
+tu_free_log_cs_isz(const char *bin, uint32_t instrlen, bool wa,
+                   uint32_t restore, uint32_t cond)
+{
+   fl_line("cs_isz bin=%.12s instrlen=0x%x wa=%u restore=0x%x cond=%u", bin,
+           instrlen, (unsigned) wa, restore, cond);
+}
+
+void
 tu_free_log_bo_free(const struct tu_bo *bo)
 {
    char line[TU_FREE_LOG_LINE_SIZE];
