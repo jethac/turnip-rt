@@ -328,12 +328,21 @@ tu_free_log_suballoc(const struct tu_bo *bo, uint64_t iova, uint64_t size,
 
 void
 tu_free_log_config(uint32_t guard, bool guard_all, bool guard_each,
-                   uint32_t tail_pad, bool epw_broad)
+                   uint32_t tail_pad, bool epw_broad, bool cs_isz_wa,
+                   uint32_t cs_isz_restore)
 {
    fl_line("cfg guard=0x%x guard_all=%u guard_each=%u tail_pad=0x%x"
-           " epw_broad=%u",
+           " epw_broad=%u cs_isz_wa=%u cs_isz_restore=0x%x",
            guard, (unsigned) guard_all, (unsigned) guard_each, tail_pad,
-           (unsigned) epw_broad);
+           (unsigned) epw_broad, (unsigned) cs_isz_wa, cs_isz_restore);
+}
+
+void
+tu_free_log_cs_isz(const char *bin, uint32_t instrlen, bool wa,
+                   uint32_t restore, uint32_t cond)
+{
+   fl_line("cs_isz bin=%.12s instrlen=0x%x wa=%u restore=0x%x cond=%u", bin,
+           instrlen, (unsigned) wa, restore, cond);
 }
 
 void

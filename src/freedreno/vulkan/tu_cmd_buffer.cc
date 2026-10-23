@@ -25,6 +25,7 @@
 #include "tu_clear_blit.h"
 #include "tu_cs.h"
 #include "tu_event.h"
+#include "tu_free_log.h"
 #include "tu_image.h"
 #include "tu_knl.h"
 #include "tu_perfetto.h"
@@ -10001,6 +10002,16 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
       shader->variant->instrlen >
       cmd->device->physical_device->info->props.instr_cache_size;
 
+   if (unlikely(tu_free_log_on) && emit_instrlen_workaround) {
+      tu_free_log_cs_isz(shader->variant->blake3_str,
+                         shader->variant->instrlen, cmd->device->cs_isz_wa,
+                         cmd->device->cs_isz_wa ?
+                            cmd->device->cs_isz_restore : 0,
+                         cs->cond_stack_depth);
+   }
+
+   emit_instrlen_workaround &= cmd->device->cs_isz_wa;
+
    /* We don't use draw states for dispatches, so the bound pipeline
     * could be overwritten by reg stomping in a renderpass or blit.
     */
@@ -10255,6 +10266,15 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
     */
    if (emit_instrlen_workaround) {
       tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
+
+      if (cmd->device->cs_isz_restore) {
+         tu_cs_emit_wfi(cs);
+         for (unsigned ctx = 0; ctx < 4; ctx++) {
+            tu_cs_emit_regs(cs,
+                            A6XX_SP_PS_INSTR_SIZE(cmd->device->cs_isz_restore));
+            tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
+         }
+      }
    }
 
    cmd->state.total_dispatches++;

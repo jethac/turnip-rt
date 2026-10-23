@@ -2976,6 +2976,13 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       device->bo_va_guard && debug_get_bool_option("TU_BO_GUARD_EACH", false);
    tail_pad = (uint32_t) align64(
       CLAMP(debug_get_num_option("TU_BO_TAILPAD", 0), 0, 1 << 30), os_page_size);
+   device->cs_isz_wa = debug_get_bool_option("TU_CS_ISZ_WA", true);
+   device->cs_isz_restore = (uint32_t)
+      CLAMP(debug_get_num_option("TU_CS_ISZ_RESTORE", 0), 0, 0xfffffff);
+   if (!device->cs_isz_wa || device->cs_isz_restore) {
+      mesa_logi("tu: TU_CS_ISZ_WA=%u TU_CS_ISZ_RESTORE=0x%x",
+                (unsigned) device->cs_isz_wa, device->cs_isz_restore);
+   }
    if (device->bo_va_guard || tail_pad || unlikely(tu_free_log_on)) {
       bool epw_broad = debug_get_bool_option("TU_EPW_BROAD", false);
       if (device->bo_va_guard || tail_pad) {
@@ -2987,7 +2994,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       }
       if (unlikely(tu_free_log_on)) {
          tu_free_log_config(device->bo_va_guard, device->bo_va_guard_all,
-                            device->bo_va_guard_each, tail_pad, epw_broad);
+                            device->bo_va_guard_each, tail_pad, epw_broad,
+                            device->cs_isz_wa, device->cs_isz_restore);
       }
    }
 
