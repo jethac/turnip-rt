@@ -21,6 +21,7 @@ enum rq_intersection_var_index {
    rq_intersection_sbt_offset,
    rq_intersection_barycentrics,
    rq_intersection_t,
+   rq_intersection_leaf,
 };
 
 static const glsl_type *
@@ -38,6 +39,7 @@ get_rq_intersection_type(void)
       FIELD(glsl_uint_type(), sbt_offset)
       FIELD(glsl_vec2_type(), barycentrics)
       FIELD(glsl_float_type(), t)
+      FIELD(glsl_uvec2_type(), leaf)
 #undef FIELD
    };
 
@@ -523,6 +525,14 @@ lower_rq_load(nir_builder *b, struct hash_table *ht, nir_intrinsic_instr *intr)
       return rq_load(b, rq, world_direction);
    case nir_ray_query_value_world_ray_origin:
       return rq_load(b, rq, world_origin);
+   case nir_ray_query_value_intersection_triangle_vertex_positions: {
+      nir_def *leaf_ptr = nir_pack_64_2x32(b, rqi_load(b, intersection, leaf));
+      return nir_load_global(
+         b, 3, 32,
+         nir_iadd_imm(b, leaf_ptr,
+                      offsetof(struct tu_leaf_node, coords) + column * 12),
+         .access = ACCESS_NON_WRITEABLE, .align_mul = 4);
+   }
    default:
       UNREACHABLE("Invalid nir_ray_query_value!");
    }
@@ -801,12 +811,14 @@ build_ray_traversal(nir_builder *b, nir_deref_instr *rq,
              * load_global_offset doesn't have the required range so we have
              * to do the offset math ourselves.
              */
-            nir_def *offset =
-               nir_ior_imm(b, nir_imul_imm(b, nir_u2u64(b, bvh_node),
-                                            sizeof(tu_leaf_node)),
-                           offsetof(struct tu_leaf_node, geometry_id));
-            nir_def *geometry_id_ptr = nir_iadd(b, nir_pack_64_2x32(b, bvh_base),
-                                                offset);
+            nir_def *leaf_ptr =
+               nir_iadd(b, nir_pack_64_2x32(b, bvh_base),
+                        nir_imul_imm(b, nir_u2u64(b, bvh_node),
+                                     sizeof(tu_leaf_node)));
+            rqi_store(b, candidate, leaf, nir_unpack_64_2x32(b, leaf_ptr), 0x3);
+            nir_def *geometry_id_ptr =
+               nir_iadd_imm(b, leaf_ptr,
+                            offsetof(struct tu_leaf_node, geometry_id));
             nir_def *geometry_id = nir_load_global(
                b, 1, 32, geometry_id_ptr, .access = ACCESS_NON_WRITEABLE,
                .align_mul = sizeof(struct tu_leaf_node),
