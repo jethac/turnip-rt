@@ -140,6 +140,30 @@ tu_layer_flag_address(const struct fdl6_view *iview, uint32_t layer);
 void
 tu_cs_image_flag_ref(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer);
 
+struct tu_mrt_values {
+   uint32_t buf_info;
+   uint32_t pitch;
+   uint32_t array_pitch;
+   uint64_t base;
+   uint32_t sp_ps_mrt;
+   uint64_t flag;
+   uint32_t flag_pitch;
+};
+
+static inline struct tu_mrt_values
+tu_image_view_mrt_values(const struct tu_image_view *iview)
+{
+   struct tu_mrt_values v;
+   v.buf_info = iview->view.RB_MRT_BUF_INFO;
+   v.pitch = iview->view.pitch;
+   v.array_pitch = iview->view.layer_size;
+   v.base = tu_layer_address(&iview->view, 0);
+   v.sp_ps_mrt = iview->view.SP_PS_MRT_REG;
+   v.flag = tu_layer_flag_address(&iview->view, 0);
+   v.flag_pitch = iview->view.FLAG_BUFFER_PITCH;
+   return v;
+}
+
 bool
 tiling_possible(VkFormat format);
 

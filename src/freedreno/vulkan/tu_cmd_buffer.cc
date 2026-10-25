@@ -900,25 +900,22 @@ tu6_emit_mrt(struct tu_cmd_buffer *cmd,
          continue;
 
       const struct tu_image_view *iview = cmd->state.attachments[a];
+      const struct tu_mrt_values mrt = tu_image_view_mrt_values(iview);
 
-      crb.add(RB_MRT_BUF_INFO(CHIP, remapped,
-                              .dword = iview->view.RB_MRT_BUF_INFO));
-      crb.add(A6XX_RB_MRT_PITCH(remapped, iview->view.pitch));
-      crb.add(A6XX_RB_MRT_ARRAY_PITCH(remapped, iview->view.layer_size));
-      crb.add(A6XX_RB_MRT_BASE(remapped,
-                               .qword = tu_layer_address(&iview->view, 0)));
+      crb.add(RB_MRT_BUF_INFO(CHIP, remapped, .dword = mrt.buf_info));
+      crb.add(A6XX_RB_MRT_PITCH(remapped, mrt.pitch));
+      crb.add(A6XX_RB_MRT_ARRAY_PITCH(remapped, mrt.array_pitch));
+      crb.add(A6XX_RB_MRT_BASE(remapped, .qword = mrt.base));
       crb.add(A6XX_RB_MRT_BASE_GMEM(
          remapped, tu_attachment_gmem_offset(
                       cmd, &cmd->state.pass->attachments[a], 0)));
-      crb.add(
-         A6XX_SP_PS_MRT_REG(remapped, .dword = iview->view.SP_PS_MRT_REG));
-      crb.add(A6XX_RB_COLOR_FLAG_BUFFER_ADDR(
-         remapped, .qword = tu_layer_flag_address(&iview->view, 0)));
-      crb.add(A6XX_RB_COLOR_FLAG_BUFFER_PITCH(
-         remapped, .dword = iview->view.FLAG_BUFFER_PITCH));
+      crb.add(A6XX_SP_PS_MRT_REG(remapped, .dword = mrt.sp_ps_mrt));
+      crb.add(A6XX_RB_COLOR_FLAG_BUFFER_ADDR(remapped, .qword = mrt.flag));
+      crb.add(A6XX_RB_COLOR_FLAG_BUFFER_PITCH(remapped,
+                                              .dword = mrt.flag_pitch));
 
       if (remapped == 0)
-         mrt0_format = static_cast<enum a6xx_format>(iview->view.SP_PS_MRT_REG & 0xff);
+         mrt0_format = static_cast<enum a6xx_format>(mrt.sp_ps_mrt & 0xff);
 
       written |= 1u << remapped;
    }
