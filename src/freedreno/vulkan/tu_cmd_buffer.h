@@ -13,6 +13,7 @@
 #include "tu_common.h"
 
 #include "tu_cs.h"
+#include "tu_d1.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
 #include "tu_image.h"
@@ -683,6 +684,8 @@ struct tu_cmd_state
 
    unsigned tile_render_pass_count;
    bool renderpass_cb_disabled;
+
+   struct tu_d1_cmd d1;
 };
 
 struct tu_vis_stream_patchpoint {

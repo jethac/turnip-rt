@@ -25,6 +25,7 @@
 #include "fdl/freedreno_layout.h"
 #include "tu_buffer.h"
 #include "tu_cs.h"
+#include "tu_d1.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
 #include "tu_formats.h"
@@ -1547,6 +1548,9 @@ tu_CreateImageView(VkDevice _device,
 
    tu_image_view_init(device, view, pCreateInfo);
 
+   if (unlikely(device->d1))
+      tu_d1_view_created(device, view);
+
    *pView = tu_image_view_to_handle(view);
 
    return VK_SUCCESS;
@@ -1562,6 +1566,9 @@ tu_DestroyImageView(VkDevice _device,
 
    if (!iview)
       return;
+
+   if (unlikely(device->d1))
+      tu_d1_view_destroyed(device, iview);
 
    vk_object_free(&device->vk, pAllocator, iview);
 }

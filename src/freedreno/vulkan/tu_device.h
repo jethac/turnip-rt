@@ -141,6 +141,8 @@ struct tu_physical_device
    uint64_t va_start;
    uint64_t va_size;
 
+   uint32_t d1_mode;
+
    bool has_cached_coherent_memory;
    bool has_cached_non_coherent_memory;
    /* Index for device local, host-coherent, host-cached memory.
@@ -507,6 +509,8 @@ struct tu_device
 
    /* Monotonically increasing counter assigned to each tu_image at creation. */
    uint64_t next_image_id;
+
+   struct tu_d1_device *d1;
 };
 VK_DEFINE_HANDLE_CASTS(tu_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 

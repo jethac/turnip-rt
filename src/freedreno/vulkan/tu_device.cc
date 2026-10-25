@@ -1065,6 +1065,7 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
    memset(p->driverInfo, 0, sizeof(p->driverInfo));
    snprintf(p->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
             "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
+   tu_d1_driver_info(pdevice, p->driverInfo, VK_MAX_DRIVER_INFO_SIZE);
    p->conformanceVersion = (VkConformanceVersion) {
       .major = 1,
       .minor = 4,
@@ -1821,6 +1822,8 @@ tu_physical_device_init(struct tu_physical_device *device,
                                  "device %s is unsupported", device->name);
       goto fail_free_name;
    }
+
+   device->d1_mode = tu_d1_physical_device_mode(device);
 
    tu_physical_device_compiler_options_init(device, instance);
 
@@ -3368,6 +3371,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    device->vis_stream_count = 0;
 
+   tu_d1_device_init(device);
+
    *pDevice = tu_device_to_handle(device);
    return VK_SUCCESS;
 
@@ -3489,6 +3494,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    tu_bo_suballocator_finish(&device->kgsl_profiling_suballoc);
    tu_bo_suballocator_finish(&device->event_suballoc);
    tu_bo_suballocator_finish(&device->vis_stream_suballocator);
+
+   tu_d1_device_finish(device);
 
    tu_bo_finish(device, device->global_bo);
 
@@ -4800,6 +4807,9 @@ tu_CmdInsertDebugUtilsLabelEXT(VkCommandBuffer _commandBuffer,
       trace_cmd_buffer_insert_label(&cmd_buffer->trace, &cmd_buffer->cs, cmd_buffer,
                                     strlen(name), name);
    }
+
+   if (unlikely(cmd_buffer->device->d1) && name[0] == 'D' && name[1] == '1')
+      tu_d1_label(cmd_buffer, name);
 }
 
 void

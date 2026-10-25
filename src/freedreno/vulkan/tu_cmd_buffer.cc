@@ -4379,6 +4379,7 @@ static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
    cmd_buffer->state.gmem_layout_divisor = 0;
    cmd_buffer->state.renderpass_cb_disabled = false;
    memset(&cmd_buffer->state.rp, 0, sizeof(cmd_buffer->state.rp));
+   cmd_buffer->state.d1.rp_active = false;
 
    /* LRZ is not valid next time we use it */
    cmd_buffer->state.lrz.valid = false;
@@ -5633,6 +5634,9 @@ VKAPI_ATTR VkResult VKAPI_CALL
 tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+
+   if (unlikely(cmd_buffer->state.d1.armed))
+      tu_d1_disarm(cmd_buffer, "no vkCmdBeginRendering before the end of the command buffer");
 
    /* We currently flush CCU at the end of the command buffer, like
     * what the blob does. There's implicit synchronization around every
@@ -7292,6 +7296,8 @@ tu_emit_subpass_begin(struct tu_cmd_buffer *cmd)
 
    tu6_emit_zs<CHIP>(cmd, cmd->state.subpass, &cmd->draw_cs);
    tu6_emit_mrt<CHIP>(cmd, cmd->state.subpass, &cmd->draw_cs);
+   if (unlikely(cmd->state.d1.rp_active))
+      tu_d1_emit_forward<CHIP>(cmd, &cmd->draw_cs);
    tu6_emit_render_cntl<CHIP>(cmd, cmd->state.subpass, &cmd->draw_cs, false);
 
    if (CHIP >= A7XX) {
@@ -7361,6 +7367,9 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
                                     pSubpassBeginInfo);
       return;
    }
+
+   if (unlikely(cmd->state.d1.armed))
+      tu_d1_disarm(cmd, "followed by vkCmdBeginRenderPass2");
 
    VK_FROM_HANDLE(tu_render_pass, pass, pRenderPassBegin->renderPass);
    VK_FROM_HANDLE(tu_framebuffer, fb, pRenderPassBegin->framebuffer);
@@ -7457,6 +7466,8 @@ static void
 tu_emit_rendering_attachment_locations(struct tu_cmd_buffer *cmd)
 {
    tu6_emit_mrt<CHIP>(cmd, cmd->state.subpass, &cmd->draw_cs);
+   if (unlikely(cmd->state.d1.rp_active))
+      tu_d1_emit_forward<CHIP>(cmd, &cmd->draw_cs);
    tu6_emit_render_cntl<CHIP>(cmd, cmd->state.subpass, &cmd->draw_cs, false);
 
    bool skips_att = false;
@@ -7669,6 +7680,9 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
       else
          tu_lrz_begin_renderpass<CHIP>(cmd);
    }
+
+   if (unlikely(cmd->state.d1.armed))
+      tu_d1_begin_rendering(cmd, pRenderingInfo);
 
    tu_renderpass_begin(cmd);
 

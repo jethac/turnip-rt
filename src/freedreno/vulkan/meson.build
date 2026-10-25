@@ -41,6 +41,7 @@ libtu_files = files(
   'tu_cmd_buffer.cc',
   'tu_cs_breadcrumbs.cc',
   'tu_cs.cc',
+  'tu_d1.cc',
   'tu_device.cc',
   'tu_descriptor_set.cc',
   'tu_dynamic_rendering.cc',
