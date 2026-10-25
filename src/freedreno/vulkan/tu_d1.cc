@@ -116,28 +116,28 @@ tu_d1_once(uint32_t *flag)
    return p_atomic_cmpxchg(flag, 0, 1) == 0;
 }
 
-void
+VkResult
 tu_d1_device_init(struct tu_device *dev)
 {
    dev->d1 = NULL;
 
    const uint32_t mode = dev->physical_device->d1_mode;
    if (!mode)
-      return;
+      return VK_SUCCESS;
 
    struct tu_d1_device *d1 = (struct tu_d1_device *)
       vk_zalloc(&dev->vk.alloc, sizeof(*d1), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!d1) {
-      mesa_loge("tu d1: out of memory, forward off");
-      return;
+      mesa_loge("tu d1: out of memory, vkCreateDevice fails");
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
    d1->mode = mode;
    d1->views = _mesa_pointer_set_create(NULL);
    if (!d1->views) {
       vk_free(&dev->vk.alloc, d1);
-      mesa_loge("tu d1: out of memory, forward off");
-      return;
+      mesa_loge("tu d1: out of memory, vkCreateDevice fails");
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
    const uint64_t size = TU_D1_STATS_OFFSET + TU_D1_STATS_DWORDS * 4;
@@ -154,8 +154,8 @@ tu_d1_device_init(struct tu_device *dev)
    if (result != VK_SUCCESS) {
       _mesa_set_destroy(d1->views, NULL);
       vk_free(&dev->vk.alloc, d1);
-      mesa_loge("tu d1: slot BO allocation failed, forward off");
-      return;
+      mesa_loge("tu d1: slot BO allocation failed, vkCreateDevice fails");
+      return result;
    }
    memset(d1->bo->map, 0, size);
    ((uint32_t *) ((char *) d1->bo->map + TU_D1_STATS_OFFSET))[TU_D1_STATS_ONE] = 1;
@@ -166,6 +166,7 @@ tu_d1_device_init(struct tu_device *dev)
    mesa_logi("tu d1: TU_D1_FORWARD=%s slots=%u sigs=%u bo=0x%" PRIx64,
              mode == 2 ? "log" : "1", TU_D1_SLOTS, TU_D1_MAX_SIGS,
              d1->bo->iova);
+   return VK_SUCCESS;
 }
 
 void

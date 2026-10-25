@@ -156,7 +156,7 @@ uint32_t tu_d1_physical_device_mode(const struct tu_physical_device *pdevice);
 void tu_d1_driver_info(const struct tu_physical_device *pdevice, char *info,
                        size_t size);
 
-void tu_d1_device_init(struct tu_device *dev);
+VkResult tu_d1_device_init(struct tu_device *dev);
 void tu_d1_device_finish(struct tu_device *dev);
 
 void tu_d1_view_created(struct tu_device *dev, struct tu_image_view *iview);

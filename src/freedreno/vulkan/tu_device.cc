@@ -3371,7 +3371,12 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    device->vis_stream_count = 0;
 
-   tu_d1_device_init(device);
+   result = tu_d1_device_init(device);
+   if (result != VK_SUCCESS) {
+      struct tu_instance *instance = device->instance;
+      tu_DestroyDevice(tu_device_to_handle(device), pAllocator);
+      return vk_startup_errorf(instance, result, "TU_D1_FORWARD slot memory");
+   }
 
    *pDevice = tu_device_to_handle(device);
    return VK_SUCCESS;
