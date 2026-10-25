@@ -51,10 +51,13 @@ struct tu_d1_device {
    uint32_t unknown;
    uint32_t events;
 
+   uint32_t last_pub_sig[TU_D1_SLOTS];
+
    uint32_t warned_unknown;
    uint32_t warned_pub_rej;
    uint32_t warned_use_bad;
    uint32_t warned_full;
+   uint32_t warned_layout;
 };
 
 uint32_t
@@ -100,6 +103,11 @@ tu_d1_log_stats(struct tu_d1_device *d1)
              p_atomic_read(&d1->pub_ok), p_atomic_read(&d1->pub_rej),
              p_atomic_read(&d1->use), p_atomic_read(&d1->use_bad),
              p_atomic_read(&d1->unknown));
+
+   const volatile uint32_t *hits = (const volatile uint32_t *)
+      ((const char *) d1->bo->map + TU_D1_STATS_OFFSET) + TU_D1_STATS_HITS;
+   mesa_logi("tu d1: gpu_hits s0=%u s1=%u s2=%u s3=%u", hits[0], hits[1],
+             hits[2], hits[3]);
 }
 
 static bool
@@ -132,8 +140,7 @@ tu_d1_device_init(struct tu_device *dev)
       return;
    }
 
-   const uint64_t size =
-      (uint64_t) TU_D1_SLOTS * TU_D1_MAX_SIGS * TU_D1_REC_DWORDS * 4;
+   const uint64_t size = TU_D1_STATS_OFFSET + TU_D1_STATS_DWORDS * 4;
    VkResult result = tu_bo_init_new(
       dev, NULL, &d1->bo, size,
       (enum tu_bo_alloc_flags) (TU_BO_ALLOC_ALLOW_DUMP |
@@ -151,6 +158,7 @@ tu_d1_device_init(struct tu_device *dev)
       return;
    }
    memset(d1->bo->map, 0, size);
+   ((uint32_t *) ((char *) d1->bo->map + TU_D1_STATS_OFFSET))[TU_D1_STATS_ONE] = 1;
 
    mtx_init(&d1->mtx, mtx_plain);
    dev->d1 = d1;
@@ -347,6 +355,7 @@ tu_d1_publish(struct tu_cmd_buffer *cmd, const struct tu_d1_label *l)
    tu_cs_emit_array(cs, rec, TU_D1_REC_WRITTEN);
    tu_cond_exec_end(cs);
 
+   p_atomic_set(&d1->last_pub_sig[l->slot], sig_id);
    p_atomic_inc(&d1->pub_ok);
 }
 
@@ -397,6 +406,25 @@ tu_d1_label(struct tu_cmd_buffer *cmd, const char *name)
       tu_d1_log_stats(d1);
 }
 
+static void
+tu_d1_warn_layout(struct tu_d1_device *d1, uint32_t gen, uint32_t slot,
+                  uint32_t proxy_id, uint32_t pub_id)
+{
+   if (!tu_d1_once(&d1->warned_layout))
+      return;
+   mtx_lock(&d1->mtx);
+   const struct tu_d1_sig a = d1->sigs[proxy_id - 1];
+   const struct tu_d1_sig b = d1->sigs[pub_id - 1];
+   mtx_unlock(&d1->mtx);
+   mesa_logw("tu d1: D1USE g=%u slot %u: proxy layout (format %u %ux%u layers %u "
+             "pitch %u info 0x%x ubwc %u) differs from the last D1PUB view "
+             "(format %u %ux%u layers %u pitch %u info 0x%x ubwc %u), "
+             "the forward cannot match",
+             gen, slot, a.format, a.width, a.height, a.layers, a.pitch,
+             a.buf_info, a.ubwc, b.format, b.width, b.height, b.layers,
+             b.pitch, b.buf_info, b.ubwc);
+}
+
 void
 tu_d1_begin_rendering(struct tu_cmd_buffer *cmd, const VkRenderingInfo *info)
 {
@@ -441,6 +469,10 @@ tu_d1_begin_rendering(struct tu_cmd_buffer *cmd, const VkRenderingInfo *info)
       st->att[j].valid = true;
       st->att[j].key = st->gen;
       st->att[j].rec_iova = tu_d1_rec_iova(d1, st->slot[j], sig_id);
+
+      const uint32_t pub_id = p_atomic_read(&d1->last_pub_sig[st->slot[j]]);
+      if (pub_id && pub_id != sig_id)
+         tu_d1_warn_layout(d1, st->gen, st->slot[j], sig_id, pub_id);
    }
 
    if (why) {
@@ -470,8 +502,10 @@ tu_d1_emit_forward(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    if (CHIP != A7XX)
       return;
 
+   const struct tu_d1_device *d1 = cmd->device->d1;
    const struct tu_d1_cmd *st = &cmd->state.d1;
    const struct tu_subpass *subpass = cmd->state.subpass;
+   const bool count = d1->mode == 2;
    unsigned mrt[2], idx[2], n = 0;
 
    for (unsigned j = 0; j < 2; j++) {
@@ -491,7 +525,9 @@ tu_d1_emit_forward(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 
    const struct fd_reg_pair scratch = tu_scratch_reg<CHIP>(TU_D1_SCRATCH);
 
-   tu_cs_reserve(cs, 3 + 2 + n * (4 + 1 + 4 + 4 + 4));
+   const uint64_t stats = d1->bo->iova + TU_D1_STATS_OFFSET;
+
+   tu_cs_reserve(cs, 3 + 2 + n * (4 + 1 + 4 + 4 + 4 + (count ? 8 : 0)));
    tu_cond_exec_start(cs, CP_COND_EXEC_0_RENDER_MODE_SYSMEM);
    tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
    tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
@@ -507,6 +543,15 @@ tu_d1_emit_forward(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
                      rec + 4 * TU_D1_REC_BASE_LO, { .cnt = 2 });
       cs->mem_to_reg(tu_d1_reg(REG_A6XX_RB_COLOR_FLAG_BUFFER_ADDR(mrt[k])),
                      rec + 4 * TU_D1_REC_FLAG_LO, { .cnt = 2 });
+      if (count) {
+         const uint64_t hit =
+            stats + 4 * (TU_D1_STATS_HITS + st->slot[idx[k]]);
+         tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 7);
+         tu_cs_emit(cs, 0);
+         tu_cs_emit_qw(cs, hit);
+         tu_cs_emit_qw(cs, hit);
+         tu_cs_emit_qw(cs, stats + 4 * TU_D1_STATS_ONE);
+      }
       tu_cond_exec_end(cs);
    }
    tu_cond_exec_end(cs);

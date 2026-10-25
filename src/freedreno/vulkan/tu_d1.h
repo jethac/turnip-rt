@@ -15,6 +15,11 @@
 #define TU_D1_REC_DWORDS 16
 #define TU_D1_SCRATCH 3
 
+#define TU_D1_STATS_OFFSET (TU_D1_SLOTS * TU_D1_MAX_SIGS * TU_D1_REC_DWORDS * 4)
+#define TU_D1_STATS_ONE 0
+#define TU_D1_STATS_HITS 1
+#define TU_D1_STATS_DWORDS 16
+
 enum tu_d1_rec {
    TU_D1_REC_BUF_INFO,
    TU_D1_REC_PITCH,
