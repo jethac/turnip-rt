@@ -347,8 +347,10 @@ queue_submit_sparse(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    pthread_mutex_lock(&device->submit_mutex);
 
    void *submit = tu_submit_create(device);
-   if (!submit)
+   if (!submit) {
+      pthread_mutex_unlock(&device->submit_mutex);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
    for (uint32_t i = 0; i < vk_submit->buffer_bind_count; i++) {
       const VkSparseBufferMemoryBindInfo *bind = &vk_submit->buffer_binds[i];
@@ -443,8 +445,10 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
 
    VkResult result =
       tu_insert_dynamic_cmdbufs(device, &cmd_buffers, &cmdbuf_count);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      pthread_mutex_unlock(&device->submit_mutex);
       return result;
+   }
 
    bool has_trace_points = false;
    static_assert(offsetof(struct tu_cmd_buffer, vk) == 0,
@@ -457,19 +461,26 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    struct tu_u_trace_submission_data *u_trace_submission_data = NULL;
 
    void *submit = tu_submit_create(device);
-   if (!submit)
+   if (!submit) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      pthread_mutex_unlock(&device->submit_mutex);
       goto fail_create_submit;
+   }
 
    result = resolve_vis_stream_patchpoints(queue, submit, &dump_cmds,
                                            cmd_buffers, cmdbuf_count);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      pthread_mutex_unlock(&device->submit_mutex);
       goto out;
+   }
 
    result = resolve_cb_control_patchpoints(queue, submit, &dump_cmds,
                                            cmd_buffers, cmdbuf_count);
 
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      pthread_mutex_unlock(&device->submit_mutex);
       goto out;
+   }
 
    if (has_trace_points) {
       tu_u_trace_submission_data_create(
