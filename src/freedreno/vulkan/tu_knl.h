@@ -184,7 +184,14 @@ struct tu_knl {
    const struct vk_device_entrypoint_table *device_entrypoints;
 };
 
+#define TU_MAX_QUEUE_FAMILIES 3
+
 struct tu_zombie_vma {
+   uint32_t queue_fence_count;
+   struct {
+      uint32_t queue_id;
+      int fence;
+   } queue_fences[TU_MAX_QUEUE_FAMILIES];
    int fence;
    uint32_t gem_handle;
 #ifdef TU_HAS_VIRTIO

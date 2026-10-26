@@ -282,28 +282,15 @@ tu_free_zombie_vma_locked(struct tu_device *dev, bool wait)
 
    MESA_TRACE_FUNC();
 
-   if (wait) {
-      struct tu_zombie_vma *vma = static_cast<struct tu_zombie_vma *>(
-            u_vector_head(&dev->zombie_vmas));
-      /* Wait for 3s (arbitrary timeout) */
-      VkResult ret = tu_wait_fence(dev, dev->queues[0]->msm_queue_id,
-                                   vma->fence, 3000000000);
-
-      if (ret != VK_SUCCESS)
-         return ret;
-   }
-
-   int last_signaled_fence = -1;
    while (u_vector_length(&dev->zombie_vmas) > 0) {
       struct tu_zombie_vma *vma = static_cast<struct tu_zombie_vma *>(
             u_vector_tail(&dev->zombie_vmas));
-      if (vma->fence > last_signaled_fence) {
-         VkResult ret =
-            tu_wait_fence(dev, dev->queues[0]->msm_queue_id, vma->fence, 0);
+      for (unsigned i = 0; i < vma->queue_fence_count; i++) {
+         VkResult ret = tu_wait_fence(dev, vma->queue_fences[i].queue_id,
+                                     vma->queue_fences[i].fence,
+                                     wait ? 3000000000 : 0);
          if (ret != VK_SUCCESS)
             return ret;
-
-         last_signaled_fence = vma->fence;
       }
 
       if (vma->gem_handle) {
@@ -1299,6 +1286,13 @@ msm_queue_submit(struct tu_queue *queue, void *_submit,
 
    if (queue->type != TU_QUEUE_SPARSE)
       p_atomic_set(&queue->fence, fence);
+
+   if (debug_get_bool_option("TU_MULTI_QUEUE_LOG", false)) {
+      mesa_logi("tu-multiqueue submit family=%u index=%u msm=%u priority=%d commands=%u waits=%u signals=%u fence=%u",
+                queue->vk.queue_family_index, queue->vk.index_in_family,
+                queue->msm_queue_id, queue->priority, entry_count,
+                wait_count, signal_count, fence);
+   }
 
 #if HAVE_PERFETTO
    clocks = tu_perfetto_end_submit(queue, queue->device->submit_count,

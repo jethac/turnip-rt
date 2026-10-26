@@ -70,6 +70,7 @@ struct tu_shader
    struct tu_suballoc_bo bo;
    struct tu_cs cs;
    struct tu_bo *pvtmem_bo;
+   uint64_t pvtmem_family_stride;
 
    struct tu_draw_state state;
    struct tu_draw_state safe_const_state;

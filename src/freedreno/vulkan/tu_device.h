@@ -24,6 +24,7 @@
 #include "tu_autotune.h"
 #include "tu_cs.h"
 #include "tu_drirc.h"
+#include "tu_knl.h"
 #include "tu_pass.h"
 #include "tu_perfetto.h"
 #include "tu_queue.h"
@@ -32,8 +33,6 @@
 
 /* queue types */
 #define TU_QUEUE_GENERAL 0
-
-#define TU_MAX_QUEUE_FAMILIES 2
 
 #define TU_BORDER_COLOR_COUNT 4096
 #define TU_BORDER_COLOR_BUILTIN 6
@@ -152,6 +151,7 @@ struct tu_physical_device
    struct fdl_ubwc_config ubwc_config;
 
    bool has_preemption;
+   bool has_compute_queue;
 
    bool expose_double_threadsize;
 
@@ -215,6 +215,13 @@ struct tu_instance
 };
 VK_DEFINE_HANDLE_CASTS(tu_instance, vk.base, VkInstance,
                        VK_OBJECT_TYPE_INSTANCE)
+
+struct tu_queue_scratch {
+   uint32_t seqno_dummy;
+   uint64_t predicate;
+   uint64_t bv_predicate;
+   alignas(16) uint32_t cs_indirect_xyz[12];
+};
 
 /* This struct defines the layout of the global_bo */
 struct tu6_global
@@ -292,9 +299,18 @@ struct tu6_global
    uint64_t preemption_latency_cmp_scratch;
    uint64_t zero_64b;
 
+   struct tu_queue_scratch queue_scratch[TU_MAX_QUEUE_FAMILIES];
+
    struct bcolor_entry bcolor_builtin[TU_BORDER_COLOR_BUILTIN];
    struct bcolor_entry bcolor[];
 };
+#define queue_iova(cmd, member) \
+   ((cmd)->device->global_bo->iova + \
+    offsetof(struct tu6_global, queue_scratch) + \
+    (cmd)->queue_family_index * sizeof(struct tu_queue_scratch) + \
+    offsetof(struct tu_queue_scratch, member))
+#define queue_iova_arr(cmd, member, idx) \
+   (queue_iova(cmd, member) + sizeof_field(struct tu_queue_scratch, member[0]) * (idx))
 #define gb_offset(member) offsetof(struct tu6_global, member)
 #define global_iova(cmd, member) ((cmd)->device->global_bo->iova + gb_offset(member))
 #define global_iova_arr(cmd, member, idx)                                    \
@@ -341,7 +357,7 @@ struct tu_device
       struct tu_bo *bo;
       mtx_t construct_mtx;
       bool initialized;
-   } scratch_bos[48 - MIN_SCRATCH_BO_SIZE_LOG2];
+   } scratch_bos[TU_MAX_QUEUE_FAMILIES][48 - MIN_SCRATCH_BO_SIZE_LOG2];
 
    struct tu_pvtmem_bo fiber_pvtmem_bo, wave_pvtmem_bo;
 
@@ -644,7 +660,8 @@ tu_device_get_u_trace(struct tu_device *device);
  * discard it.
  */
 VkResult
-tu_get_scratch_bo(struct tu_device *dev, uint64_t size, struct tu_bo **bo);
+tu_get_scratch_bo(struct tu_device *dev, uint32_t family, uint64_t size,
+                  struct tu_bo **bo);
 
 void tu_setup_dynamic_framebuffer(struct tu_cmd_buffer *cmd_buffer,
                                   const VkRenderingInfo *pRenderingInfo);

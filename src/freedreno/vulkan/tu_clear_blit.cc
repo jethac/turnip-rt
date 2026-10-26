@@ -3512,7 +3512,7 @@ tu_copy_image_to_image(struct tu_cmd_buffer *cmd,
                         &params, NULL);
 
       struct tu_bo *staging_bo;
-      VkResult result = tu_get_scratch_bo(cmd->device,
+      VkResult result = tu_get_scratch_bo(cmd->device, cmd->queue_family_index,
                                           staging_layout.size,
                                           &staging_bo);
       if (result != VK_SUCCESS) {

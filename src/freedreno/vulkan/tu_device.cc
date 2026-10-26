@@ -1749,6 +1749,13 @@ static const VkQueueFamilyProperties tu_gfx_sparse_queue_family_properties = {
    .minImageTransferGranularity = { 1, 1, 1 },
 };
 
+static const VkQueueFamilyProperties tu_compute_queue_family_properties = {
+   .queueFlags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+   .queueCount = 1,
+   .timestampValidBits = 48,
+   .minImageTransferGranularity = { 1, 1, 1 },
+};
+
 static const VkQueueFamilyProperties tu_sparse_queue_family_properties = {
    .queueFlags = VK_QUEUE_SPARSE_BINDING_BIT,
    .queueCount = 1,
@@ -1932,6 +1939,15 @@ tu_physical_device_init(struct tu_physical_device *device,
          (struct tu_queue_family) {
             .type = TU_QUEUE_SPARSE,
             .properties = &tu_sparse_queue_family_properties,
+         };
+   }
+
+   device->has_compute_queue = strcmp(instance->knl->name, "msm") == 0;
+   if (device->has_compute_queue) {
+      device->queue_families[device->num_queue_families++] =
+         (struct tu_queue_family) {
+            .type = TU_QUEUE_GFX,
+            .properties = &tu_compute_queue_family_properties,
          };
    }
 
@@ -2864,8 +2880,9 @@ tu_device_destroy_mutexes(struct tu_device *device)
    mtx_destroy(&device->mutex);
    mtx_destroy(&device->copy_timestamp_cs_pool_mutex);
    mtx_destroy(&device->softfloat_mutex);
-   for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos); i++)
-      mtx_destroy(&device->scratch_bos[i].construct_mtx);
+   for (unsigned f = 0; f < TU_MAX_QUEUE_FAMILIES; f++)
+      for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos[f]); i++)
+         mtx_destroy(&device->scratch_bos[f][i].construct_mtx);
 
    u_rwlock_destroy(&device->dma_bo_lock);
    u_rwlock_destroy(&device->vm_bind_fence_lock);
@@ -3002,8 +3019,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 #ifdef HAVE_PERFETTO
    tu_perfetto_init_state(&device->perfetto);
 #endif
-   for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos); i++)
-      mtx_init(&device->scratch_bos[i].construct_mtx, mtx_plain);
+   for (unsigned f = 0; f < TU_MAX_QUEUE_FAMILIES; f++)
+      for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos[f]); i++)
+         mtx_init(&device->scratch_bos[f][i].construct_mtx, mtx_plain);
 
    u_rwlock_init(&device->dma_bo_lock);
    u_rwlock_init(&device->vm_bind_fence_lock);
@@ -3056,7 +3074,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       memset(device->queues[qfi], 0,
              queue_create->queueCount * sizeof(struct tu_queue));
 
-      device->queue_count[qfi] = queue_create->queueCount;
+      device->queue_count[qfi] = 0;
 
       for (unsigned q = 0; q < queue_create->queueCount; q++) {
          /* For the emulated second queue, share the first queue's kernel
@@ -3068,10 +3086,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
          result = tu_queue_init(device, &device->queues[qfi][q], type,
                                 global_priority, q, queue_create,
                                 emulated ? &device->queues[qfi][0] : NULL);
-         if (result != VK_SUCCESS) {
-            device->queue_count[qfi] = q;
+         if (result != VK_SUCCESS)
             goto fail_queues;
-         }
+         device->queue_count[qfi]++;
       }
 
       autotune_disable_preempt_optimize |=
@@ -3199,6 +3216,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_empty_shaders;
    }
 
+   memset(global->queue_scratch, 0, sizeof(global->queue_scratch));
    global->predicate = 0;
    global->vtx_stats_query_not_running = 1;
    global->dbg_one = static_cast<uint32_t>(-1);
@@ -3442,9 +3460,11 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    u_trace_context_fini(&device->trace_context);
 
-   for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos); i++) {
-      if (device->scratch_bos[i].initialized)
-         tu_bo_finish(device, device->scratch_bos[i].bo);
+   for (unsigned f = 0; f < TU_MAX_QUEUE_FAMILIES; f++) {
+      for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos[f]); i++) {
+         if (device->scratch_bos[f][i].initialized)
+            tu_bo_finish(device, device->scratch_bos[f][i].bo);
+      }
    }
 
    if (device->fiber_pvtmem_bo.bo)
@@ -3546,16 +3566,19 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 }
 
 VkResult
-tu_get_scratch_bo(struct tu_device *dev, uint64_t size, struct tu_bo **bo)
+tu_get_scratch_bo(struct tu_device *dev, uint32_t family, uint64_t size,
+                  struct tu_bo **bo)
 {
+   assert(family < TU_MAX_QUEUE_FAMILIES);
+   auto &scratch_bos = dev->scratch_bos[family];
    unsigned size_log2 = MAX2(util_logbase2_ceil64(size), MIN_SCRATCH_BO_SIZE_LOG2);
    unsigned index = size_log2 - MIN_SCRATCH_BO_SIZE_LOG2;
-   assert(index < ARRAY_SIZE(dev->scratch_bos));
+   assert(index < ARRAY_SIZE(scratch_bos));
 
-   for (unsigned i = index; i < ARRAY_SIZE(dev->scratch_bos); i++) {
-      if (p_atomic_read(&dev->scratch_bos[i].initialized)) {
+   for (unsigned i = index; i < ARRAY_SIZE(scratch_bos); i++) {
+      if (p_atomic_read(&scratch_bos[i].initialized)) {
          /* Fast path: just return the already-allocated BO. */
-         *bo = dev->scratch_bos[i].bo;
+         *bo = scratch_bos[i].bo;
          return VK_SUCCESS;
       }
    }
@@ -3564,30 +3587,30 @@ tu_get_scratch_bo(struct tu_device *dev, uint64_t size, struct tu_bo **bo)
     * of allocating it is slow, and we don't want to block the CPU while it
     * finishes.
    */
-   mtx_lock(&dev->scratch_bos[index].construct_mtx);
+   mtx_lock(&scratch_bos[index].construct_mtx);
 
    /* Another thread may have allocated it already while we were waiting on
     * the lock. We need to check this in order to avoid double-allocating.
     */
-   if (dev->scratch_bos[index].initialized) {
-      mtx_unlock(&dev->scratch_bos[index].construct_mtx);
-      *bo = dev->scratch_bos[index].bo;
+   if (scratch_bos[index].initialized) {
+      mtx_unlock(&scratch_bos[index].construct_mtx);
+      *bo = scratch_bos[index].bo;
       return VK_SUCCESS;
    }
 
    unsigned bo_size = 1ull << size_log2;
-   VkResult result = tu_bo_init_new(dev, NULL, &dev->scratch_bos[index].bo, bo_size,
+   VkResult result = tu_bo_init_new(dev, NULL, &scratch_bos[index].bo, bo_size,
                                     TU_BO_ALLOC_INTERNAL_RESOURCE, "scratch");
    if (result != VK_SUCCESS) {
-      mtx_unlock(&dev->scratch_bos[index].construct_mtx);
+      mtx_unlock(&scratch_bos[index].construct_mtx);
       return result;
    }
 
-   p_atomic_set(&dev->scratch_bos[index].initialized, true);
+   p_atomic_set(&scratch_bos[index].initialized, true);
 
-   mtx_unlock(&dev->scratch_bos[index].construct_mtx);
+   mtx_unlock(&scratch_bos[index].construct_mtx);
 
-   *bo = dev->scratch_bos[index].bo;
+   *bo = scratch_bos[index].bo;
    return VK_SUCCESS;
 }
 

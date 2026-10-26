@@ -187,7 +187,7 @@ tu_emit_raw_event_write(struct tu_cmd_buffer *cmd,
    }
 
    if (needs_seqno) {
-      tu_cs_emit_qw(cs, global_iova(cmd, seqno_dummy));
+      tu_cs_emit_qw(cs, queue_iova(cmd, seqno_dummy));
       tu_cs_emit(cs, 0);
    }
 }
@@ -4423,6 +4423,7 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
    }
 
    cmd_buffer->device = device;
+   cmd_buffer->queue_family_index = pool->queue_family_index;
 
    u_trace_init(&cmd_buffer->trace, &device->trace_context);
    u_trace_init(&cmd_buffer->rp_trace, &device->trace_context);
@@ -4691,15 +4692,12 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 
    /* setup initial configuration into command buffer */
    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
-      switch (cmd_buffer->queue_family_index) {
-      case TU_QUEUE_GENERAL:
+      if (cmd_buffer->device->physical_device->queue_families[
+             cmd_buffer->queue_family_index].type == TU_QUEUE_GFX) {
          TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, &cmd_buffer->cs);
          result = tu_cs_get_status(&cmd_buffer->cs);
          if (result != VK_SUCCESS)
             return vk_command_buffer_set_error(&cmd_buffer->vk, result);
-         break;
-      default:
-         break;
       }
    } else if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
       const bool pass_continue =
@@ -9889,7 +9887,7 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
          for (uint32_t i = 0; i < 3; i++) {
             tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
             tu_cs_emit(cs, 0);
-            tu_cs_emit_qw(cs, global_iova_arr(cmd, cs_indirect_xyz, i));
+            tu_cs_emit_qw(cs, queue_iova_arr(cmd, cs_indirect_xyz, i));
             tu_cs_emit_qw(cs, indirect_iova + i * sizeof(uint32_t));
          }
 
@@ -9905,7 +9903,7 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
             uint32_t emit_size = emit_local ? 8 : 4;
 
             tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 2 + emit_size);
-            tu_cs_emit_qw(cs, global_iova_arr(cmd, cs_indirect_xyz, 0) + 4 * sizeof(uint32_t));
+            tu_cs_emit_qw(cs, queue_iova_arr(cmd, cs_indirect_xyz, 0) + 4 * sizeof(uint32_t));
             for (uint32_t i = 0; i < emit_size; i++) {
                tu_cs_emit(cs, indirect_driver_params[i]);
             }
@@ -9915,7 +9913,7 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
          tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
          tu_cs_emit_wfi(cs);
 
-         iova = global_iova(cmd, cs_indirect_xyz[0]);
+         iova = queue_iova(cmd, cs_indirect_xyz[0]);
       }
 
       tu_cs_emit_pkt7(cs, tu6_stage2opcode(type), 5);
@@ -9975,7 +9973,7 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
          for (uint32_t i = 0; i < 3; i++) {
             tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
             tu_cs_emit(cs, 0);
-            tu_cs_emit_qw(cs, global_iova_arr(cmd, cs_indirect_xyz, i));
+            tu_cs_emit_qw(cs, queue_iova_arr(cmd, cs_indirect_xyz, i));
             tu_cs_emit_qw(cs, info->indirect + i * 4);
          }
 
@@ -9989,7 +9987,7 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
                      CP_LOAD_STATE6_0_STATE_SRC(SS6_INDIRECT) |
                      CP_LOAD_STATE6_0_STATE_BLOCK(tu6_stage2shadersb(type)) |
                      CP_LOAD_STATE6_0_NUM_UNIT(1));
-         tu_cs_emit_qw(cs, global_iova(cmd, cs_indirect_xyz[0]));
+         tu_cs_emit_qw(cs, queue_iova(cmd, cs_indirect_xyz[0]));
       }
 
       /* Fill out IR3_DP_CS_SUBGROUP_SIZE and IR3_DP_SUBGROUP_ID_SHIFT for
@@ -10099,6 +10097,12 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    }
 
    cmd->state.dirty &= ~TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   if (shader->pvtmem_bo) {
+      tu_cs_emit_regs(cs, A6XX_SP_CS_PVT_MEM_BASE(
+         .qword = shader->pvtmem_bo->iova +
+                  cmd->queue_family_index * shader->pvtmem_family_stride));
+   }
 
    tu_set_render_mode<CHIP>(cs, {RM6_COMPUTE});
 
@@ -11157,7 +11161,7 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
 
    tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
    tu_cs_emit(cs, 0);
-   tu_cs_emit_qw(cs, global_iova(cmd, predicate));
+   tu_cs_emit_qw(cs, queue_iova(cmd, predicate));
    tu_cs_emit_qw(cs, iova);
 
    if (CHIP >= A7XX) {
@@ -11166,7 +11170,7 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
                              CP_COND_REG_EXEC_0_BV);
       tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
       tu_cs_emit(cs, 0);
-      tu_cs_emit_qw(cs, global_iova(cmd, bv_predicate));
+      tu_cs_emit_qw(cs, queue_iova(cmd, bv_predicate));
       tu_cs_emit_qw(cs, iova);
       tu_cond_exec_end(cs);
    }
@@ -11186,7 +11190,7 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
    tu_cs_emit_pkt7(cs, CP_DRAW_PRED_SET, 3);
    tu_cs_emit(cs, CP_DRAW_PRED_SET_0_SRC(PRED_SRC_MEM) |
                   CP_DRAW_PRED_SET_0_TEST(inv ? EQ_0_PASS : NE_0_PASS));
-   tu_cs_emit_qw(cs, global_iova(cmd, predicate));
+   tu_cs_emit_qw(cs, queue_iova(cmd, predicate));
 
    if (CHIP >= A7XX) {
       tu_cond_exec_end(cs);
@@ -11195,7 +11199,7 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
       tu_cs_emit_pkt7(cs, CP_DRAW_PRED_SET, 3);
       tu_cs_emit(cs, CP_DRAW_PRED_SET_0_SRC(PRED_SRC_MEM) |
                      CP_DRAW_PRED_SET_0_TEST(inv ? EQ_0_PASS : NE_0_PASS));
-      tu_cs_emit_qw(cs, global_iova(cmd, bv_predicate));
+      tu_cs_emit_qw(cs, queue_iova(cmd, bv_predicate));
       tu_cond_exec_end(cs);
    }
 

@@ -3388,8 +3388,10 @@ tu_setup_pvtmem(struct tu_device *dev,
          align(pvtmem_bo->per_fiber_size *
                   dev->physical_device->info->fibers_per_sp,
                1 << 12);
-      uint32_t total_size =
-         dev->physical_device->info->num_sp_cores * pvtmem_bo->per_sp_size;
+      uint64_t total_size =
+         uint64_t(dev->physical_device->info->num_sp_cores) * pvtmem_bo->per_sp_size *
+         (dev->physical_device->has_compute_queue ?
+          dev->physical_device->num_queue_families : 1);
 
       VkResult result = tu_bo_init_new(dev, NULL, &pvtmem_bo->bo, total_size,
                                        TU_BO_ALLOC_INTERNAL_RESOURCE, "pvtmem");
@@ -3404,6 +3406,8 @@ tu_setup_pvtmem(struct tu_device *dev,
    config->per_sp_size = pvtmem_bo->per_sp_size;
 
    shader->pvtmem_bo = tu_bo_get_ref(pvtmem_bo->bo);
+   shader->pvtmem_family_stride =
+      uint64_t(dev->physical_device->info->num_sp_cores) * pvtmem_bo->per_sp_size;
    config->iova = shader->pvtmem_bo->iova;
 
    mtx_unlock(&pvtmem_bo->mtx);
@@ -3774,7 +3778,9 @@ tu_lower_nir(struct tu_device *dev,
     * dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_atomic.atomicwrite.device.payload_local.image.guard_local.buffer.vert
     */
 
-   NIR_PASS(_, nir, nir_opt_acquire_release_barriers, SCOPE_QUEUE_FAMILY);
+   NIR_PASS(_, nir, nir_opt_acquire_release_barriers,
+            dev->physical_device->has_compute_queue ? SCOPE_WORKGROUP :
+                                                     SCOPE_QUEUE_FAMILY);
 
    /* This needs to happen before multiview lowering which rewrites store
     * instructions of the position variable, so that we can just rewrite one

@@ -93,6 +93,18 @@ tu_bo_make_zombie(struct tu_device *dev, struct tu_bo *bo)
 #endif
    vma->iova = bo->iova;
    vma->size = bo->size;
+   vma->queue_fence_count = 0;
+   for (unsigned f = 0; f < TU_MAX_QUEUE_FAMILIES; f++) {
+      for (int q = 0; q < dev->queue_count[f]; q++) {
+         struct tu_queue *queue = &dev->queues[f][q];
+         if (queue->type != TU_QUEUE_GFX || vk_queue_is_emulated(&queue->vk))
+            continue;
+         assert(vma->queue_fence_count < ARRAY_SIZE(vma->queue_fences));
+         unsigned i = vma->queue_fence_count++;
+         vma->queue_fences[i].queue_id = queue->msm_queue_id;
+         vma->queue_fences[i].fence = p_atomic_read(&queue->fence);
+      }
+   }
    if (dev->queue_count[0] > 0)
       vma->fence = p_atomic_read(&dev->queues[0]->fence);
    else

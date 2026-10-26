@@ -337,7 +337,8 @@ tu_autotune::get_supported_mod_flags(tu_device *device) const
 {
    uint32_t supported_mod_flags =
       static_cast<uint32_t>(mod_flag::BIG_GMEM) | static_cast<uint32_t>(mod_flag::TUNE_SMALL);
-   if (device->physical_device->info->props.max_draw_states > TU_DRAW_STATE_AT_WRITE_RP_HASH &&
+   if (!device->physical_device->has_compute_queue &&
+       device->physical_device->info->props.max_draw_states > TU_DRAW_STATE_AT_WRITE_RP_HASH &&
        device->physical_device->is_perf_cntr_selectable) {
       supported_mod_flags |= static_cast<uint32_t>(mod_flag::PREEMPT_OPTIMIZE);
    }
@@ -1699,6 +1700,9 @@ tu_autotune::tu_autotune(struct tu_device *device, VkResult &result)
          disable_preempt_optimize();
       }
    }
+
+   if (!supports_preempt_latency_tracking())
+      disable_preempt_optimize();
 
    result = VK_SUCCESS;
    return;
