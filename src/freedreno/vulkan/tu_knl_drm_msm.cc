@@ -1271,6 +1271,9 @@ msm_queue_submit(struct tu_queue *queue, void *_submit,
                                  &req, sizeof(req));
       }
 
+      if (!ret && !has_vm_bind)
+         p_atomic_set(&queue->fence, req.fence);
+
       if (has_vm_bind)
          u_rwlock_rdunlock(&queue->device->vm_bind_fence_lock);
       else
