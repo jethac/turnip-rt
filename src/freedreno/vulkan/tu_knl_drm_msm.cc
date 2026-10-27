@@ -436,17 +436,23 @@ tu_map_vm_bind(struct tu_device *dev, uint32_t map_op, uint32_t map_op_flags,
       },
    };
 
+   /* Keep kernel enqueue order and fence publication order identical. Otherwise
+    * concurrent binds can publish an older fence after a newer one, allowing
+    * a subsequent submit to run before all previously returned binds complete.
+    */
+   u_rwlock_wrlock(&dev->vm_bind_fence_lock);
+
    int ret = drmCommandWriteRead(dev->fd,
                                  DRM_MSM_VM_BIND,
                                  &req, sizeof(req));
 
    /* When failing to map a BO, the kernel marks the VM as dead */
-   if (ret)
+   if (ret) {
+      u_rwlock_wrunlock(&dev->vm_bind_fence_lock);
       return vk_device_set_lost(&dev->vk, "BO map failed: %m");
+   }
 
-   int old_fence;
-   u_rwlock_wrlock(&dev->vm_bind_fence_lock);
-   old_fence = dev->vm_bind_fence_fd;
+   int old_fence = dev->vm_bind_fence_fd;
    dev->vm_bind_fence_fd = req.fence_fd;
    u_rwlock_wrunlock(&dev->vm_bind_fence_lock);
 
