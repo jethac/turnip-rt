@@ -803,6 +803,13 @@ struct tu_cmd_buffer
    struct util_dynarray rd_secondaries;
    bool rd_secondaries_lost;
 
+   /* Set layouts whose embedded-sampler BO iova was recorded. Each holds a
+    * reference so the BO outlives pending execution even if the application
+    * destroys the set/pipeline layout, which Vulkan permits once recording
+    * has ended. Released on reset/destroy (not allowed while pending).
+    */
+   struct util_dynarray embedded_sampler_layouts;
+
    uint32_t vsc_draw_strm_pitch;
    uint32_t vsc_prim_strm_pitch;
    uint32_t vsc_draw_strm_offset, vsc_draw_strm_size_offset;

@@ -4464,6 +4464,15 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
 }
 
 static void
+tu_cmd_release_embedded_sampler_layouts(struct tu_cmd_buffer *cmd_buffer)
+{
+   util_dynarray_foreach (&cmd_buffer->embedded_sampler_layouts,
+                          struct tu_descriptor_set_layout *, layout)
+      vk_descriptor_set_layout_unref(&cmd_buffer->device->vk, &(*layout)->vk);
+   util_dynarray_clear(&cmd_buffer->embedded_sampler_layouts);
+}
+
+static void
 tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
 {
    struct tu_cmd_buffer *cmd_buffer =
@@ -4508,6 +4517,8 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    }
    util_dynarray_fini(&cmd_buffer->msrtss_depth_temporaries);
    util_dynarray_fini(&cmd_buffer->rd_secondaries);
+   tu_cmd_release_embedded_sampler_layouts(cmd_buffer);
+   util_dynarray_fini(&cmd_buffer->embedded_sampler_layouts);
 
    ralloc_free(cmd_buffer->patchpoints_ctx);
    ralloc_free(cmd_buffer->pre_chain.patchpoints_ctx);
@@ -4592,6 +4603,7 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    util_dynarray_clear(&cmd_buffer->msrtss_depth_temporaries);
    util_dynarray_clear(&cmd_buffer->rd_secondaries);
    cmd_buffer->rd_secondaries_lost = false;
+   tu_cmd_release_embedded_sampler_layouts(cmd_buffer);
 
    u_trace_fini(&cmd_buffer->trace);
    u_trace_init(&cmd_buffer->trace, &cmd_buffer->device->trace_context);
@@ -5291,6 +5303,23 @@ tu_bind_descriptor_buffer_embedded_samplers(
 
    struct tu_descriptor_set_layout *set_layout =
       layout->set[info->set].layout;
+
+   /* Keep the embedded-sampler BO alive for this command buffer's lifetime. */
+   unsigned held = util_dynarray_num_elements(&cmd->embedded_sampler_layouts,
+                                              struct tu_descriptor_set_layout *);
+   if (!held || *util_dynarray_element(&cmd->embedded_sampler_layouts,
+                                       struct tu_descriptor_set_layout *,
+                                       held - 1) != set_layout) {
+      struct tu_descriptor_set_layout **slot =
+         (struct tu_descriptor_set_layout **) util_dynarray_grow(
+            &cmd->embedded_sampler_layouts, struct tu_descriptor_set_layout *, 1);
+      if (!slot) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return;
+      }
+      vk_descriptor_set_layout_ref(&set_layout->vk);
+      *slot = set_layout;
+   }
 
    tu_free_log_sampler_owner("bind", cmd->device,
                               (uint64_t) tu_descriptor_set_layout_to_handle(set_layout),
