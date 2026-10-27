@@ -493,6 +493,9 @@ struct tu_device
 
    uint32_t submit_count;
 
+   /* TU_FREE_LOG calibration throttle; protected by submit_mutex. */
+   uint64_t free_log_next_calibration_ns;
+
    /* Address space and global fault count for this local_fd with DRM backend */
    uint64_t fault_count;
 

@@ -4,6 +4,7 @@
  */
 
 #include "tu_free_log.h"
+#include "tu_device.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -37,6 +38,7 @@
 
 bool tu_free_log_on;
 bool tu_rt_label_on;
+static bool fl_calibration_on;
 
 struct tu_free_log_as {
    uint64_t va;
@@ -197,6 +199,8 @@ fl_init_once(void)
    backtrace(warm, ARRAY_SIZE(warm));
 #endif
 
+   fl_calibration_on = free_log &&
+      debug_get_bool_option("TU_FREE_LOG_CALIBRATION", false);
    tu_free_log_on = free_log;
    tu_rt_label_on = label;
 }
@@ -478,4 +482,61 @@ tu_free_log_rt_dispatch(const void *cmd, const void *pipeline,
            dims ? dims[0] : 0, dims ? dims[1] : 0, dims ? dims[2] : 0,
            cmd_va, raygen_va);
    return seq;
+}
+
+/* The submit mutex serializes the per-device throttle. Never hold fl_lock
+ * across kernel queries: the existing log sink takes it only when appending.
+ * Sampling precedes submission, not GPU execution of that submission. */
+void
+tu_free_log_calibration(struct tu_device *device, const void *queue,
+                        uint32_t queue_id, uint32_t submission_id)
+{
+   if (!tu_free_log_on || !fl_calibration_on)
+      return;
+
+   struct timespec before, after;
+   if (clock_gettime(CLOCK_MONOTONIC_RAW, &before) != 0) {
+      if (device->free_log_next_calibration_ns != UINT64_MAX)
+         fl_line("clock_calibration_error device=%p reason=raw_clock errno=%d",
+                 device, errno);
+      device->free_log_next_calibration_ns = UINT64_MAX;
+      return;
+   }
+   uint64_t now = (uint64_t) before.tv_sec * 1000000000ull + before.tv_nsec;
+   if (now < device->free_log_next_calibration_ns)
+      return;
+   device->free_log_next_calibration_ns = now + 1000000000ull;
+
+   uint64_t suspend_before = 0, suspend_after = 0, ticks = 0;
+   int sb = tu_device_get_suspend_count(device, &suspend_before);
+   int cb = clock_gettime(CLOCK_MONOTONIC_RAW, &before);
+   int cb_errno = cb ? errno : 0;
+   int gpu = cb ? -1 : tu_device_get_gpu_timestamp(device, &ticks);
+   int ca = clock_gettime(CLOCK_MONOTONIC_RAW, &after);
+   int ca_errno = ca ? errno : 0;
+   int sa = tu_device_get_suspend_count(device, &suspend_after);
+   if (cb || ca) {
+      fl_line("clock_calibration_error device=%p queue=%p queue_id=%u submit=%u "
+              "reason=bracket before_errno=%d after_errno=%d gpu_rc=%d",
+              device, queue, queue_id, submission_id, cb_errno, ca_errno, gpu);
+      return;
+   }
+   uint64_t begin_ns = (uint64_t) before.tv_sec * 1000000000ull + before.tv_nsec;
+   uint64_t end_ns = (uint64_t) after.tv_sec * 1000000000ull + after.tv_nsec;
+   bool valid = gpu == 0 && end_ns >= begin_ns &&
+      (sb != 0 || sa != 0 || suspend_before == suspend_after);
+   uint64_t bracket_ns = end_ns >= begin_ns ? end_ns - begin_ns : 0;
+   /* Conservative whole-bracket uncertainty + one rounded-up GPU tick.
+    * This is not an API pMaxDeviation value, nor a drift bound. */
+   uint64_t uncertainty_ns = bracket_ns +
+      tu_device_ticks_to_ns(device, 1) + 1;
+   fl_line("clock_calibration device=%p queue=%p queue_id=%u submit=%u "
+           "phase=pre_submit valid=%u gpu_rc=%d gpu_ticks=%" PRIu64
+           " gpu_ns=%" PRIu64 " raw_before_ns=%" PRIu64
+           " raw_after_ns=%" PRIu64 " uncertainty_ns=%" PRIu64
+           " suspend_before_rc=%d suspend_before=%" PRIu64
+           " suspend_after_rc=%d suspend_after=%" PRIu64,
+           device, queue, queue_id, submission_id, valid, gpu, ticks,
+           gpu == 0 ? tu_device_ticks_to_ns(device, ticks) : 0,
+           begin_ns, end_ns, uncertainty_ns, sb, suspend_before, sa, suspend_after);
 }

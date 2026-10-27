@@ -11,6 +11,10 @@
 extern bool tu_free_log_on;
 extern bool tu_rt_label_on;
 
+/* Called with device->submit_mutex held, immediately before submission. */
+void tu_free_log_calibration(struct tu_device *device, const void *queue,
+                             uint32_t queue_id, uint32_t submission_id);
+
 void tu_free_log_device_init(void);
 void tu_free_log_device_finish(void);
 

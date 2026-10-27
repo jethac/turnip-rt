@@ -19,6 +19,7 @@
 #include "tu_dynamic_rendering.h"
 #include "tu_image.h"
 #include "tu_knl.h"
+#include "tu_free_log.h"
 
 static int
 tu_get_submitqueue_priority(const struct tu_physical_device *pdevice,
@@ -393,6 +394,7 @@ queue_submit_sparse(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
       }
    }
 
+   tu_free_log_calibration(device, queue, queue->msm_queue_id, device->submit_count);
    VkResult result =
       tu_queue_submit(queue, submit, vk_submit->waits, vk_submit->wait_count,
                       vk_submit->signals, vk_submit->signal_count,
@@ -571,6 +573,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    }
 #endif
 
+   tu_free_log_calibration(device, queue, queue->msm_queue_id, device->submit_count);
    result =
       tu_queue_submit(queue, submit, vk_submit->waits, vk_submit->wait_count,
                       vk_submit->signals, vk_submit->signal_count,
