@@ -3379,26 +3379,33 @@ tu_setup_pvtmem(struct tu_device *dev,
    mtx_lock(&pvtmem_bo->mtx);
 
    if (pvtmem_bo->per_fiber_size < pvtmem_bytes) {
-      if (pvtmem_bo->bo)
-         tu_bo_finish(dev, pvtmem_bo->bo);
-
-      pvtmem_bo->per_fiber_size =
+      const uint32_t per_fiber_size =
          util_next_power_of_two(align(pvtmem_bytes, 512));
-      pvtmem_bo->per_sp_size =
-         align(pvtmem_bo->per_fiber_size *
-                  dev->physical_device->info->fibers_per_sp,
+      const uint32_t per_sp_size =
+         align(per_fiber_size * dev->physical_device->info->fibers_per_sp,
                1 << 12);
       uint64_t total_size =
-         uint64_t(dev->physical_device->info->num_sp_cores) * pvtmem_bo->per_sp_size *
+         uint64_t(dev->physical_device->info->num_sp_cores) * per_sp_size *
          (dev->physical_device->has_compute_queue ?
           dev->physical_device->num_queue_families : 1);
 
-      VkResult result = tu_bo_init_new(dev, NULL, &pvtmem_bo->bo, total_size,
+      struct tu_bo *new_bo;
+      VkResult result = tu_bo_init_new(dev, NULL, &new_bo, total_size,
                                        TU_BO_ALLOC_INTERNAL_RESOURCE, "pvtmem");
       if (result != VK_SUCCESS) {
          mtx_unlock(&pvtmem_bo->mtx);
          return result;
       }
+
+      /* Publish the new BO and layout together only after allocation succeeds.
+       * On failure the old pool must remain usable by subsequent pipelines.
+       */
+      struct tu_bo *old_bo = pvtmem_bo->bo;
+      pvtmem_bo->bo = new_bo;
+      pvtmem_bo->per_fiber_size = per_fiber_size;
+      pvtmem_bo->per_sp_size = per_sp_size;
+      if (old_bo)
+         tu_bo_finish(dev, old_bo);
    }
 
    config->per_wave = per_wave;
