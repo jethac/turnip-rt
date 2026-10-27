@@ -24,6 +24,7 @@
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
 #include "tu_foveate.h"
+#include "tu_free_log.h"
 #include "tu_lrz.h"
 #include "tu_pipeline.h"
 #include "tu_rmv.h"
@@ -3595,6 +3596,22 @@ tu_upload_shader(struct tu_device *dev,
       }
    }
 
+   if (tu_shader_upload_log_on) {
+      auto log_variant = [&](const struct ir3_shader_variant *variant,
+                             uint64_t binary, const char *kind) {
+         if (variant)
+            tu_free_log_shader_upload(shader, &shader->bo, kind, variant->type,
+                                      variant->blake3_str, binary,
+                                      variant->instrlen, variant->info.size,
+                                      variant->info.constant_data_offset,
+                                      variant->constant_data_size);
+      };
+      log_variant(v, iova, "main");
+      log_variant(binning, binning_iova, "binning");
+      log_variant(safe_const, safe_const_iova, "safe_const");
+      log_variant(safe_const_binning, safe_const_binning_iova, "safe_const_binning");
+   }
+
    return VK_SUCCESS;
 }
 
@@ -4599,6 +4616,10 @@ tu_empty_shader_create(struct tu_device *dev,
    tu_cs_begin_sub_stream(&shader->cs, 32, &sub_cs);
    TU_CALLX(dev, tu6_emit_variant)(&sub_cs, stage, NULL, &pvtmem_config, 0, 0);
    shader->state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
+
+   if (tu_shader_upload_log_on)
+      tu_free_log_shader_upload(shader, &shader->bo, "empty", stage, "-",
+                                0, 0, 0, 0, 0);
 
    *shader_out = shader;
    return VK_SUCCESS;

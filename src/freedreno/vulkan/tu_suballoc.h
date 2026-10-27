@@ -37,6 +37,8 @@ struct tu_suballoc_bo
    struct tu_bo *bo;
    uint64_t iova;
    uint32_t size; /* bytes */
+   uint64_t free_log_id; /* Optional CPU diagnostic allocation generation. */
+   const void *free_log_device;
 };
 
 void

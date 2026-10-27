@@ -5,6 +5,7 @@
 
 #include "tu_free_log.h"
 #include "tu_device.h"
+#include "tu_suballoc.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -38,6 +39,9 @@
 
 bool tu_free_log_on;
 bool tu_rt_label_on;
+bool tu_shader_upload_log_on;
+static std::atomic<uint64_t> fl_shader_records;
+static std::atomic<uint64_t> fl_suballoc_seq;
 static bool fl_calibration_on;
 
 struct tu_free_log_as {
@@ -201,6 +205,8 @@ fl_init_once(void)
 
    fl_calibration_on = free_log &&
       debug_get_bool_option("TU_FREE_LOG_CALIBRATION", false);
+   tu_shader_upload_log_on = free_log &&
+      debug_get_bool_option("TU_FREE_LOG_SHADER_UPLOAD", false);
    tu_free_log_on = free_log;
    tu_rt_label_on = label;
 }
@@ -242,6 +248,8 @@ tu_free_log_device_init(void)
 
    fl_line("open pid=%d devices=%u so=%s so_base=0x%" PRIxPTR, (int) getpid(),
            devices, so, so_base);
+   if (tu_shader_upload_log_on)
+      fl_line("shader_upload_config enabled=1 limit=65536");
    mtx_unlock(&fl_life);
 }
 
@@ -539,4 +547,68 @@ tu_free_log_calibration(struct tu_device *device, const void *queue,
            device, queue, queue_id, submission_id, valid, gpu, ticks,
            gpu == 0 ? tu_device_ticks_to_ns(device, ticks) : 0,
            begin_ns, end_ns, uncertainty_ns, sb, suspend_before, sa, suspend_after);
+}
+
+/* CPU metadata only; no Vulkan/GPU calls and no unbounded identity table. */
+static bool
+fl_shader_record(void)
+{
+   if (!tu_shader_upload_log_on)
+      return false;
+   uint64_t count = fl_shader_records.fetch_add(1, std::memory_order_relaxed);
+   if (count == 65536)
+      fl_line("shader_upload_loss reason=record_limit limit=65536");
+   return count < 65536;
+}
+
+void
+tu_free_log_suballoc_alloc(struct tu_suballoc_bo *bo,
+                           const struct tu_suballocator *pool,
+                           uint32_t alignment)
+{
+   bo->free_log_id = 0;
+   bo->free_log_device = NULL;
+   if (!tu_shader_upload_log_on || !pool->name ||
+       strcmp(pool->name, "pipeline_suballoc"))
+      return;
+   bo->free_log_device = pool->dev;
+   bo->free_log_id = fl_suballoc_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+   if (!fl_shader_record())
+      return;
+   fl_line("pipeline_suballoc_acquire id=%" PRIu64 " sub=%p pool=%p device=%p "
+           "iova=0x%" PRIx64 " size=0x%x alignment=%u bo=%p "
+           "bo_iova=0x%" PRIx64 " bo_size=0x%" PRIx64 " gem=%u",
+           bo->free_log_id, bo, pool, bo->free_log_device, bo->iova, bo->size, alignment,
+           bo->bo, bo->bo->iova, bo->bo->size, bo->bo->gem_handle);
+}
+
+void
+tu_free_log_suballoc_release(const struct tu_suballoc_bo *bo)
+{
+   if (!tu_shader_upload_log_on || !bo->free_log_id || !fl_shader_record())
+      return;
+   fl_line("pipeline_suballoc_release id=%" PRIu64 " sub=%p device=%p "
+           "iova=0x%" PRIx64 " size=0x%x bo=%p "
+           "bo_iova=0x%" PRIx64 " bo_size=0x%" PRIx64 " gem=%u",
+           bo->free_log_id, bo, bo->free_log_device, bo->iova, bo->size, bo->bo,
+           bo->bo->iova, bo->bo->size, bo->bo->gem_handle);
+}
+
+void
+tu_free_log_shader_upload(const void *shader, const struct tu_suballoc_bo *bo,
+                          const char *kind, uint32_t stage, const char *hash,
+                          uint64_t binary_iova, uint32_t instrlen,
+                          uint32_t padded_bytes, uint32_t constant_offset,
+                          uint32_t constant_bytes)
+{
+   if (!tu_shader_upload_log_on || !bo->free_log_id || !fl_shader_record())
+      return;
+   fl_line("shader_upload_success id=%" PRIu64 " shader=%p device=%p kind=%s stage=%u "
+           "hash=%.64s binary_iova=0x%" PRIx64 " instrlen=0x%x "
+           "padded_bytes=0x%x constant_offset=0x%x constant_bytes=0x%x "
+           "sub_iova=0x%" PRIx64 " sub_size=0x%x bo=%p "
+           "bo_iova=0x%" PRIx64 " bo_size=0x%" PRIx64 " gem=%u",
+           bo->free_log_id, shader, bo->free_log_device, kind, stage, hash, binary_iova, instrlen,
+           padded_bytes, constant_offset, constant_bytes, bo->iova, bo->size,
+           bo->bo, bo->bo->iova, bo->bo->size, bo->bo->gem_handle);
 }

@@ -10,6 +10,19 @@
 
 extern bool tu_free_log_on;
 extern bool tu_rt_label_on;
+extern bool tu_shader_upload_log_on;
+struct tu_suballoc_bo;
+struct tu_suballocator;
+void tu_free_log_suballoc_alloc(struct tu_suballoc_bo *bo,
+                               const struct tu_suballocator *pool,
+                               uint32_t alignment);
+void tu_free_log_suballoc_release(const struct tu_suballoc_bo *bo);
+void tu_free_log_shader_upload(const void *shader,
+                              const struct tu_suballoc_bo *bo,
+                              const char *kind, uint32_t stage,
+                              const char *hash, uint64_t binary_iova,
+                              uint32_t instrlen, uint32_t padded_bytes,
+                              uint32_t constant_offset, uint32_t constant_bytes);
 
 /* Called with device->submit_mutex held, immediately before submission. */
 void tu_free_log_calibration(struct tu_device *device, const void *queue,

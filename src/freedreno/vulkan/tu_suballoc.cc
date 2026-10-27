@@ -21,6 +21,7 @@
  */
 
 #include "tu_suballoc.h"
+#include "tu_free_log.h"
 
 /* Initializes a BO sub-allocator using refcounts on BOs.
  */
@@ -62,6 +63,7 @@ tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
          suballoc_bo->size = size;
 
          suballoc->next_offset = offset + size;
+         tu_free_log_suballoc_alloc(suballoc_bo, suballoc, alignment);
          return VK_SUCCESS;
       } else {
          tu_bo_finish(suballoc->dev, bo);
@@ -100,6 +102,7 @@ tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
    suballoc_bo->iova = suballoc_bo->bo->iova;
    suballoc_bo->size = size;
    suballoc->next_offset = size;
+   tu_free_log_suballoc_alloc(suballoc_bo, suballoc, alignment);
 
    return VK_SUCCESS;
 }
@@ -109,6 +112,10 @@ tu_suballoc_bo_free(struct tu_suballocator *suballoc, struct tu_suballoc_bo *bo)
 {
    if (!bo->bo)
       return;
+
+   if (tu_shader_upload_log_on && suballoc->name &&
+       !strcmp(suballoc->name, "pipeline_suballoc"))
+      tu_free_log_suballoc_release(bo);
 
    /* If we we held the last reference to this BO, so just move it to the
     * suballocator for the next time we need to allocate.
