@@ -115,6 +115,8 @@ struct tu_cs
    struct tu_device *device;
    enum tu_cs_mode mode;
    bool writeable;
+   /* Owned by a tu_cmd_buffer; tags new BOs for RD submit scoping. */
+   bool rd_cmdbuf_owned;
    uint32_t next_bo_size;
    VkResult status;
 

@@ -65,6 +65,12 @@ struct tu_bo {
    bool lazy : 1;
 
    bool dump;
+   /* RD preflight diagnostics: dump was enabled after allocation by a
+    * descriptor-buffer bind, and the BO belongs to a command buffer's own
+    * command streams (eligible for submit-scoped omission).
+    */
+   bool dump_bound;
+   bool rd_cmdbuf_cs;
 
    /* Pointer to the vk_object_base associated with the BO
     * for the purposes of VK_EXT_device_address_binding_report

@@ -4447,6 +4447,13 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
    tu_cs_init(&cmd_buffer->sub_cs, device, TU_CS_MODE_SUB_STREAM, 2048, "draw sub cs");
    tu_cs_init(&cmd_buffer->pre_chain.draw_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw cs");
    tu_cs_init(&cmd_buffer->pre_chain.draw_epilogue_cs, device, TU_CS_MODE_GROW, 4096, "prechain draw epiligoue cs");
+   cmd_buffer->cs.rd_cmdbuf_owned = true;
+   cmd_buffer->draw_cs.rd_cmdbuf_owned = true;
+   cmd_buffer->tile_store_cs.rd_cmdbuf_owned = true;
+   cmd_buffer->draw_epilogue_cs.rd_cmdbuf_owned = true;
+   cmd_buffer->sub_cs.rd_cmdbuf_owned = true;
+   cmd_buffer->pre_chain.draw_cs.rd_cmdbuf_owned = true;
+   cmd_buffer->pre_chain.draw_epilogue_cs.rd_cmdbuf_owned = true;
 
    for (unsigned i = 0; i < MAX_BIND_POINTS; i++)
       cmd_buffer->descriptors[i].push_set.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET;

@@ -189,6 +189,7 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
    }
 
    TU_RMV(cmd_buffer_bo_create, cs->device, new_bo);
+   new_bo->rd_cmdbuf_cs = cs->rd_cmdbuf_owned;
 
    bos->bos[bos->bo_count++] = new_bo;
 

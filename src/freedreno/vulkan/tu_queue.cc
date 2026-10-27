@@ -21,6 +21,9 @@
 #include "tu_knl.h"
 #include "tu_free_log.h"
 
+#include "util/set.h"
+#include "util/u_debug.h"
+
 static int
 tu_get_submitqueue_priority(const struct tu_physical_device *pdevice,
                             VkQueueGlobalPriorityKHR global_priority,
@@ -74,6 +77,27 @@ tu_get_submitqueue_priority(const struct tu_physical_device *pdevice,
       DIV_ROUND_UP((pdevice->submitqueue_priority_count - 1) * priority, 3);
 
    return priority;
+}
+
+DEBUG_GET_ONCE_BOOL_OPTION(rd_submit_scope, "TU_RD_SUBMIT_SCOPE", false)
+
+/* Adds every BO a command stream owns or references through its entries. */
+static bool
+rd_scope_add_cs(struct set *bos, const struct tu_cs *cs)
+{
+   for (uint32_t i = 0; i < cs->read_only.bo_count; i++) {
+      if (!_mesa_set_add(bos, cs->read_only.bos[i]))
+         return false;
+   }
+   for (uint32_t i = 0; i < cs->read_write.bo_count; i++) {
+      if (!_mesa_set_add(bos, cs->read_write.bos[i]))
+         return false;
+   }
+   for (uint32_t i = 0; i < cs->entry_count; i++) {
+      if (!_mesa_set_add(bos, cs->entries[i].bo))
+         return false;
+   }
+   return true;
 }
 
 static void
@@ -524,33 +548,102 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
                            device->submit_count)) {
       struct fd_rd_output *rd = &device->rd_output;
       rd_selected = true;
-      mtx_lock(&device->bo_mutex);
-      /* Exact uncompressed section bytes, before opening any output file. */
-      uint64_t bytes = 32; /* CHIP_ID and CMD, each 8-byte header + 8 payload. */
-      bool valid = device->instance->knl->bo_map_dump &&
-                   device->instance->knl->bo_unmap_dump;
-      util_dynarray_foreach (&device->dump_bo_list, struct tu_bo *, bo_ptr) {
-         struct tu_bo *bo = *bo_ptr;
-         bytes += 20; /* GPUADDR header + 12 bytes. */
-         if (bo->size > UINT32_MAX) {
-            valid = false;
-            break;
+      /* Opt-in submit scoping: contents of BOs owned by command buffers are
+       * written only for the command buffers in this submit (and BOs holding
+       * its root entries). GPUADDR records are still written for every BO,
+       * so omitted contents remain visible as omissions, not absences.
+       */
+      bool scope = debug_get_option_rd_submit_scope();
+      struct set *scope_bos = NULL;
+      bool scope_ok = true;
+      if (scope) {
+         scope_bos = _mesa_pointer_set_create(NULL);
+         scope_ok = scope_bos != NULL;
+         for (uint32_t i = 0; scope_ok && i < cmdbuf_count; i++) {
+            struct tu_cmd_buffer *cmd = cmd_buffers[i];
+            scope_ok = rd_scope_add_cs(scope_bos, &cmd->cs) &&
+                       rd_scope_add_cs(scope_bos, &cmd->draw_cs) &&
+                       rd_scope_add_cs(scope_bos, &cmd->tile_store_cs) &&
+                       rd_scope_add_cs(scope_bos, &cmd->draw_epilogue_cs) &&
+                       rd_scope_add_cs(scope_bos, &cmd->sub_cs) &&
+                       rd_scope_add_cs(scope_bos, &cmd->pre_chain.draw_cs) &&
+                       rd_scope_add_cs(scope_bos, &cmd->pre_chain.draw_epilogue_cs);
          }
-         if (p_atomic_read(&bo->dump)) {
-            if (bo->size > INT_MAX) {
-               valid = false;
+         util_dynarray_foreach (&dump_cmds, struct tu_cs_entry, cmd) {
+            if (!scope_ok)
                break;
-            }
-            bytes += 8 + bo->size;
-         }
-         if (bytes > UINT64_C(1024) * 1024 * 1024) {
-            valid = false;
-            break;
+            scope_ok = _mesa_set_add(scope_bos, cmd->bo) != NULL;
          }
       }
+      mtx_lock(&device->bo_mutex);
+      /* Exact uncompressed section bytes, before opening any output file.
+       * Per-BO content decisions are frozen here so a concurrent
+       * descriptor-buffer bind cannot change them before writing.
+       */
+      uint32_t listed = util_dynarray_num_elements(&device->dump_bo_list, struct tu_bo *);
+      uint8_t *content = scope_ok ? (uint8_t *)calloc(MAX2(listed, 1), 1) : NULL;
+      uint64_t bytes = 32; /* CHIP_ID and CMD, each 8-byte header + 8 payload. */
+      uint64_t listed_max = 0, over_u32 = 0, marked = 0, marked_bytes = 0;
+      uint64_t bound = 0, bound_bytes = 0, cmdbuf = 0, cmdbuf_bytes = 0;
+      uint64_t omitted = 0, omitted_bytes = 0, kept = 0, kept_bytes = 0;
+      uint64_t kept_max = 0, over_int = 0;
+      bool backend = device->instance->knl->bo_map_dump &&
+                     device->instance->knl->bo_unmap_dump;
+      for (uint32_t i = 0; content && i < listed; i++) {
+         struct tu_bo *bo = *util_dynarray_element(&device->dump_bo_list, struct tu_bo *, i);
+         bytes += 20; /* GPUADDR header + 12 bytes. */
+         listed_max = MAX2(listed_max, bo->size);
+         if (bo->size > UINT32_MAX)
+            over_u32++;
+         if (!p_atomic_read(&bo->dump))
+            continue;
+         marked++;
+         marked_bytes += bo->size;
+         if (p_atomic_read(&bo->dump_bound)) {
+            bound++;
+            bound_bytes += bo->size;
+         }
+         if (bo->rd_cmdbuf_cs) {
+            cmdbuf++;
+            cmdbuf_bytes += bo->size;
+            if (scope && !_mesa_set_search(scope_bos, bo)) {
+               omitted++;
+               omitted_bytes += bo->size;
+               continue;
+            }
+         }
+         content[i] = 1;
+         kept++;
+         kept_bytes += bo->size;
+         kept_max = MAX2(kept_max, bo->size);
+         if (bo->size > INT_MAX)
+            over_int++;
+         else
+            bytes += 8 + bo->size;
+      }
       bytes += 20 * (uint64_t)util_dynarray_num_elements(&dump_cmds, struct tu_cs_entry);
-      if (!valid) {
-         fd_rd_output_error(rd, "unsupported_backend_or_snapshot_size");
+      const uint64_t limit = UINT64_C(1024) * 1024 * 1024;
+      const char *reason =
+         !content ? "scope_or_preflight_allocation" :
+         !backend ? "backend_unavailable" :
+         over_u32 ? "listed_bo_over_uint32" :
+         over_int ? "content_bo_over_int_max" :
+         bytes > limit ? "snapshot_over_1gib" : NULL;
+      mesa_logi("RD_CAPTURE_PREFLIGHT device=%p queue=%p msm_queue=%u submit=%u namespace=%s "
+                "scope=%u cmdbufs=%u roots=%u listed=%u listed_max=0x%" PRIx64 " over_u32=%" PRIu64
+                " marked=%" PRIu64 " marked_bytes=%" PRIu64 " bound=%" PRIu64 " bound_bytes=%" PRIu64
+                " cmdbuf_cs=%" PRIu64 " cmdbuf_cs_bytes=%" PRIu64 " omitted=%" PRIu64
+                " omitted_bytes=%" PRIu64 " content=%" PRIu64 " content_bytes=%" PRIu64
+                " content_max=0x%" PRIx64 " over_int=%" PRIu64 " bytes=%" PRIu64 " limit=%" PRIu64
+                " valid=%u reason=%s",
+                device, queue, queue->msm_queue_id, device->submit_count,
+                rd->name ? rd->name : "-", scope, cmdbuf_count,
+                (unsigned)util_dynarray_num_elements(&dump_cmds, struct tu_cs_entry),
+                listed, listed_max, over_u32, marked, marked_bytes, bound, bound_bytes,
+                cmdbuf, cmdbuf_bytes, omitted, omitted_bytes, kept, kept_bytes, kept_max,
+                over_int, bytes, limit, reason == NULL, reason ? reason : "-");
+      if (reason) {
+         fd_rd_output_error(rd, reason);
       } else if (fd_rd_output_begin_selected(rd, device->vk.current_frame,
                                              device->submit_count, bytes)) {
          mesa_logi("RD_CAPTURE_BEGIN device=%p queue=%p msm_queue=%u submit=%u capture=%u bytes=%" PRIu64 " file=%s namespace=%s",
@@ -558,12 +651,12 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
                    rd->captures, bytes, rd->capture_path, rd->name ? rd->name : "-");
          fd_rd_output_write_section(rd, RD_CHIP_ID, &device->physical_device->dev_id.chip_id, 8);
          fd_rd_output_write_section(rd, RD_CMD, "tu-dump", 8);
-         util_dynarray_foreach (&device->dump_bo_list, struct tu_bo *, bo_ptr) {
-            struct tu_bo *bo = *bo_ptr;
+         for (uint32_t i = 0; i < listed; i++) {
+            struct tu_bo *bo = *util_dynarray_element(&device->dump_bo_list, struct tu_bo *, i);
             uint32_t buf[3] = { (uint32_t)bo->iova, (uint32_t)bo->size,
                                 (uint32_t)(bo->iova >> 32) };
             fd_rd_output_write_section(rd, RD_GPUADDR, buf, 12);
-            if (p_atomic_read(&bo->dump) && !rd->failed) {
+            if (content[i] && !rd->failed) {
                void *alias = NULL;
                if (device->instance->knl->bo_map_dump(device, bo, &alias) != VK_SUCCESS) {
                   fd_rd_output_error(rd, "private_map");
@@ -583,6 +676,9 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
          fd_rd_output_end(rd);
       }
       mtx_unlock(&device->bo_mutex);
+      free(content);
+      if (scope_bos)
+         _mesa_set_destroy(scope_bos, NULL);
    }
 
    if (FD_RD_DUMP(ENABLE)) {
