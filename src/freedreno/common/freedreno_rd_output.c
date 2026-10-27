@@ -164,14 +164,49 @@ fd_rd_output_init_mode(struct fd_rd_output *output, const char* output_name, boo
 {
    memset(output, 0, sizeof(*output));
    output->bounded = bounded;
+   output->trigger_fd = -1;
    const char *test_name = os_get_option("FD_RD_DUMP_TESTNAME");
    ASSERTED int name_len;
+   char *initial_name = NULL;
    if (test_name)
-      name_len = asprintf(&output->name, "%s_%s", test_name, output_name);
+      name_len = asprintf(&initial_name, "%s_%s", test_name, output_name);
    else
-      name_len = asprintf(&output->name, "%s", output_name);
+      name_len = asprintf(&initial_name, "%s", output_name);
+   if (name_len >= 0)
+      output->name = initial_name;
+   if (bounded && name_len < 0) {
+      fd_rd_output_error(output, "namespace_name_allocation");
+      return;
+   }
    assert(name_len != -1);
    fd_rd_output_sanitize_name(output->name);
+
+   if (bounded) {
+      char marker[PATH_MAX];
+      int length = snprintf(marker, sizeof(marker), "%s/%s_epochXXXXXX",
+                            fd_rd_dump_env.output_path, output->name);
+      if (length < 0 || (size_t)length >= sizeof(marker) - 64) {
+         fd_rd_output_error(output, "namespace_path_length");
+         return;
+      }
+      int fd = mkstemp(marker);
+      if (fd < 0) {
+         fd_rd_output_error(output, "namespace_reservation");
+         return;
+      }
+      /* Retain the zero-byte reservation across device and DSO lifetimes. */
+      if (close(fd)) {
+         fd_rd_output_error(output, "namespace_close");
+         return;
+      }
+      char *name = NULL;
+      if (asprintf(&name, "%s", strrchr(marker, '/') + 1) < 0) {
+         fd_rd_output_error(output, "namespace_name_allocation");
+         return;
+      }
+      free(output->name);
+      output->name = name;
+   }
 
    output->combine = false;
    output->file = NULL;
@@ -219,14 +254,12 @@ void
 fd_rd_output_error(struct fd_rd_output *output, const char *reason)
 {
    output->failed = true;
-   mesa_loge("RD_CAPTURE_ERROR name=%s reason=%s", output->name, reason);
+   mesa_loge("RD_CAPTURE_ERROR name=%s reason=%s", output->name ? output->name : "-", reason);
 }
 
 void
 fd_rd_output_fini(struct fd_rd_output *output)
 {
-   free(output->name);
-
    if (output->file != NULL) {
       assert(output->combine);
       gzclose(output->file);
@@ -244,6 +277,7 @@ fd_rd_output_fini(struct fd_rd_output *output)
       unlink(file_path);
    }
 
+   free(output->name);
    util_dynarray_fini(&output->frame_ranges);
    util_dynarray_fini(&output->submit_ranges);
 }

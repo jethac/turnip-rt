@@ -3377,6 +3377,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
                device->device_idx);
 
       fd_rd_output_init_bounded(&device->rd_output, output_name);
+      mesa_logi("RD_CAPTURE_DEVICE device=%p namespace=%s failed=%u",
+                device, device->rd_output.name ? device->rd_output.name : "-",
+                device->rd_output.failed);
    }
 
    device->vk.cmd_dispatch_unaligned = tu_dispatch_unaligned;

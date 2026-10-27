@@ -553,9 +553,9 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
          fd_rd_output_error(rd, "unsupported_backend_or_snapshot_size");
       } else if (fd_rd_output_begin_selected(rd, device->vk.current_frame,
                                              device->submit_count, bytes)) {
-         mesa_logi("RD_CAPTURE_BEGIN device=%p queue=%p msm_queue=%u submit=%u capture=%u bytes=%" PRIu64 " file=%s",
+         mesa_logi("RD_CAPTURE_BEGIN device=%p queue=%p msm_queue=%u submit=%u capture=%u bytes=%" PRIu64 " file=%s namespace=%s",
                    device, queue, queue->msm_queue_id, device->submit_count,
-                   rd->captures, bytes, rd->capture_path);
+                   rd->captures, bytes, rd->capture_path, rd->name ? rd->name : "-");
          fd_rd_output_write_section(rd, RD_CHIP_ID, &device->physical_device->dev_id.chip_id, 8);
          fd_rd_output_write_section(rd, RD_CMD, "tu-dump", 8);
          util_dynarray_foreach (&device->dump_bo_list, struct tu_bo *, bo_ptr) {
@@ -593,14 +593,15 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
          rd_bridge = true;
          uint32_t capture = rd_selected ? rd->captures : 0;
          util_dynarray_foreach (&dump_cmds, struct tu_cs_entry, cmd) {
-            mesa_logi("RD_CAPTURE_ROOT device=%p queue=%p msm_queue=%u submit=%u capture=%u iova=0x%" PRIx64 " dwords=%u gem=%u",
+            mesa_logi("RD_CAPTURE_ROOT device=%p queue=%p msm_queue=%u submit=%u capture=%u iova=0x%" PRIx64 " dwords=%u gem=%u namespace=%s",
                       device, queue, queue->msm_queue_id, device->submit_count, capture,
-                      cmd->bo->iova + cmd->offset, cmd->size >> 2, cmd->bo->gem_handle);
+                      cmd->bo->iova + cmd->offset, cmd->size >> 2, cmd->bo->gem_handle,
+                      rd->name ? rd->name : "-");
          }
-         mesa_logi("RD_CAPTURE_PRE_SUBMIT device=%p queue=%p msm_queue=%u submit=%u capture=%u selected=%u complete=%u file=%s",
+         mesa_logi("RD_CAPTURE_PRE_SUBMIT device=%p queue=%p msm_queue=%u submit=%u capture=%u selected=%u complete=%u file=%s namespace=%s",
                    device, queue, queue->msm_queue_id, device->submit_count,
                    capture, rd_selected, rd_selected && !rd->failed,
-                   rd_selected ? rd->capture_path : "-");
+                   rd_selected ? rd->capture_path : "-", rd->name ? rd->name : "-");
       } else if (rd->bridge_records != UINT64_MAX) {
          rd->bridge_records = UINT64_MAX;
          fd_rd_output_error(rd, "bridge_record_loss");
@@ -623,11 +624,12 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
                       vk_submit->signals, vk_submit->signal_count,
                       u_trace_submission_data);
    if (rd_bridge) {
-      mesa_logi("RD_CAPTURE_POST_SUBMIT device=%p queue=%p msm_queue=%u submit=%u capture=%u result=%d fence=%d fence_valid=%u file=%s",
+      mesa_logi("RD_CAPTURE_POST_SUBMIT device=%p queue=%p msm_queue=%u submit=%u capture=%u result=%d fence=%d fence_valid=%u file=%s namespace=%s",
                 device, queue, queue->msm_queue_id, device->submit_count,
                 rd_selected ? device->rd_output.captures : 0, result, queue->fence,
                 result == VK_SUCCESS,
-                rd_selected ? device->rd_output.capture_path : "-");
+                rd_selected ? device->rd_output.capture_path : "-",
+                device->rd_output.name ? device->rd_output.name : "-");
    }
 
    if (result != VK_SUCCESS) {
