@@ -1486,11 +1486,9 @@ lower_inline_ubo(nir_builder *b, nir_intrinsic_instr *intrin, void *cb_data)
 static bool
 can_speculate_resource(nir_def *def,
                        const struct tu_pipeline_layout *layout,
-                       bool *can_speculate_descriptor,
-                       bool *push_ubo_exempt)
+                       bool *can_speculate_descriptor)
 {
    *can_speculate_descriptor = false;
-   *push_ubo_exempt = false;
 
    /* We're looking for a pattern like this:
     *
@@ -1530,30 +1528,16 @@ can_speculate_resource(nir_def *def,
    *can_speculate_descriptor =
       can_speculate_descriptor_load(resource_intr->src[0], set_layout,
                                     binding);
-   *push_ubo_exempt = tu_push_ubo_exempt(set_layout, binding);
 
    return *can_speculate_descriptor && !bind_layout->partially_bound;
 }
 
 static bool
-tu_push_ubo_src_allowed(const nir_shader *nir)
-{
-   static const char *list = os_get_option("TU_PUSH_UBO_SPECULATE_SRC");
-   if (!list || !*list)
-      return true;
-   char hex[9];
-   snprintf(hex, sizeof(hex), "%08x", nir->info.source_blake3[0]);
-   return strstr(list, hex) != NULL;
-}
-
-static bool
-set_speculate_intrinsic(nir_intrinsic_instr *intrin, const nir_shader *nir,
+set_speculate_intrinsic(nir_intrinsic_instr *intrin,
                         struct lower_instr_params *params)
 {
-   mesa_shader_stage stage = nir->info.stage;
    const struct tu_pipeline_layout *layout = params->layout;
    bool can_speculate = false, can_speculate_descriptor = false;
-   bool push_ubo_exempt = false;
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_load_ssbo:
@@ -1562,30 +1546,16 @@ set_speculate_intrinsic(nir_intrinsic_instr *intrin, const nir_shader *nir,
    case nir_intrinsic_ssbo_atomic_swap:
    case nir_intrinsic_get_ssbo_size:
       can_speculate = can_speculate_resource(intrin->src[0].ssa, layout,
-                                             &can_speculate_descriptor,
-                                             &push_ubo_exempt);
+                                             &can_speculate_descriptor);
       break;
 
    case nir_intrinsic_store_ssbo:
       can_speculate = can_speculate_resource(intrin->src[1].ssa, layout,
-                                             &can_speculate_descriptor,
-                                             &push_ubo_exempt);
+                                             &can_speculate_descriptor);
       break;
 
    default:
       return false;
-   }
-
-   if (push_ubo_exempt && can_speculate) {
-      if (stage != MESA_SHADER_COMPUTE || params->ray_tracing ||
-          intrin->intrinsic != nir_intrinsic_load_ubo ||
-          !tu_push_ubo_src_allowed(nir)) {
-         can_speculate = false;
-      } else {
-         if (!nir_src_is_const(intrin->src[1]))
-            nir_intrinsic_set_range(intrin, ~0);
-         params->shader->push_ubo_speculated = true;
-      }
    }
 
    if ((intrin->intrinsic == nir_intrinsic_load_ubo ||
@@ -1612,7 +1582,7 @@ set_speculate_instr(nir_builder *b, nir_instr *instr, void *cb_data)
    struct lower_instr_params *params = static_cast<struct lower_instr_params *>(cb_data);
    if (instr->type == nir_instr_type_intrinsic) {
       return set_speculate_intrinsic(nir_instr_as_intrinsic(instr),
-                                     b->shader, params);
+                                     params);
    }
 
    return false;
@@ -4131,7 +4101,6 @@ tu_shader_create(struct tu_device *dev,
       .push_consts_dwords = shader->const_state.push_consts.dwords,
       .const_allocs = const_allocs,
       .nir_options = nir_options,
-      .no_early_preamble = shader->push_ubo_speculated,
       .rt_part = rt && rt->part,
       .rt_scalar_pvtmem = rt && debug_get_bool_option("TU_RT_LINK_PERWAVE", false),
       .rt_blobs = rt ? rt->blobs : NULL,
@@ -4181,12 +4150,11 @@ tu_shader_create(struct tu_device *dev,
    static const bool log_hashes =
       debug_get_bool_option("TU_LOG_SHADER_HASHES", false);
    if (log_hashes && shader->variant)
-      mesa_logi("tu-hash: %s src=%08x%08x bin=%.12s instrs=%u constlen=%u "
-                "push_ubo=%d",
+      mesa_logi("tu-hash: %s src=%08x%08x bin=%.12s instrs=%u constlen=%u",
                 mesa_shader_stage_name(src_stage), src_hash[0], src_hash[1],
                 shader->variant->blake3_str,
                 shader->variant->info.instrs_count,
-                shader->variant->constlen, shader->push_ubo_speculated);
+                shader->variant->constlen);
 
    if (ir3_exceeds_safe_constlen(shader->variant)) {
       struct ir3_shader_key safe_constlen_key = *ir3_key;
