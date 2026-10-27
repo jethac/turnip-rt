@@ -80,6 +80,11 @@ tu_get_submitqueue_priority(const struct tu_physical_device *pdevice,
 }
 
 DEBUG_GET_ONCE_BOOL_OPTION(rd_submit_scope, "TU_RD_SUBMIT_SCOPE", false)
+/* Opt-in: a pending trigger request is only consumed by submits whose root
+ * command-stream entries total at least this many dwords, so finite captures
+ * can target large per-frame scene/composite submits.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(rd_min_root_dwords, "TU_RD_MIN_ROOT_DWORDS", 0)
 
 /* Adds every BO a command stream owns or references through its entries. */
 static bool
@@ -475,6 +480,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    struct tu_cs *autotune_cs = NULL;
    bool rd_selected = false;
    bool rd_bridge = false;
+   uint64_t rd_root_dwords = 0;
 
    if (vk_submit->buffer_bind_count ||
        vk_submit->image_bind_count ||
@@ -567,7 +573,13 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
                          autotune_cs->entry_count);
    }
 
+   if (FD_RD_DUMP(ENABLE)) {
+      util_dynarray_foreach (&dump_cmds, struct tu_cs_entry, cmd)
+         rd_root_dwords += cmd->size >> 2;
+   }
+
    if (cmdbuf_count && FD_RD_DUMP(ENABLE) &&
+       rd_root_dwords >= (uint64_t) MAX2(debug_get_option_rd_min_root_dwords(), 0) &&
        fd_rd_output_select(&device->rd_output, device->vk.current_frame,
                            device->submit_count)) {
       struct fd_rd_output *rd = &device->rd_output;
@@ -646,7 +658,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
          over_int ? "content_bo_over_int_max" :
          bytes > limit ? "snapshot_over_1gib" : NULL;
       mesa_logi("RD_CAPTURE_PREFLIGHT device=%p queue=%p msm_queue=%u submit=%u namespace=%s "
-                "scope=%u cmdbufs=%u roots=%u listed=%u listed_max=0x%" PRIx64 " over_u32=%" PRIu64
+                "scope=%u cmdbufs=%u roots=%u root_dwords=%" PRIu64 " min_root_dwords=%" PRId64 " listed=%u listed_max=0x%" PRIx64 " over_u32=%" PRIu64
                 " marked=%" PRIu64 " marked_bytes=%" PRIu64 " bound=%" PRIu64 " bound_bytes=%" PRIu64
                 " cmdbuf_cs=%" PRIu64 " cmdbuf_cs_bytes=%" PRIu64 " omitted=%" PRIu64
                 " omitted_bytes=%" PRIu64 " content=%" PRIu64 " content_bytes=%" PRIu64
@@ -655,7 +667,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
                 device, queue, queue->msm_queue_id, device->submit_count,
                 rd->name ? rd->name : "-", scope, cmdbuf_count,
                 (unsigned)util_dynarray_num_elements(&dump_cmds, struct tu_cs_entry),
-                listed, listed_max, over_u32, marked, marked_bytes, bound, bound_bytes,
+                rd_root_dwords, debug_get_option_rd_min_root_dwords(), listed, listed_max, over_u32, marked, marked_bytes, bound, bound_bytes,
                 cmdbuf, cmdbuf_bytes, omitted, omitted_bytes, kept, kept_bytes, kept_max,
                 over_int, bytes, limit, reason == NULL, reason ? reason : "-");
       if (reason) {
