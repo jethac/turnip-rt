@@ -4507,6 +4507,7 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
       tu_destroy_memory(cmd_buffer->device, *mem);
    }
    util_dynarray_fini(&cmd_buffer->msrtss_depth_temporaries);
+   util_dynarray_fini(&cmd_buffer->rd_secondaries);
 
    ralloc_free(cmd_buffer->patchpoints_ctx);
    ralloc_free(cmd_buffer->pre_chain.patchpoints_ctx);
@@ -4589,6 +4590,8 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       tu_destroy_memory(cmd_buffer->device, *mem);
    }
    util_dynarray_clear(&cmd_buffer->msrtss_depth_temporaries);
+   util_dynarray_clear(&cmd_buffer->rd_secondaries);
+   cmd_buffer->rd_secondaries_lost = false;
 
    u_trace_fini(&cmd_buffer->trace);
    u_trace_init(&cmd_buffer->trace, &cmd_buffer->device->trace_context);
@@ -6683,6 +6686,15 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
 
    for (uint32_t i = 0; i < commandBufferCount; i++) {
       VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
+
+      if (FD_RD_DUMP(ENABLE)) {
+         struct tu_cmd_buffer **slot = (struct tu_cmd_buffer **)
+            util_dynarray_grow(&cmd->rd_secondaries, struct tu_cmd_buffer *, 1);
+         if (slot)
+            *slot = secondary;
+         else
+            cmd->rd_secondaries_lost = true;
+      }
 
 #ifdef HAVE_PERFETTO
       /* Propagate viewport/scissor state so that we can emit the correct

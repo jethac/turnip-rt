@@ -100,6 +100,30 @@ rd_scope_add_cs(struct set *bos, const struct tu_cs *cs)
    return true;
 }
 
+/* Adds a command buffer's own streams and those of executed secondaries.
+ * Secondaries must stay valid while the primary is pending, so the recorded
+ * pointers are live at submit time.
+ */
+static bool
+rd_scope_add_cmd(struct set *bos, struct tu_cmd_buffer *cmd, unsigned depth)
+{
+   if (depth > 4 || cmd->rd_secondaries_lost)
+      return false;
+   if (!rd_scope_add_cs(bos, &cmd->cs) ||
+       !rd_scope_add_cs(bos, &cmd->draw_cs) ||
+       !rd_scope_add_cs(bos, &cmd->tile_store_cs) ||
+       !rd_scope_add_cs(bos, &cmd->draw_epilogue_cs) ||
+       !rd_scope_add_cs(bos, &cmd->sub_cs) ||
+       !rd_scope_add_cs(bos, &cmd->pre_chain.draw_cs) ||
+       !rd_scope_add_cs(bos, &cmd->pre_chain.draw_epilogue_cs))
+      return false;
+   util_dynarray_foreach (&cmd->rd_secondaries, struct tu_cmd_buffer *, secondary) {
+      if (!rd_scope_add_cmd(bos, *secondary, depth + 1))
+         return false;
+   }
+   return true;
+}
+
 static void
 submit_add_entries(struct tu_device *dev, void *submit,
                    struct util_dynarray *dump_cmds,
@@ -559,16 +583,8 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
       if (scope) {
          scope_bos = _mesa_pointer_set_create(NULL);
          scope_ok = scope_bos != NULL;
-         for (uint32_t i = 0; scope_ok && i < cmdbuf_count; i++) {
-            struct tu_cmd_buffer *cmd = cmd_buffers[i];
-            scope_ok = rd_scope_add_cs(scope_bos, &cmd->cs) &&
-                       rd_scope_add_cs(scope_bos, &cmd->draw_cs) &&
-                       rd_scope_add_cs(scope_bos, &cmd->tile_store_cs) &&
-                       rd_scope_add_cs(scope_bos, &cmd->draw_epilogue_cs) &&
-                       rd_scope_add_cs(scope_bos, &cmd->sub_cs) &&
-                       rd_scope_add_cs(scope_bos, &cmd->pre_chain.draw_cs) &&
-                       rd_scope_add_cs(scope_bos, &cmd->pre_chain.draw_epilogue_cs);
-         }
+         for (uint32_t i = 0; scope_ok && i < cmdbuf_count; i++)
+            scope_ok = rd_scope_add_cmd(scope_bos, cmd_buffers[i], 0);
          util_dynarray_foreach (&dump_cmds, struct tu_cs_entry, cmd) {
             if (!scope_ok)
                break;
@@ -603,7 +619,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
             bound++;
             bound_bytes += bo->size;
          }
-         if (bo->rd_cmdbuf_cs) {
+         if (p_atomic_read(&bo->rd_cmdbuf_cs)) {
             cmdbuf++;
             cmdbuf_bytes += bo->size;
             if (scope && !_mesa_set_search(scope_bos, bo)) {

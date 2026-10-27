@@ -797,6 +797,12 @@ struct tu_cmd_buffer
    struct util_dynarray msrtss_color_temporaries;
    struct util_dynarray msrtss_depth_temporaries;
 
+   /* Secondaries executed by this command buffer, recorded only with
+    * FD_RD_DUMP so submit-scoped RD captures can include their streams.
+    */
+   struct util_dynarray rd_secondaries;
+   bool rd_secondaries_lost;
+
    uint32_t vsc_draw_strm_pitch;
    uint32_t vsc_prim_strm_pitch;
    uint32_t vsc_draw_strm_offset, vsc_draw_strm_size_offset;

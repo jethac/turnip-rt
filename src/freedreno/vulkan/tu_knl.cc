@@ -79,8 +79,8 @@ tu_bo_init_new_explicit_iova(struct tu_device *dev,
                              VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
 
    (*out_bo)->dump = flags & TU_BO_ALLOC_ALLOW_DUMP;
-   (*out_bo)->dump_bound = false;
-   (*out_bo)->rd_cmdbuf_cs = false;
+   p_atomic_set(&(*out_bo)->dump_bound, false);
+   p_atomic_set(&(*out_bo)->rd_cmdbuf_cs, false);
 
    if (!(*out_bo)->unique_id)
       (*out_bo)->unique_id = (*out_bo)->gem_handle;
