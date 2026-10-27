@@ -425,6 +425,8 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    bool u_trace_enabled = u_trace_should_process(&queue->device->trace_context);
    struct util_dynarray dump_cmds;
    struct tu_cs *autotune_cs = NULL;
+   bool rd_selected = false;
+   bool rd_bridge = false;
 
    if (vk_submit->buffer_bind_count ||
        vk_submit->image_bind_count ||
@@ -518,49 +520,91 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    }
 
    if (cmdbuf_count && FD_RD_DUMP(ENABLE) &&
-       fd_rd_output_begin(&queue->device->rd_output,
-                          queue->device->vk.current_frame, queue->device->submit_count)) {
-      struct tu_device *device = queue->device;
-      struct fd_rd_output *rd_output = &device->rd_output;
-
-      if (FD_RD_DUMP(FULL)) {
-         VkResult result = tu_queue_wait_fence(queue, queue->fence, ~0);
-         if (result != VK_SUCCESS) {
-            mesa_loge("FD_RD_DUMP_FULL: wait on previous submission for device %u and queue %d failed: %u",
-                      device->device_idx, queue->msm_queue_id, 0);
-         }
-      }
-
-      fd_rd_output_write_section(rd_output, RD_CHIP_ID, &device->physical_device->dev_id.chip_id, 8);
-      fd_rd_output_write_section(rd_output, RD_CMD, "tu-dump", 8);
-
+       fd_rd_output_select(&device->rd_output, device->vk.current_frame,
+                           device->submit_count)) {
+      struct fd_rd_output *rd = &device->rd_output;
+      rd_selected = true;
       mtx_lock(&device->bo_mutex);
+      /* Exact uncompressed section bytes, before opening any output file. */
+      uint64_t bytes = 32; /* CHIP_ID and CMD, each 8-byte header + 8 payload. */
+      bool valid = device->instance->knl->bo_map_dump &&
+                   device->instance->knl->bo_unmap_dump;
       util_dynarray_foreach (&device->dump_bo_list, struct tu_bo *, bo_ptr) {
          struct tu_bo *bo = *bo_ptr;
-         uint64_t iova = bo->iova;
-
-         uint32_t buf[3] = { iova, bo->size, iova >> 32 };
-         fd_rd_output_write_section(rd_output, RD_GPUADDR, buf, 12);
-         if (bo->dump || FD_RD_DUMP(FULL)) {
-            const VkResult result = tu_bo_map(device, bo, NULL); /* note: this would need locking to be safe */
-            if (result != VK_SUCCESS) {
-               mesa_loge("FD_RD_DUMP: failed to map BO '%s' (iova 0x%" PRIx64 ", size %" PRIu64 "): %d",
-                         bo->name ? bo->name : "<unnamed>", iova, bo->size, result);
-               continue;
+         bytes += 20; /* GPUADDR header + 12 bytes. */
+         if (bo->size > UINT32_MAX) {
+            valid = false;
+            break;
+         }
+         if (p_atomic_read(&bo->dump)) {
+            if (bo->size > INT_MAX) {
+               valid = false;
+               break;
             }
-            fd_rd_output_write_section(rd_output, RD_BUFFER_CONTENTS, bo->map, bo->size);
+            bytes += 8 + bo->size;
+         }
+         if (bytes > UINT64_C(1024) * 1024 * 1024) {
+            valid = false;
+            break;
          }
       }
-      mtx_unlock(&device->bo_mutex);
-
-      util_dynarray_foreach (&dump_cmds, struct tu_cs_entry, cmd) {
-         uint64_t iova = cmd->bo->iova + cmd->offset;
-         uint32_t size = cmd->size >> 2;
-         uint32_t buf[3] = { iova, size, iova >> 32 };
-         fd_rd_output_write_section(rd_output, RD_CMDSTREAM_ADDR, buf, 12);
+      bytes += 20 * (uint64_t)util_dynarray_num_elements(&dump_cmds, struct tu_cs_entry);
+      if (!valid) {
+         fd_rd_output_error(rd, "unsupported_backend_or_snapshot_size");
+      } else if (fd_rd_output_begin_selected(rd, device->vk.current_frame,
+                                             device->submit_count, bytes)) {
+         mesa_logi("RD_CAPTURE_BEGIN device=%p queue=%p msm_queue=%u submit=%u capture=%u bytes=%" PRIu64 " file=%s",
+                   device, queue, queue->msm_queue_id, device->submit_count,
+                   rd->captures, bytes, rd->capture_path);
+         fd_rd_output_write_section(rd, RD_CHIP_ID, &device->physical_device->dev_id.chip_id, 8);
+         fd_rd_output_write_section(rd, RD_CMD, "tu-dump", 8);
+         util_dynarray_foreach (&device->dump_bo_list, struct tu_bo *, bo_ptr) {
+            struct tu_bo *bo = *bo_ptr;
+            uint32_t buf[3] = { (uint32_t)bo->iova, (uint32_t)bo->size,
+                                (uint32_t)(bo->iova >> 32) };
+            fd_rd_output_write_section(rd, RD_GPUADDR, buf, 12);
+            if (p_atomic_read(&bo->dump) && !rd->failed) {
+               void *alias = NULL;
+               if (device->instance->knl->bo_map_dump(device, bo, &alias) != VK_SUCCESS) {
+                  fd_rd_output_error(rd, "private_map");
+                  break;
+               }
+               fd_rd_output_write_section(rd, RD_BUFFER_CONTENTS, alias, bo->size);
+               if (!device->instance->knl->bo_unmap_dump(bo, alias))
+                  fd_rd_output_error(rd, "private_unmap");
+            }
+         }
+         util_dynarray_foreach (&dump_cmds, struct tu_cs_entry, cmd) {
+            uint64_t iova = cmd->bo->iova + cmd->offset;
+            uint32_t size = cmd->size >> 2;
+            uint32_t buf[3] = { (uint32_t)iova, size, (uint32_t)(iova >> 32) };
+            fd_rd_output_write_section(rd, RD_CMDSTREAM_ADDR, buf, 12);
+         }
+         fd_rd_output_end(rd);
       }
+      mtx_unlock(&device->bo_mutex);
+   }
 
-      fd_rd_output_end(rd_output);
+   if (FD_RD_DUMP(ENABLE)) {
+      struct fd_rd_output *rd = &device->rd_output;
+      uint64_t records = 2 + util_dynarray_num_elements(&dump_cmds, struct tu_cs_entry);
+      if (rd->bridge_records <= 4194304 && records <= 4194304 - rd->bridge_records) {
+         rd->bridge_records += records;
+         rd_bridge = true;
+         uint32_t capture = rd_selected ? rd->captures : 0;
+         util_dynarray_foreach (&dump_cmds, struct tu_cs_entry, cmd) {
+            mesa_logi("RD_CAPTURE_ROOT device=%p queue=%p msm_queue=%u submit=%u capture=%u iova=0x%" PRIx64 " dwords=%u gem=%u",
+                      device, queue, queue->msm_queue_id, device->submit_count, capture,
+                      cmd->bo->iova + cmd->offset, cmd->size >> 2, cmd->bo->gem_handle);
+         }
+         mesa_logi("RD_CAPTURE_PRE_SUBMIT device=%p queue=%p msm_queue=%u submit=%u capture=%u selected=%u complete=%u file=%s",
+                   device, queue, queue->msm_queue_id, device->submit_count,
+                   capture, rd_selected, rd_selected && !rd->failed,
+                   rd_selected ? rd->capture_path : "-");
+      } else if (rd->bridge_records != UINT64_MAX) {
+         rd->bridge_records = UINT64_MAX;
+         fd_rd_output_error(rd, "bridge_record_loss");
+      }
    }
 
    util_dynarray_fini(&dump_cmds);
@@ -578,6 +622,13 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
       tu_queue_submit(queue, submit, vk_submit->waits, vk_submit->wait_count,
                       vk_submit->signals, vk_submit->signal_count,
                       u_trace_submission_data);
+   if (rd_bridge) {
+      mesa_logi("RD_CAPTURE_POST_SUBMIT device=%p queue=%p msm_queue=%u submit=%u capture=%u result=%d fence=%d fence_valid=%u file=%s",
+                device, queue, queue->msm_queue_id, device->submit_count,
+                rd_selected ? device->rd_output.captures : 0, result, queue->fence,
+                result == VK_SUCCESS,
+                rd_selected ? device->rd_output.capture_path : "-");
+   }
 
    if (result != VK_SUCCESS) {
       pthread_mutex_unlock(&device->submit_mutex);

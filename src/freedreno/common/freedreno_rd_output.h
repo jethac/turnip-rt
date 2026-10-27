@@ -39,6 +39,11 @@ fd_rd_dump_env_init(void);
 struct fd_rd_output {
    char *name;
    bool combine;
+   bool bounded, failed;
+   uint32_t captures;
+   uint64_t bridge_records;
+   uint64_t reserved_bytes, expected_bytes, written_bytes;
+   char capture_path[PATH_MAX];
    gzFile file;
 
    int trigger_fd;
@@ -50,6 +55,16 @@ struct fd_rd_output {
 
 void
 fd_rd_output_init(struct fd_rd_output *output, const char* output_name);
+
+void
+fd_rd_output_init_bounded(struct fd_rd_output *output, const char *output_name);
+bool
+fd_rd_output_select(struct fd_rd_output *output, uint32_t frame, uint32_t submit);
+bool
+fd_rd_output_begin_selected(struct fd_rd_output *output, uint32_t frame,
+                            uint32_t submit, uint64_t bytes);
+void
+fd_rd_output_error(struct fd_rd_output *output, const char *reason);
 
 void
 fd_rd_output_fini(struct fd_rd_output *output);

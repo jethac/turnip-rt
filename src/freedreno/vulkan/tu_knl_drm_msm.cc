@@ -823,6 +823,23 @@ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
    return VK_SUCCESS;
 }
 
+static VkResult
+msm_bo_map_dump(struct tu_device *dev, struct tu_bo *bo, void **map)
+{
+   uint64_t offset = tu_gem_info(dev, bo->gem_handle, MSM_INFO_GET_OFFSET);
+   if (!offset) return VK_ERROR_MEMORY_MAP_FAILED;
+   void *alias = mmap(NULL, bo->size, PROT_READ, MAP_SHARED, dev->fd, offset);
+   if (alias == MAP_FAILED) return VK_ERROR_MEMORY_MAP_FAILED;
+   *map = alias;
+   return VK_SUCCESS;
+}
+
+static bool
+msm_bo_unmap_dump(struct tu_bo *bo, void *map)
+{
+   return munmap(map, bo->size) == 0;
+}
+
 static void
 msm_bo_allow_dump(struct tu_device *dev, struct tu_bo *bo)
 {
@@ -1335,6 +1352,8 @@ static const struct tu_knl msm_knl_funcs = {
       .bo_init_dmabuf = msm_bo_init_dmabuf,
       .bo_export_dmabuf = tu_drm_export_dmabuf,
       .bo_map = msm_bo_map,
+      .bo_map_dump = msm_bo_map_dump,
+      .bo_unmap_dump = msm_bo_unmap_dump,
       .bo_allow_dump = msm_bo_allow_dump,
       .bo_finish = msm_bo_finish,
       .bo_set_metadata = msm_bo_set_metadata,

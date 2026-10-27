@@ -149,6 +149,9 @@ struct tu_knl {
    int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
    VkResult (*bo_alloc_lazy)(struct tu_device *dev, struct tu_bo *bo);
    VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
+   /* RD-only CPU alias; caller holds bo_mutex, never changes bo->map. */
+   VkResult (*bo_map_dump)(struct tu_device *dev, struct tu_bo *bo, void **map);
+   bool (*bo_unmap_dump)(struct tu_bo *bo, void *map);
    void (*bo_allow_dump)(struct tu_device *dev, struct tu_bo *bo);
    void (*bo_finish)(struct tu_device *dev, struct tu_bo *bo);
    void (*bo_set_metadata)(struct tu_device *dev, struct tu_bo *bo,

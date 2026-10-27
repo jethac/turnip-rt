@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <limits.h>
 #include <unistd.h>
 
 #include "c11/threads.h"
@@ -157,9 +159,11 @@ fd_rd_output_allowed(struct fd_rd_output *output, uint32_t frame, uint32_t submi
    return false;
 }
 
-void
-fd_rd_output_init(struct fd_rd_output *output, const char* output_name)
+static void
+fd_rd_output_init_mode(struct fd_rd_output *output, const char* output_name, bool bounded)
 {
+   memset(output, 0, sizeof(*output));
+   output->bounded = bounded;
    const char *test_name = os_get_option("FD_RD_DUMP_TESTNAME");
    ASSERTED int name_len;
    if (test_name)
@@ -174,7 +178,10 @@ fd_rd_output_init(struct fd_rd_output *output, const char* output_name)
    output->trigger_fd = -1;
    output->trigger_count = 0;
 
-   if (FD_RD_DUMP(COMBINE)) {
+   if (bounded && (!FD_RD_DUMP(TRIGGER) || FD_RD_DUMP(FULL) || FD_RD_DUMP(COMBINE)))
+      fd_rd_output_error(output, "requires_trigger_without_full_or_combine");
+
+   if (!output->failed && FD_RD_DUMP(COMBINE)) {
       output->combine = true;
 
       char file_path[PATH_MAX];
@@ -183,15 +190,36 @@ fd_rd_output_init(struct fd_rd_output *output, const char* output_name)
       output->file = gzopen(file_path, "w");
    }
 
-   if (FD_RD_DUMP(TRIGGER)) {
+   if (!output->failed && FD_RD_DUMP(TRIGGER)) {
       char file_path[PATH_MAX];
       snprintf(file_path, sizeof(file_path), "%s/%s_trigger",
                fd_rd_dump_env.output_path, output->name);
-      output->trigger_fd = open(file_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+      output->trigger_fd = open(file_path, O_RDWR | O_CREAT | (bounded ? O_EXCL : O_TRUNC), 0600);
+      if (output->trigger_fd < 0 && bounded)
+         fd_rd_output_error(output, "trigger_open");
    }
 
    fd_rd_parse_dump_range("FD_RD_DUMP_FRAMES", &output->frame_ranges);
    fd_rd_parse_dump_range("FD_RD_DUMP_SUBMITS", &output->submit_ranges);
+}
+
+void
+fd_rd_output_init(struct fd_rd_output *output, const char *name)
+{
+   fd_rd_output_init_mode(output, name, false);
+}
+
+void
+fd_rd_output_init_bounded(struct fd_rd_output *output, const char *name)
+{
+   fd_rd_output_init_mode(output, name, true);
+}
+
+void
+fd_rd_output_error(struct fd_rd_output *output, const char *reason)
+{
+   output->failed = true;
+   mesa_loge("RD_CAPTURE_ERROR name=%s reason=%s", output->name, reason);
 }
 
 void
@@ -232,17 +260,23 @@ fd_rd_output_update_trigger_count(struct fd_rd_output *output)
    if (fstat(output->trigger_fd, &stat) != 0) {
       mesa_loge("[fd_rd_output] failed to acccess the %s trigger file",
                 output->name);
+      if (output->bounded) fd_rd_output_error(output, "trigger_io");
       return;
    }
 
    if (stat.st_size == 0)
       return;
 
+   if (output->bounded && (stat.st_size < 0 || stat.st_size >= 32)) {
+      fd_rd_output_error(output, "trigger_size");
+      return;
+   }
    char trigger_data[32];
    int ret = read(output->trigger_fd, trigger_data, sizeof(trigger_data));
-   if (ret < 0) {
+   if (ret < 0 || (output->bounded && ret != stat.st_size)) {
       mesa_loge("[fd_rd_output] failed to read from the %s trigger file",
                 output->name);
+      if (output->bounded) fd_rd_output_error(output, "trigger_io");
       return;
    }
    int num_read = MIN2(ret, sizeof(trigger_data) - 1);
@@ -254,12 +288,14 @@ fd_rd_output_update_trigger_count(struct fd_rd_output *output)
    if (lseek(output->trigger_fd, 0, SEEK_SET) < 0) {
       mesa_loge("[fd_rd_output] failed to reset the %s trigger file position",
                 output->name);
+      if (output->bounded) fd_rd_output_error(output, "trigger_io");
       return;
    }
 
    if (ftruncate(output->trigger_fd, 0) < 0) {
       mesa_loge("[fd_rd_output] failed to truncate the %s trigger file",
                 output->name);
+      if (output->bounded) fd_rd_output_error(output, "trigger_io");
       return;
    }
 
@@ -269,7 +305,15 @@ fd_rd_output_update_trigger_count(struct fd_rd_output *output)
     * disable any further generation of RD dumps.
     */
    trigger_data[num_read] = '\0';
-   int32_t value = strtol(trigger_data, NULL, 0);
+   char *end = NULL;
+   errno = 0;
+   long value = strtol(trigger_data, &end, 0);
+   while (end && isspace((unsigned char)*end)) ++end;
+   if (output->bounded && (errno || end == trigger_data || !end || *end ||
+                           value < 0 || value > 8)) {
+      fd_rd_output_error(output, "trigger_must_be_0_to_8");
+      return;
+   }
 
    if (value == -1) {
       output->trigger_count = UINT_MAX;
@@ -286,12 +330,16 @@ fd_rd_output_update_trigger_count(struct fd_rd_output *output)
 }
 
 bool
-fd_rd_output_begin(struct fd_rd_output *output, uint32_t frame, uint32_t submit)
+fd_rd_output_select(struct fd_rd_output *output, uint32_t frame, uint32_t submit)
 {
    assert(output->combine ^ (output->file == NULL));
 
+   if (output->failed)
+      return false;
    if (FD_RD_DUMP(TRIGGER)) {
       fd_rd_output_update_trigger_count(output);
+      if (output->failed)
+         return false;
 
       if (output->trigger_count == 0)
          return false;
@@ -303,6 +351,44 @@ fd_rd_output_begin(struct fd_rd_output *output, uint32_t frame, uint32_t submit)
    if (!fd_rd_output_allowed(output, frame, submit))
       return false;
 
+   return true;
+}
+
+bool
+fd_rd_output_begin(struct fd_rd_output *output, uint32_t frame, uint32_t submit)
+{
+   return fd_rd_output_select(output, frame, submit) &&
+          fd_rd_output_begin_selected(output, frame, submit, 0);
+}
+
+bool
+fd_rd_output_begin_selected(struct fd_rd_output *output, uint32_t frame,
+                            uint32_t submit, uint64_t bytes)
+{
+   if (output->failed)
+      return false;
+   if (output->bounded) {
+      const uint64_t gib = UINT64_C(1024) * 1024 * 1024;
+      /* zlib compressBound plus ample gzip framing margin. */
+      uint64_t bound = bytes + (bytes >> 12) + (bytes >> 14) + (bytes >> 25) + 1024;
+      struct statvfs st;
+      if (bytes > gib || output->captures >= 8 ||
+          bound > 8 * gib - output->reserved_bytes ||
+          statvfs(fd_rd_dump_env.output_path, &st) || !st.f_frsize ||
+          st.f_bavail > UINT64_MAX / st.f_frsize) {
+         fd_rd_output_error(output, "capture_budget_or_statvfs");
+         return false;
+      }
+      uint64_t free_bytes = (uint64_t)st.f_bavail * st.f_frsize;
+      if (free_bytes < bound + 2 * gib || (!output->captures && free_bytes < 12 * gib)) {
+         fd_rd_output_error(output, "free_reserve");
+         return false;
+      }
+      output->expected_bytes = bytes;
+      output->written_bytes = 0;
+      output->reserved_bytes += bound;
+      ++output->captures;
+   }
    if (output->combine)
       return true;
 
@@ -314,10 +400,18 @@ fd_rd_output_begin(struct fd_rd_output *output, uint32_t frame, uint32_t submit)
       snprintf(file_path, sizeof(file_path), "%s/%s_submit%.5d.rd",
                fd_rd_dump_env.output_path, output->name, submit);
    }
-   output->file = gzopen(file_path, "w");
+   snprintf(output->capture_path, sizeof(output->capture_path), "%s", file_path);
+   if (output->bounded) {
+      int fd = open(file_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+      output->file = fd < 0 ? NULL : gzdopen(fd, "w");
+      if (fd >= 0 && !output->file) close(fd);
+   } else {
+      output->file = gzopen(file_path, "w");
+   }
    if (output->file == NULL) {
       mesa_loge("[fd_rd_output] failed to open %s: %s", file_path,
                 strerror(errno));
+      if (output->bounded) fd_rd_output_error(output, "capture_open");
       return false;
    }
    return true;
@@ -326,12 +420,19 @@ fd_rd_output_begin(struct fd_rd_output *output, uint32_t frame, uint32_t submit)
 static void
 fd_rd_output_write(struct fd_rd_output *output, const void *buffer, int size)
 {
+   if (output->failed) return;
+   if (output->bounded && (size < 0 || (uint64_t)size > output->expected_bytes - output->written_bytes)) {
+      fd_rd_output_error(output, "unexpected_section_size");
+      return;
+   }
+   output->written_bytes += size;
    const uint8_t *pos = (uint8_t *) buffer;
    while (size > 0) {
       int ret = gzwrite(output->file, pos, size);
       if (ret <= 0) {
          mesa_loge("[fd_rd_output] failed to write to compressed output: %s",
                    gzerror(output->file, NULL));
+         if (output->bounded) fd_rd_output_error(output, "gzip_write");
          return;
       }
       pos += ret;
@@ -361,6 +462,8 @@ fd_rd_output_end(struct fd_rd_output *output)
       return;
    }
 
-   gzclose(output->file);
+   int result = gzclose(output->file);
    output->file = NULL;
+   if (output->bounded && (result != Z_OK || output->written_bytes != output->expected_bytes))
+      fd_rd_output_error(output, "gzip_close_or_incomplete");
 }

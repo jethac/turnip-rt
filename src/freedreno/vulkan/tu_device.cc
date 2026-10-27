@@ -3376,7 +3376,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
                app_name, engine_name, device->instance->instance_idx,
                device->device_idx);
 
-      fd_rd_output_init(&device->rd_output, output_name);
+      fd_rd_output_init_bounded(&device->rd_output, output_name);
    }
 
    device->vk.cmd_dispatch_unaligned = tu_dispatch_unaligned;
