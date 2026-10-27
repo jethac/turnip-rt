@@ -43,6 +43,9 @@ bool tu_shader_upload_log_on;
 static std::atomic<uint64_t> fl_shader_records;
 static std::atomic<uint64_t> fl_suballoc_seq;
 static bool fl_calibration_on;
+static bool fl_sync_on;
+static bool fl_sampler_owner_on;
+static std::atomic<uint64_t> fl_sampler_owner_records;
 
 struct tu_free_log_as {
    uint64_t va;
@@ -72,9 +75,11 @@ fl_flush_locked(void)
    size_t off = 0;
    while (fl_fd >= 0 && off < fl_len) {
       ssize_t n = write(fl_fd, fl_buf + off, fl_len - off);
-      if (n < 0) {
-         if (errno == EINTR)
+      if (n < 0 || (n == 0 && fl_sync_on)) {
+         if (n < 0 && errno == EINTR)
             continue;
+         if (fl_sync_on)
+            mesa_loge("TU_FREE_LOG sync_write_error errno=%d pending=%zu", errno, fl_len - off);
          break;
       }
       off += n;
@@ -100,6 +105,8 @@ fl_append(const char *body, int len)
    memcpy(fl_buf + fl_len, body, len);
    fl_len += len;
    fl_buf[fl_len++] = '\n';
+   if (fl_sync_on)
+      fl_flush_locked();
    mtx_unlock(&fl_lock);
 }
 
@@ -207,6 +214,9 @@ fl_init_once(void)
       debug_get_bool_option("TU_FREE_LOG_CALIBRATION", false);
    tu_shader_upload_log_on = free_log &&
       debug_get_bool_option("TU_FREE_LOG_SHADER_UPLOAD", false);
+   fl_sync_on = free_log && debug_get_bool_option("TU_FREE_LOG_SYNC", false);
+   fl_sampler_owner_on = free_log &&
+      debug_get_bool_option("TU_FREE_LOG_SAMPLER_OWNER", false);
    tu_free_log_on = free_log;
    tu_rt_label_on = label;
 }
@@ -248,6 +258,10 @@ tu_free_log_device_init(void)
 
    fl_line("open pid=%d devices=%u so=%s so_base=0x%" PRIxPTR, (int) getpid(),
            devices, so, so_base);
+   if (fl_sync_on)
+      fl_line("free_log_config sync=1");
+   if (fl_sampler_owner_on)
+      fl_line("sampler_owner_config enabled=1 limit=1048576");
    if (tu_shader_upload_log_on)
       fl_line("shader_upload_config enabled=1 limit=65536");
    mtx_unlock(&fl_life);
@@ -611,4 +625,25 @@ tu_free_log_shader_upload(const void *shader, const struct tu_suballoc_bo *bo,
            bo->free_log_id, shader, bo->free_log_device, kind, stage, hash, binary_iova, instrlen,
            padded_bytes, constant_offset, constant_bytes, bo->iova, bo->size,
            bo->bo, bo->bo->iova, bo->bo->size, bo->bo->gem_handle);
+}
+
+/* Native Vulkan handles only: any translation-layer join requires a verified bridge. */
+void
+tu_free_log_sampler_owner(const char *event, const struct tu_device *device,
+                           uint64_t set_layout, uint64_t pipeline_layout,
+                           const void *cmd, uint32_t set, uint32_t bind_point,
+                           const struct tu_bo *bo)
+{
+   if (!fl_sampler_owner_on || !bo)
+      return;
+   uint64_t count = fl_sampler_owner_records.fetch_add(1, std::memory_order_relaxed);
+   if (count == 1048576)
+      fl_line("sampler_owner_loss reason=record_limit limit=1048576");
+   if (count >= 1048576)
+      return;
+   fl_line("sampler_owner event=%s device=%p set_layout=0x%" PRIx64
+           " pipeline_layout=0x%" PRIx64 " cmd=%p set=%u bind_point=%u"
+           " bo=%p iova=0x%" PRIx64 " size=0x%" PRIx64 " gem=%u",
+           event, device, set_layout, pipeline_layout, cmd, set, bind_point,
+           bo, bo->iova, bo->size, bo->gem_handle);
 }

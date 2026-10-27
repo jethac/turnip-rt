@@ -5282,6 +5282,11 @@ tu_bind_descriptor_buffer_embedded_samplers(
    struct tu_descriptor_set_layout *set_layout =
       layout->set[info->set].layout;
 
+   tu_free_log_sampler_owner("bind", cmd->device,
+                              (uint64_t) tu_descriptor_set_layout_to_handle(set_layout),
+                              (uint64_t) info->layout, cmd, info->set,
+                              (uint32_t) bind_point, set_layout->embedded_samplers);
+
    struct tu_descriptor_state *descriptors_state =
       tu_get_descriptors_state(cmd, bind_point);
 

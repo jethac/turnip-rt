@@ -11,6 +11,10 @@
 extern bool tu_free_log_on;
 extern bool tu_rt_label_on;
 extern bool tu_shader_upload_log_on;
+void tu_free_log_sampler_owner(const char *event, const struct tu_device *device,
+                               uint64_t set_layout, uint64_t pipeline_layout,
+                               const void *cmd, uint32_t set, uint32_t bind_point,
+                               const struct tu_bo *bo);
 struct tu_suballoc_bo;
 struct tu_suballocator;
 void tu_free_log_suballoc_alloc(struct tu_suballoc_bo *bo,

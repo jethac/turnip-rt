@@ -18,6 +18,7 @@
  */
 
 #include "tu_descriptor_set.h"
+#include "tu_free_log.h"
 
 #include "util/mesa-blake3.h"
 #include "util/format/u_format.h"
@@ -98,6 +99,9 @@ tu_descriptor_set_layout_destroy(struct vk_device *vk_dev,
    struct tu_descriptor_set_layout *layout =
       container_of(vk_layout, struct tu_descriptor_set_layout, vk);
 
+   if (layout->embedded_samplers)
+      tu_free_log_sampler_owner("destroy", dev, (uint64_t) tu_descriptor_set_layout_to_handle(layout),
+                                 0, NULL, 0, 0, layout->embedded_samplers);
    if (layout->embedded_samplers)
       tu_bo_finish(dev, layout->embedded_samplers);
    vk_descriptor_set_layout_destroy(vk_dev, vk_layout);
@@ -331,6 +335,8 @@ tu_CreateDescriptorSetLayout(
    }
 
    *pSetLayout = tu_descriptor_set_layout_to_handle(set_layout);
+   tu_free_log_sampler_owner("create", device, (uint64_t) *pSetLayout,
+                              0, NULL, 0, 0, set_layout->embedded_samplers);
 
    return VK_SUCCESS;
 }
@@ -593,6 +599,14 @@ tu_CreatePipelineLayout(VkDevice _device,
    tu_pipeline_layout_init(layout);
 
    *pPipelineLayout = tu_pipeline_layout_to_handle(layout);
+   for (uint32_t set = 0; set < layout->num_sets; set++) {
+      struct tu_descriptor_set_layout *sl = layout->set[set].layout;
+      if (sl)
+         tu_free_log_sampler_owner("pipeline_create", device,
+                                    (uint64_t) tu_descriptor_set_layout_to_handle(sl),
+                                    (uint64_t) *pPipelineLayout, NULL, set, 0,
+                                    sl->embedded_samplers);
+   }
 
    return VK_SUCCESS;
 }
@@ -609,6 +623,11 @@ tu_DestroyPipelineLayout(VkDevice _device,
       return;
 
    for (uint32_t i = 0; i < pipeline_layout->num_sets; i++) {
+      if (pipeline_layout->set[i].layout)
+         tu_free_log_sampler_owner("pipeline_destroy", device,
+                                    (uint64_t) tu_descriptor_set_layout_to_handle(pipeline_layout->set[i].layout),
+                                    (uint64_t) _pipelineLayout, NULL, i, 0,
+                                    pipeline_layout->set[i].layout->embedded_samplers);
       if (pipeline_layout->set[i].layout)
          vk_descriptor_set_layout_unref(&device->vk, &pipeline_layout->set[i].layout->vk);
    }
