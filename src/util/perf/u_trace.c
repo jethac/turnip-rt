@@ -24,6 +24,8 @@
 #include "u_trace.h"
 
 #include <inttypes.h>
+#include <stdarg.h>
+#include <stdlib.h>
 
 #include "util/detect_os.h"
 #include "util/list.h"
@@ -31,6 +33,47 @@
 #include "util/u_call_once.h"
 #include "util/u_debug.h"
 #include "util/u_vector.h"
+
+void
+u_trace_printf_json(FILE *out, const char *format, ...)
+{
+   char local[1024], *text = local;
+   va_list ap, copy;
+   va_start(ap, format);
+   va_copy(copy, ap);
+   int len = vsnprintf(local, sizeof(local), format, ap);
+   va_end(ap);
+   if (len >= (int)sizeof(local)) {
+      size_t size = (size_t)len + 1;
+      text = malloc(size);
+      len = text ? vsnprintf(text, size, format, copy) : -1;
+      if (len >= 0 && (size_t)len >= size)
+         len = -1;
+   }
+   va_end(copy);
+   if (len < 0) {
+      if (text != local)
+         free(text);
+      fputs("null", out);
+      return;
+   }
+
+   fputc('"', out);
+   for (int i = 0; i < len; i++) {
+      unsigned char c = text[i];
+      if (c == '"' || c == '\\') {
+         fputc('\\', out);
+         fputc(c, out);
+      } else if (c < 0x20) {
+         fprintf(out, "\\u%04x", c);
+      } else {
+         fputc(c, out);
+      }
+   }
+   fputc('"', out);
+   if (text != local)
+      free(text);
+}
 
 #if DETECT_OS_WINDOWS
 #include <windows.h>

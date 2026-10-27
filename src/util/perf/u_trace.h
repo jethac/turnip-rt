@@ -46,6 +46,9 @@
 extern "C" {
 #endif
 
+/* Emit one formatted, JSON-escaped string value (including quotes). */
+void u_trace_printf_json(FILE *out, const char *format, ...) PRINTFLIKE(2, 3);
+
 /* A trace mechanism (very) loosely inspired by the linux kernel tracepoint
  * mechanism, in that it allows for defining driver specific (or common)
  * tracepoints, which generate 'trace_$name()' functions that can be

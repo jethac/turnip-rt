@@ -505,6 +505,29 @@ static void ${func_name}${trace_name}(FILE *out, const void *arg, const void *in
    __typeof__(${arg.value_expr("__entry", backend=backend)}) __free_${arg.name} =
        ${arg.value_expr("__entry", backend=backend)};
   % endfor
+  % if backend == 'U_TRACE_BACKEND_JSON':
+   % if trace.tp_print_custom is not None:
+   fputs("\\"unstructured\\": ", out);
+   u_trace_printf_json(out, "${trace.tp_print_custom[0]}"
+    % for arg in trace.tp_print_custom[1:]:
+           , ${arg}
+    % endfor
+   );
+   % else:
+    % for arg in trace.tp_print:
+   fputs("\\"${arg.name}\\": ", out);
+   u_trace_printf_json(out, "${arg.c_format}",
+     % if arg.free_prim_type_func is not None:
+                       __free_${arg.name});
+     % else:
+                       ${arg.value_expr("__entry", backend=backend)});
+     % endif
+     % if arg != trace.tp_print[-1]:
+   fputs(", ", out);
+     % endif
+    % endfor
+   % endif
+  % else:
   % if trace.tp_print_custom is not None:
    fprintf(out, ${caller.tp_print_custom_fmt()}
    % for arg in trace.tp_print_custom[1:]:
@@ -521,6 +544,7 @@ static void ${func_name}${trace_name}(FILE *out, const void *arg, const void *in
    % endfor
   % endif
    );
+  % endif
   % for arg in trace.args_to_free():
    ${arg.free_prim_type_func}(__free_${arg.name});
   % endfor
