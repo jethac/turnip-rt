@@ -805,6 +805,12 @@ u_trace_context_fini(struct u_trace_context *utctx)
    simple_mtx_unlock(&ctx_list_mutex);
 #endif
 
+   /* Drain queued flushes first: they print to utctx->out and read
+    * dummy_indirect_data, begin_tracepoints and tracepoint_ranges.
+    */
+   if (utctx->queue.jobs)
+      util_queue_finish(&utctx->queue);
+
    util_dynarray_fini(&utctx->begin_tracepoints);
    _mesa_hash_table_fini(&utctx->tracepoint_ranges, free_tracepoint_ranges_entry);
 
