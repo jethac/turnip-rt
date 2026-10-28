@@ -558,13 +558,21 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
 
       submit_add_entries(device, submit, &dump_cmds, cs->entries,
                          cs->entry_count);
+   }
 
-      if (u_trace_submission_data &&
-          u_trace_submission_data->timestamp_copy_data) {
-         struct tu_cs *cs = &u_trace_submission_data->timestamp_copy_data->cs;
-         submit_add_entries(device, submit, &dump_cmds, cs->entries,
-                            cs->entry_count);
-      }
+   /* The timestamp-copy stream (WFI + CP_WAIT_FOR_ME + copies of every
+    * reusable command buffer's timestamps in this submission) was built once
+    * for the whole submission by tu_create_copy_timestamp_cs(). Emitting it
+    * after each command buffer re-ran the full copy and its idle waits N
+    * times; only the final execution's values survive anyway. Emit it once,
+    * after all command buffers. Tracing-only: untraced submissions never
+    * create timestamp_copy_data, so their command streams are unchanged.
+    */
+   if (u_trace_submission_data &&
+       u_trace_submission_data->timestamp_copy_data) {
+      struct tu_cs *cs = &u_trace_submission_data->timestamp_copy_data->cs;
+      submit_add_entries(device, submit, &dump_cmds, cs->entries,
+                         cs->entry_count);
    }
 
    autotune_cs = device->autotune->on_submit(cmd_buffers, cmdbuf_count);
