@@ -33,6 +33,7 @@ struct tu_gaze_shm {
 #define TU_GAZE_MODE_P3_HMD_PROJ 3u
 #define TU_GAZE_FLAG_SACCADE (1u << 7)
 #define TU_GAZE_FLAG_EYE0_NONE (1u << 11)
+#define TU_GAZE_FLAG_SAMPLE_FROZEN (1u << 14)
 
 struct tu_gaze_shm_v2 {
    struct tu_gaze_shm v1;
