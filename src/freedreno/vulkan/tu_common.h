@@ -231,6 +231,7 @@ struct tu_suballoc_bo;
 struct tu_suballocator;
 struct tu_subpass;
 struct tu_u_trace_submission_data;
+struct tu_trace_pc;
 
 /* Helper for iterating over layers of an attachment that handles both
  * multiview and layered rendering cases.

@@ -430,7 +430,14 @@ print_json_event(struct u_trace_context *utctx,
    fprintf(utctx->out, "\"params\": {");
    if (evt->tp->print)
       evt->tp->print_json(utctx->out, evt->payload, indirect);
-   fprintf(utctx->out, "}\n}\n");
+   fprintf(utctx->out, "}");
+   if (utctx->json_event_extra)
+      utctx->json_event_extra(utctx, utctx->out, evt->tp->name,
+                              utctx->json_event_ts_buffer,
+                              utctx->json_event_ts_offset,
+                              utctx->json_event_flush_data,
+                              utctx->event_nr == 0);
+   fprintf(utctx->out, "\n}\n");
 }
 
 static struct u_trace_printer json_printer = {
@@ -699,6 +706,10 @@ u_trace_context_init(struct u_trace_context *utctx,
    utctx->start_of_frame = true;
 
    utctx->dummy_indirect_data = calloc(1, max_indirect_size_bytes);
+   utctx->json_event_extra = NULL;
+   utctx->json_event_ts_buffer = NULL;
+   utctx->json_event_ts_offset = 0;
+   utctx->json_event_flush_data = NULL;
 
    util_dynarray_init(&utctx->flushed_traces, NULL);
 
@@ -1072,6 +1083,12 @@ process_flush(void *job, void *gdata, int thread_index)
       }
 
       if (utctx->out) {
+         if (utctx->json_event_extra) {
+            utctx->json_event_ts_buffer =
+               u_trace_buffer_view_get_buffer(ut, u_trace_buffer_list_timestamps, event->timestamp);
+            utctx->json_event_ts_offset = event->timestamp.offset;
+            utctx->json_event_flush_data = flush->flush_data;
+         }
          simple_mtx_lock(&shared_out_mtx);
          utctx->out_printer->event(utctx, event, timestamp, delta, indirect_data);
          simple_mtx_unlock(&shared_out_mtx);
@@ -1222,7 +1239,7 @@ alloc_device_memory(struct u_trace *ut, enum u_trace_buffer_list_index list_inde
 
    uint32_t min_size = TIMESTAMP_BUF_SIZE;
    if (list_index == u_trace_buffer_list_timestamps)
-      min_size *= ut->utctx->timestamp_size_bytes;
+      min_size = MIN2(min_size * ut->utctx->timestamp_size_bytes, 128 * 1024);
    else
       min_size *= ut->utctx->max_indirect_size_bytes;
 

@@ -494,6 +494,9 @@ struct tu_device
 
    struct fd_perfcntr_state *perfcntrs;
 
+   /* TU_TRACE_PERFCNTRS state, NULL when the knob is unset. */
+   struct tu_trace_pc *trace_pc;
+
    struct tu_autotune *autotune;
 
    struct breadcrumbs_context *breadcrumbs_ctx;
@@ -737,6 +740,9 @@ struct tu_u_trace_submission_data
    void *mem_ctx;
    struct u_trace **trace_per_cmd_buffer;
    struct tu_copy_timestamp_data *timestamp_copy_data;
+
+   /* TU_TRACE_PERFCNTRS set programmed for this submission. */
+   uint32_t trace_pc_set;
 
    /* GPU time is reset on GPU power cycle and the GPU time
     * offset may change between submissions due to power cycle.

@@ -48,6 +48,7 @@
 #include "tu_query_pool.h"
 #include "tu_queue.h"
 #include "tu_rmv.h"
+#include "tu_trace_perfcntr.h"
 #include "tu_tracepoints.h"
 #include "tu_wsi.h"
 
@@ -2386,6 +2387,11 @@ tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
 {
    struct tu_suballoc_bo *bo = static_cast<struct tu_suballoc_bo *>(timestamps);
    struct tu_cs *ts_cs = static_cast<struct tu_cs *>(cs);
+   struct tu_device *device =
+      container_of(ut->utctx, struct tu_device, trace_context);
+
+   if (device->trace_pc)
+      tu_trace_pc_emit_snapshot(device, ts_cs, bo->iova + offset_B);
 
    if (CHIP == A6XX) {
       tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE, 4);
@@ -3449,8 +3455,10 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    device->submit_count = 0;
    list_inithead(&device->copy_timestamp_cs_pool);
+   if (tu_trace_pc_init(device) != VK_SUCCESS)
+      mesa_loge("TU_TRACE_PERFCNTRS: out of memory, counter capture disabled");
    u_trace_context_init(&device->trace_context, device,
-                     sizeof(uint64_t),
+                     tu_trace_pc_slot_bytes(device),
                      12,
                      tu_trace_create_buffer,
                      tu_trace_destroy_buffer,
@@ -3459,6 +3467,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
                      tu_trace_capture_data,
                      tu_trace_get_data,
                      tu_trace_delete_flush_data);
+   tu_trace_pc_install_printer(device);
 
    tu_breadcrumbs_init(device);
 
@@ -3500,6 +3509,7 @@ fail_timeline_cond:
 fail_QCTDD09112208_cmdbuf_start_cs:
 fail_bin_preamble:
 fail_autotune:
+   tu_trace_pc_finish(device);
    delete device->autotune;
    fd_perfcntr_state_free(device->perfcntrs);
 fail_prepare_perfcntrs_pass_cs:
@@ -3566,6 +3576,7 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    tu_breadcrumbs_finish(device);
 
    u_trace_context_fini(&device->trace_context);
+   tu_trace_pc_finish(device);
 
    for (unsigned f = 0; f < TU_MAX_QUEUE_FAMILIES; f++) {
       for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos[f]); i++) {

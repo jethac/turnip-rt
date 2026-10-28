@@ -307,6 +307,19 @@ struct u_trace_context {
 
    void *dummy_indirect_data;
 
+   /* Optional driver hook, NULL unless the driver installs it after
+    * u_trace_context_init(). When set, the JSON printer calls it after each
+    * event's "params" object with the event's timestamp slot, so the driver
+    * can print extra members that live in the same slot.
+    */
+   void (*json_event_extra)(struct u_trace_context *utctx, FILE *out,
+                            const char *tp_name, void *timestamps,
+                            uint64_t offset_B, void *flush_data,
+                            bool first_in_batch);
+   void *json_event_ts_buffer;
+   uint64_t json_event_ts_offset;
+   void *json_event_flush_data;
+
    /* list of unprocessed trace chunks in fifo order: */
    struct util_dynarray flushed_traces;
 };
