@@ -338,6 +338,13 @@ tu_free_log_config(bool epw_broad, bool cs_isz_wa, uint32_t cs_isz_restore)
 }
 
 void
+tu_free_log_tail_pad_config(uint32_t pipeline_tail_pad)
+{
+   fl_line("cfg_tail_pad pipeline_suballoc=0x%x global=0x%x",
+           pipeline_tail_pad, pipeline_tail_pad);
+}
+
+void
 tu_free_log_cs_trim(const char *name, const char *reason, uint32_t bo_count,
                     uint64_t retained_bytes, uint64_t used_bytes,
                     uint64_t next_bytes)

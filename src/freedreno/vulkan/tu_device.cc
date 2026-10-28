@@ -3056,6 +3056,35 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
                          device->cs_isz_wa, device->cs_isz_restore);
    }
 
+   /* On a7xx the SP's own instruction fetch (reported as UCHE) has been
+    * observed reading past the end of a small fragment shader, anchored at
+    * SP_xS_BASE and reaching up to ~0x2000 bytes from the shader start (the
+    * fetch is bounded by an SP_PS_INSTR_SIZE that can come from another
+    * register context, see the instrlen workaround in tu_dispatch and
+    * mesa#5892).  Shaders are packed flush against the end of their
+    * pipeline_suballoc BO, and in VM_BIND mode the VA after a BO can be
+    * unmapped at any moment by an unrelated BO free, so such a read can fault
+    * with READ TRANSLATION.  Keep a mapped tail after the last allocation of
+    * every shader-holding BO.  Default 16 KiB (2x the largest reach measured
+    * on FD750); TU_PIPELINE_TAIL_PAD=0 restores the old packing.  This
+    * changes only BO sizes and suballocation placement, never the emitted
+    * commands.
+    */
+   {
+      const uint64_t tail_pad_default = 16 * 1024;
+      int64_t tail_pad_opt =
+         debug_get_num_option("TU_PIPELINE_TAIL_PAD", tail_pad_default);
+      uint64_t tail_pad = CLAMP(tail_pad_opt, 0, 1024 * 1024);
+      device->pipeline_tail_pad =
+         (uint32_t) align64(tail_pad, MAX2(os_page_size, 1));
+      if (device->pipeline_tail_pad != tail_pad_default) {
+         mesa_logi("tu: TU_PIPELINE_TAIL_PAD=0x%x",
+                   device->pipeline_tail_pad);
+      }
+      if (unlikely(tu_free_log_on))
+         tu_free_log_tail_pad_config(device->pipeline_tail_pad);
+   }
+
    device->vk.command_buffer_ops = &tu_cmd_buffer_ops;
    device->vk.as_build_ops = &tu_as_build_ops;
    device->vk.check_status = tu_device_check_status;
@@ -3222,6 +3251,12 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    if (device->vk.enabled_features.customBorderColors)
       global_size += TU_BORDER_COLOR_COUNT * sizeof(struct bcolor_entry);
 
+   /* global_bo starts with the builtin clear/blit shaders; keep the same
+    * mapped tail after it as after pipeline_suballoc BOs.  Appended after
+    * every field, so no offset inside global_bo changes.
+    */
+   global_size += device->pipeline_tail_pad;
+
    tu_bo_suballocator_init(
       &device->pipeline_suballoc, device, 128 * 1024,
       static_cast<enum tu_bo_alloc_flags>(TU_BO_ALLOC_GPU_READ_ONLY |
@@ -3229,6 +3264,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
                                           TU_BO_ALLOC_INTERNAL_RESOURCE |
                                           tu_bo_ib_flags(device)),
       "pipeline_suballoc");
+   device->pipeline_suballoc.tail_pad = device->pipeline_tail_pad;
    if (is_kgsl(physical_device->instance)) {
       tu_bo_suballocator_init(&device->kgsl_profiling_suballoc, device,
                               128 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE,

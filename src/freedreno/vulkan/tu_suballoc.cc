@@ -34,6 +34,7 @@ tu_bo_suballocator_init(struct tu_suballocator *suballoc,
 {
    suballoc->dev = dev;
    suballoc->default_size = default_size;
+   suballoc->tail_pad = 0;
    suballoc->flags = flags;
    suballoc->bo = NULL;
    suballoc->cached_bo = NULL;
@@ -57,7 +58,7 @@ tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
    struct tu_bo *bo = suballoc->bo;
    if (bo) {
       uint32_t offset = align(suballoc->next_offset, alignment);
-      if (offset + size <= bo->size) {
+      if ((uint64_t) offset + size + suballoc->tail_pad <= bo->size) {
          suballoc_bo->bo = tu_bo_get_ref(bo);
          suballoc_bo->iova = bo->iova + offset;
          suballoc_bo->size = size;
@@ -71,7 +72,10 @@ tu_suballoc_bo_alloc(struct tu_suballoc_bo *suballoc_bo,
       }
    }
 
-   uint32_t alloc_size = MAX2(size, suballoc->default_size);
+   /* The tail pad is part of the BO, so the first suballocation of a fresh
+    * (or recycled) BO also ends at least tail_pad bytes before its end.
+    */
+   uint32_t alloc_size = MAX2(size, suballoc->default_size) + suballoc->tail_pad;
 
    /* Reuse a recycled suballoc BO if we have one and it's big enough, otherwise free it. */
    if (suballoc->cached_bo) {

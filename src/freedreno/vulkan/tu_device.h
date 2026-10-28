@@ -378,6 +378,10 @@ struct tu_device
 
    bool cs_isz_wa;
    uint32_t cs_isz_restore;
+   /* Mapped, never-allocated bytes kept at the end of every
+    * pipeline_suballoc BO and of global_bo (TU_PIPELINE_TAIL_PAD).
+    */
+   uint32_t pipeline_tail_pad;
 
    /* KGSL requires a small chunk of GPU mem to retrieve raw GPU time on
     * each submission.

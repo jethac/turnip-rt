@@ -39,6 +39,7 @@ void tu_free_log_bo_alloc(struct tu_bo *bo, uint32_t flags, const char *name);
 void tu_free_log_bo_free(const struct tu_bo *bo);
 void tu_free_log_config(bool epw_broad, bool cs_isz_wa,
                         uint32_t cs_isz_restore);
+void tu_free_log_tail_pad_config(uint32_t pipeline_tail_pad);
 void tu_free_log_cs_trim(const char *name, const char *reason,
                          uint32_t bo_count, uint64_t retained_bytes,
                          uint64_t used_bytes, uint64_t next_bytes);

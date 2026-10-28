@@ -20,6 +20,11 @@ struct tu_suballocator
    struct tu_device *dev;
 
    uint32_t default_size;
+   /* Bytes kept unallocated (but mapped, since they are part of the BO) at
+    * the end of every BO of this suballocator, so a GPU read that runs past
+    * the end of the last suballocation still hits mapped memory.  0 = none.
+    */
+   uint32_t tail_pad;
    enum tu_bo_alloc_flags flags;
 
    /** Current BO we're suballocating out of. */
