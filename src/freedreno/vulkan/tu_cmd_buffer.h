@@ -720,6 +720,33 @@ struct tu_cb_control_point {
    uint32_t original_value;
 };
 
+/* TU_LPAC_COMPUTE: why an LPAC-family command buffer has to run on the BR
+ * fallback ring. NONE must stay first (zero).
+ */
+#define TU_LPAC_GFX_REASONS(X)                     \
+   X(NONE, "none")                                 \
+   X(COPY, "copy")                                 \
+   X(FILL_UPDATE, "fill_update")                   \
+   X(CLEAR, "clear")                               \
+   X(BLIT_RESOLVE, "blit_resolve")                 \
+   X(EVENT, "set_reset_event")                     \
+   X(QUERY, "begin_end_query")                     \
+   X(MARKER, "buffer_marker")                      \
+   X(COND_RENDER, "conditional_rendering")         \
+   X(UNALIGNED_DISPATCH, "unaligned_dispatch")     \
+   X(TRACE_RAYS, "trace_rays")                     \
+   X(CS_ISZ, "cs_isz_workaround")                  \
+   X(SECONDARY, "secondary")                       \
+   X(PERF_PASS, "perf_pass")                       \
+   X(AUTOTUNE, "autotune")
+
+enum tu_lpac_gfx_reason {
+#define TU_LPAC_REASON_ENUM(e, s) TU_LPAC_GFX_REASON_##e,
+   TU_LPAC_GFX_REASONS(TU_LPAC_REASON_ENUM)
+#undef TU_LPAC_REASON_ENUM
+   TU_LPAC_GFX_REASON_COUNT,
+};
+
 struct tu_cmd_buffer
 {
    struct vk_command_buffer vk;
@@ -843,6 +870,17 @@ struct tu_cmd_buffer
    bool vsc_initialized;
 
    bool prev_fsr_is_null;
+
+   /* TU_LPAC_COMPUTE only (all false/NONE otherwise):
+    * lpac_family: pool's family is backed by the LPAC ring.
+    * lpac_rec: still recording in LPAC mode (LPAC-subset flushes). Cleared
+    *    at the first command LPAC cannot execute; recording continues in
+    *    normal BR mode and the batch is routed to the BR fallback ring.
+    * lpac_gfx_reason: first such command (NONE = runs on LPAC).
+    */
+   bool lpac_family;
+   bool lpac_rec;
+   enum tu_lpac_gfx_reason lpac_gfx_reason;
 };
 
 struct vk_device_dispatch_table;
@@ -1118,5 +1156,23 @@ tu_fdm_num_layers(const struct tu_cmd_buffer *cmd)
    return cmd->state.pass->num_views ? cmd->state.pass->num_views : 
       (cmd->state.fdm_per_layer ? cmd->state.framebuffer->layers : 1);
 }
+
+/* TU_LPAC_COMPUTE: the command being recorded needs BR (graphics) hardware.
+ * Must be called before the command emits anything. No-op unless the
+ * buffer belongs to the LPAC-backed family.
+ */
+void
+tu_lpac_require_gfx_slow(struct tu_cmd_buffer *cmd,
+                         enum tu_lpac_gfx_reason reason);
+
+static inline void
+tu_lpac_require_gfx(struct tu_cmd_buffer *cmd, enum tu_lpac_gfx_reason reason)
+{
+   if (unlikely(cmd->lpac_family))
+      tu_lpac_require_gfx_slow(cmd, reason);
+}
+
+const char *
+tu_lpac_gfx_reason_name(enum tu_lpac_gfx_reason reason);
 
 #endif /* TU_CMD_BUFFER_H */

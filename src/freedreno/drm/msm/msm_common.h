@@ -292,6 +292,27 @@ msm_common_has_preemption(int fd, uint32_t priority)
    return true;
 }
 
+/* Opens and closes an LPAC (concurrent compute-only CP) submitqueue. Only
+ * kernels carrying the LPAC submitqueue series accept the flag.
+ */
+static inline bool
+msm_common_has_lpac(int fd, uint32_t extra_flags)
+{
+   struct drm_msm_submitqueue req = {
+      .flags = MSM_SUBMITQUEUE_LPAC | extra_flags,
+      .prio = 0,
+   };
+
+   int ret =
+      drmCommandWriteRead(fd, DRM_MSM_SUBMITQUEUE_NEW, &req, sizeof(req));
+   if (ret)
+      return false;
+
+   drmCommandWrite(fd, DRM_MSM_SUBMITQUEUE_CLOSE, &req.id, sizeof(req.id));
+
+   return true;
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -471,6 +471,66 @@ tu6_emit_flushes(struct tu_cmd_buffer *cmd_buffer,
       tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
 }
 
+/* TU_LPAC_COMPUTE: the cache-maintenance subset valid on the LPAC CP, from
+ * MR !39889. LPAC has no CCU/RB/blit cache and no BV, so CCU, blit-cache,
+ * subpass-fence and wait-for-BR requests are dropped; compute reads and
+ * writes go through UCHE/CCHE. Requests for CCU flushes can only come from
+ * barriers naming graphics/transfer accesses, which an LPAC-mode buffer never
+ * executes itself (those commands switch it to BR mode first); cross-queue
+ * visibility of another queue's CCU writes is that queue's end-of-buffer
+ * CCU clean.
+ */
+template <chip CHIP>
+static void
+tu6_emit_flushes_lpac(struct tu_cmd_buffer *cmd_buffer,
+                      struct tu_cs *cs,
+                      struct tu_cache_state *cache)
+{
+   BITMASK_ENUM(tu_cmd_flush_bits) flushes = cache->flush_bits;
+   cache->flush_bits = 0;
+
+   if (TU_DEBUG(FLUSHALL))
+      flushes |= TU_CMD_FLAG_ALL_CLEAN | TU_CMD_FLAG_ALL_INVALIDATE;
+
+   if (TU_DEBUG(SYNCDRAW))
+      flushes |= TU_CMD_FLAG_WAIT_MEM_WRITES |
+                 TU_CMD_FLAG_WAIT_FOR_IDLE |
+                 TU_CMD_FLAG_WAIT_FOR_ME;
+
+   if (flushes & TU_CMD_FLAG_CACHE_CLEAN)
+      tu_emit_event_write<CHIP>(cmd_buffer, cs, FD_CACHE_CLEAN);
+   if (flushes & TU_CMD_FLAG_CACHE_INVALIDATE)
+      tu_emit_event_write<CHIP>(cmd_buffer, cs, FD_CACHE_INVALIDATE);
+   if (flushes & TU_CMD_FLAG_BINDLESS_DESCRIPTOR_INVALIDATE) {
+      /* Compute bits only: never touch graphics state from LPAC. */
+      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
+            .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
+      ));
+      tu_cs_emit_regs(cs, A6XX_SP_CS_BINDLESS_INVALIDATE(1));
+   }
+   if (CHIP >= A7XX && (flushes & TU_CMD_FLAG_CCHE_INVALIDATE) &&
+       /* Invalidating UCHE seems to also invalidate CCHE */
+       !(flushes & TU_CMD_FLAG_CACHE_INVALIDATE)) {
+      /* CP_CCHE_INVALIDATE is just a plain register write underneath, so
+       * it needs WFI before it, in order to invalidate at the right point.
+       */
+      tu_cs_emit_wfi(cs);
+      tu_cs_emit_pkt7(cs, CP_CCHE_INVALIDATE, 0);
+   }
+   /* The RT workaround is specified as a BR/BV/LPAC critical section
+    * (adreno_pm4.xml CP_SET_MARKER RT_WA_START/END).
+    */
+   if (CHIP == A7XX && (flushes & TU_CMD_FLAG_RTU_INVALIDATE) &&
+       cmd_buffer->device->physical_device->info->props.has_rt_workaround)
+      tu_emit_rt_workaround<CHIP>(cmd_buffer, cs);
+   if (flushes & TU_CMD_FLAG_WAIT_MEM_WRITES)
+      tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+   if (flushes & TU_CMD_FLAG_WAIT_FOR_IDLE)
+      tu_cs_emit_wfi(cs);
+   if (flushes & TU_CMD_FLAG_WAIT_FOR_ME)
+      tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+}
+
 static void
 tu7_write_onchip_val(struct tu_cs *cs, enum tu_onchip_addr addr,
                      uint32_t val)
@@ -557,6 +617,11 @@ tu_emit_cache_flush(struct tu_cmd_buffer *cmd_buffer)
    struct tu_cs *cs = &cmd_buffer->cs;
    struct tu_cache_state *cache = &cmd_buffer->state.cache;
    BITMASK_ENUM(tu_cmd_flush_bits) flushes = cache->flush_bits;
+
+   if (unlikely(cmd_buffer->lpac_rec)) {
+      tu6_emit_flushes_lpac<CHIP>(cmd_buffer, cs, cache);
+      return;
+   }
 
    tu6_emit_flushes<CHIP>(cmd_buffer, cs, cache);
 
@@ -2310,6 +2375,43 @@ tu_emit_early_preamble_workaround(struct tu_cs *cs, bool static_regs)
    tu_cs_emit_regs(cs, A6XX_SP_PS_CNTL_0());
 }
 
+/* Value BR programs for a raw magic register (shared with the LPAC init so
+ * both CPs write identical values).
+ */
+static uint32_t
+tu6_magic_reg_value(const struct tu_device *dev, uint32_t reg, uint32_t value)
+{
+   const struct tu_physical_device *phys_dev = dev->physical_device;
+
+   switch(reg) {
+      case REG_A6XX_TPL1_DBG_ECO_CNTL:
+         value = (value & ~A6XX_TPL1_DBG_ECO_CNTL_LINEAR_MIPMAP_FALLBACK_IN_BLOCKS) |
+                 (phys_dev->info->props.supports_linear_mipmap_threshold_in_blocks
+                     ? A6XX_TPL1_DBG_ECO_CNTL_LINEAR_MIPMAP_FALLBACK_IN_BLOCKS
+                     : 0);
+         break;
+      case REG_A6XX_TPL1_DBG_ECO_CNTL1:
+         value = (value & ~A6XX_TPL1_DBG_ECO_CNTL1_TP_UBWC_FLAG_HINT) |
+                 (phys_dev->info->props.enable_tp_ubwc_flag_hint
+                     ? A6XX_TPL1_DBG_ECO_CNTL1_TP_UBWC_FLAG_HINT
+                     : 0);
+         break;
+      case REG_A6XX_SP_CHICKEN_BITS:
+         value = (value & ~A6XX_SP_CHICKEN_BITS_EOLM_ENABLE) |
+                 (phys_dev->info->props.has_eolm_eogm
+                     ? A6XX_SP_CHICKEN_BITS_EOLM_ENABLE
+                     : 0);
+         break;
+      case REG_A7XX_SP_CHICKEN_BITS_2:
+         if (phys_dev->info->props.has_independent_icache_miss &&
+             dev->instance->drirc.perf.independent_icache_miss)
+            value |= A7XX_SP_CHICKEN_BITS_2_INDEPENDENT_ICACHE_MISS;
+         break;
+   }
+
+   return value;
+}
+
 template <chip CHIP>
 static void
 tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
@@ -2345,34 +2447,9 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
       if (!magic_reg.reg)
          break;
 
-      uint32_t value = magic_reg.value;
-      switch(magic_reg.reg) {
-         case REG_A6XX_TPL1_DBG_ECO_CNTL:
-            value = (value & ~A6XX_TPL1_DBG_ECO_CNTL_LINEAR_MIPMAP_FALLBACK_IN_BLOCKS) |
-                    (phys_dev->info->props.supports_linear_mipmap_threshold_in_blocks
-                        ? A6XX_TPL1_DBG_ECO_CNTL_LINEAR_MIPMAP_FALLBACK_IN_BLOCKS
-                        : 0);
-            break;
-         case REG_A6XX_TPL1_DBG_ECO_CNTL1:
-            value = (value & ~A6XX_TPL1_DBG_ECO_CNTL1_TP_UBWC_FLAG_HINT) |
-                    (phys_dev->info->props.enable_tp_ubwc_flag_hint
-                        ? A6XX_TPL1_DBG_ECO_CNTL1_TP_UBWC_FLAG_HINT
-                        : 0);
-            break;
-         case REG_A6XX_SP_CHICKEN_BITS:
-            value = (value & ~A6XX_SP_CHICKEN_BITS_EOLM_ENABLE) |
-                    (phys_dev->info->props.has_eolm_eogm
-                        ? A6XX_SP_CHICKEN_BITS_EOLM_ENABLE
-                        : 0);
-            break;
-         case REG_A7XX_SP_CHICKEN_BITS_2:
-            if (phys_dev->info->props.has_independent_icache_miss &&
-                dev->instance->drirc.perf.independent_icache_miss)
-               value |= A7XX_SP_CHICKEN_BITS_2_INDEPENDENT_ICACHE_MISS;
-            break;
-      }
-
-      tu_cs_emit_write_reg(cs, magic_reg.reg, value);
+      tu_cs_emit_write_reg(cs, magic_reg.reg,
+                           tu6_magic_reg_value(dev, magic_reg.reg,
+                                               magic_reg.value));
    }
 
    if (dev->physical_device->info->props.has_attachment_shading_rate) {
@@ -2507,6 +2584,138 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
    ));
 }
 
+/* TU_LPAC_INIT=mr: emit MR !39889's LPAC init verbatim. Default ("safe"),
+ * on the principle "never write a register from LPAC with a value BR or
+ * the kernel would not also write", since banking of these registers per
+ * CP is unknown and LPAC runs concurrently with BR:
+ *  - drop MR's writes of BR-visible SP/RB chicken registers with values
+ *    that differ from BR's (SP_CHICKEN_BITS=0, SP_CHICKEN_BITS_3 |=
+ *    BIT(10), RB_CMP_DBG_ECO_CNTL=BIT(19));
+ *  - drop SP_LPAC_CHICKEN_BITS_2 (0xaf84) = 0: the kernel sets BIT(4) at
+ *    hw_init when LPAC exists;
+ *  - drop the UCHE magic writes (UCHE is one shared block; BR and the
+ *    kernel program it);
+ *  - SP_UPDATE_CNTL with compute bits only;
+ *  - add the compute-relevant static state BR sets that MR omits, with
+ *    BR's exact values (TPL1_DBG_ECO_CNTL/_CNTL1, bicubic weights,
+ *    SP_NC_MODE_CNTL_2), so LPAC samples like BR if these are banked.
+ * Magic registers always carry BR's values except in mr mode.
+ */
+static bool
+tu_lpac_init_mr(void)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *s = os_get_option("TU_LPAC_INIT");
+      mode = s && !strcmp(s, "mr");
+   }
+   return mode;
+}
+
+/* Registers the LPAC CP needs at command buffer start. Based on MR !39889
+ * ("tu: add paths to record commands for lpac", "hack init regs"); the
+ * 0xaf8x/0xb780 values are copied from the blob by that MR (meaning unknown;
+ * 0xaf84 is SP_LPAC_CHICKEN_BITS_2 per MR !39416).
+ */
+template <chip CHIP>
+static void
+tu6_init_static_regs_lpac(struct tu_device *dev, struct tu_cs *cs)
+{
+   const struct tu_physical_device *phys_dev = dev->physical_device;
+   const bool mr = tu_lpac_init_mr();
+
+   for (size_t i = 0; i < ARRAY_SIZE(phys_dev->info->magic_raw); i++) {
+      auto magic_reg = phys_dev->info->magic_raw[i];
+      if (!magic_reg.reg)
+         break;
+
+      switch (magic_reg.reg) {
+      case REG_A6XX_UCHE_CACHE_WAYS:
+      case REG_A7XX_UCHE_UNKNOWN_0E10:
+      case REG_A7XX_UCHE_UNKNOWN_0E11:
+         if (mr)
+            tu_cs_emit_write_reg(cs, magic_reg.reg, magic_reg.value);
+         break;
+      case REG_A6XX_TPL1_DBG_ECO_CNTL:
+      case REG_A6XX_TPL1_DBG_ECO_CNTL1:
+         if (!mr)
+            tu_cs_emit_write_reg(cs, magic_reg.reg,
+                                 tu6_magic_reg_value(dev, magic_reg.reg,
+                                                     magic_reg.value));
+         break;
+      case REG_A6XX_SP_CHICKEN_BITS:
+      case REG_A7XX_SP_CHICKEN_BITS_1:
+      case REG_A7XX_SP_CHICKEN_BITS_2:
+      case REG_A7XX_SP_CHICKEN_BITS_3:
+      case REG_A7XX_SP_HLSQ_DBG_ECO_CNTL:
+      case REG_A6XX_SP_DBG_ECO_CNTL:
+      case REG_A7XX_VFD_DBG_ECO_CNTL:
+         tu_cs_emit_write_reg(cs, magic_reg.reg,
+                              mr ? magic_reg.value :
+                                   tu6_magic_reg_value(dev, magic_reg.reg,
+                                                       magic_reg.value));
+         break;
+      default:
+         break;
+      }
+   }
+
+   tu_cs_emit_regs(cs, A6XX_SP_MODE_CNTL(.constant_demotion_enable = true,
+                                            .isammode = ISAMMODE_GL,
+                                            .shared_consts_enable = false));
+
+   /* Same TPL1 sampling mode as BR, so an LPAC-family buffer samples
+    * identically on either ring.
+    */
+   tu_cs_emit_regs(cs, TPL1_MODE_CNTL(CHIP, .isammode = ISAMMODE_GL,
+                                            .texcoordroundmode = dev->instance->drirc.misc.use_tex_coord_round_nearest_even_mode
+                                               ? COORD_ROUND_NEAREST_EVEN
+                                               : COORD_TRUNCATE,
+                                            .nearestmipsnap = CLAMP_ROUND_TRUNCATE,
+                                            .destdatatypeoverride = true,
+                                            .clamp_disable = true));
+
+   tu_cs_emit_regs(cs, A6XX_TPL1_GFX_BORDER_COLOR_BASE(.qword = dev->global_bo->iova + gb_offset(bcolor_builtin)));
+   tu_cs_emit_regs(cs, A6XX_TPL1_CS_BORDER_COLOR_BASE(.qword = dev->global_bo->iova + gb_offset(bcolor_builtin)));
+
+   if (!mr) {
+      tu_cs_emit_write_reg(cs, REG_A6XX_SP_NC_MODE_CNTL_2, 0);
+      tu_cs_emit_regs(cs, TPL1_BICUBIC_WEIGHTS_TABLE_REG(CHIP, 0, 0),
+                      TPL1_BICUBIC_WEIGHTS_TABLE_REG(CHIP, 1, 0x3fe05ff4),
+                      TPL1_BICUBIC_WEIGHTS_TABLE_REG(CHIP, 2, 0x3fa0ebee),
+                      TPL1_BICUBIC_WEIGHTS_TABLE_REG(CHIP, 3, 0x3f5193ed),
+                      TPL1_BICUBIC_WEIGHTS_TABLE_REG(CHIP, 4, 0x3f0243f0), );
+   }
+
+   /* 0xaf84 (SP_LPAC_CHICKEN_BITS_2) last: dropped unless mr. */
+   static const uint32_t lpac_private[][2] = {
+      { 0xaf80, 0x10000000 }, { 0xaf8a, 0x0 }, { 0xaf8b, 0x0 },
+      { 0xaf81, 0x10000400 }, { 0xaf83, 0x0 },
+      { 0xaf85, 0x0 },        { 0xb780, 0x13100000 }, { 0xaf84, 0x0 },
+   };
+   const uint32_t mr_shared[][2] = {
+      { REG_A6XX_SP_CHICKEN_BITS, 0 },
+      { REG_A7XX_SP_CHICKEN_BITS_3, BIT(23) | BIT(10) },
+      { REG_A7XX_SP_CHICKEN_BITS_1, BIT(22) },
+      { REG_A6XX_RB_CMP_DBG_ECO_CNTL, BIT(19) },
+   };
+   const unsigned n_private = ARRAY_SIZE(lpac_private) - (mr ? 0 : 1);
+   const unsigned n = n_private + (mr ? ARRAY_SIZE(mr_shared) : 0);
+   tu_cs_emit_pkt7(cs, CP_NON_CONTEXT_REG_BUNCH, 2 + 2 * n);
+   tu_cs_emit(cs, 0x233f251c);
+   tu_cs_emit(cs, 0x00000000);
+   for (unsigned i = 0; i < n_private; i++) {
+      tu_cs_emit(cs, lpac_private[i][0]);
+      tu_cs_emit(cs, lpac_private[i][1]);
+   }
+   if (mr) {
+      for (unsigned i = 0; i < ARRAY_SIZE(mr_shared); i++) {
+         tu_cs_emit(cs, mr_shared[i][0]);
+         tu_cs_emit(cs, mr_shared[i][1]);
+      }
+   }
+}
+
 /* Emit the bin restore preamble, which runs in between bins when L1
  * preemption with skipsaverestore happens and we switch back to this context.
  * We need to restore static registers normally programmed at cmdbuf start
@@ -2593,9 +2802,13 @@ tu_init_hw_rp(struct tu_cs *cs)
 }
 TU_GENX(tu_init_hw_rp);
 
+/* lpac_dual: emitted inside a CP_COND_REG_EXEC by tu_BeginCommandBuffer for
+ * an LPAC-family buffer, which toggles the writeable stream itself (a
+ * writeable switch cannot happen inside a conditional block).
+ */
 template <chip CHIP>
 static void
-tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs, bool lpac_dual = false)
 {
    struct tu_device *dev = cmd->device;
    const struct tu_physical_device *phys_dev = dev->physical_device;
@@ -2654,7 +2867,8 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    }
 
    if (CHIP >= A7XX) {
-      if (cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)
+      if ((cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) &&
+          !lpac_dual)
          tu_cs_set_writeable(cs, true);
 
       /* This sets the amount BV is allowed to be ahead of BR when we do
@@ -2670,7 +2884,8 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
       patchpoint->iova = tu_cs_get_cur_iova(cs);
       tu_cs_emit(cs, 1);
 
-      if (cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)
+      if ((cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) &&
+          !lpac_dual)
          tu_cs_set_writeable(cs, false);
 
       tu7_set_thread_br_patchpoint(cmd, cs, false);
@@ -2729,6 +2944,89 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    }
 
    tu_cs_sanity_check(cs);
+}
+
+/* LPAC command buffer start (MR !39889 tu6_init_hw_lpac). */
+template <chip CHIP>
+static void
+tu6_init_hw_lpac(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   struct tu_device *dev = cmd->device;
+   const struct tu_physical_device *phys_dev = dev->physical_device;
+
+   tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
+   tu_cs_emit_wfi(cs);
+
+   if (tu_lpac_init_mr()) {
+      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
+            .vs_state = true,
+            .hs_state = true,
+            .ds_state = true,
+            .gs_state = true,
+            .fs_state = true,
+            .cs_state = true,
+            .cs_uav = true,
+            .gfx_uav = true,
+            .cs_shared_const = true,
+            .gfx_shared_const = true,
+            .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
+            .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,));
+   } else {
+      tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
+            .cs_state = true,
+            .cs_uav = true,
+            .cs_shared_const = true,
+            .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,));
+   }
+
+   tu_cs_emit_wfi(cs);
+
+   tu6_init_static_regs_lpac<CHIP>(dev, cs);
+
+   tu_disable_draw_states(cmd, cs);
+
+   if (FD_QUIRK(phys_dev->info, QCTDD09112208_cmdbuf_start_cs)) {
+      tu_cs_reserve(cs, 3 + 4);
+      tu_cs_emit_pkt7(cs, CP_COND_REG_EXEC, 2);
+      tu_cs_emit(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
+                     CP_COND_REG_EXEC_0_BR | CP_COND_REG_EXEC_0_LPAC);
+      tu_cs_emit(cs, RENDER_MODE_CP_COND_REG_EXEC_1_DWORDS(4));
+      tu_cs_emit_ib(cs, &dev->cmdbuf_QCTDD09112208_cmdbuf_start_cs_entry);
+   }
+
+   tu_cs_sanity_check(cs);
+}
+
+void
+tu_lpac_require_gfx_slow(struct tu_cmd_buffer *cmd,
+                         enum tu_lpac_gfx_reason reason)
+{
+   assert(reason != TU_LPAC_GFX_REASON_NONE);
+   if (cmd->lpac_gfx_reason == TU_LPAC_GFX_REASON_NONE) {
+      cmd->lpac_gfx_reason = reason;
+      static bool logged[TU_LPAC_GFX_REASON_COUNT];
+      if (!p_atomic_xchg(&logged[reason], true)) {
+         mesa_logi("tu-lpac first BR fallback for reason=%s (LPAC-family batch "
+                   "routed to the BR fallback ring)",
+                   tu_lpac_gfx_reason_name(reason));
+      }
+   }
+   /* Record the rest of the buffer in normal BR mode. Everything already
+    * recorded in LPAC mode is valid on BR: dual init, compute packets and
+    * UCHE-level flushes.
+    */
+   cmd->lpac_rec = false;
+}
+
+const char *
+tu_lpac_gfx_reason_name(enum tu_lpac_gfx_reason reason)
+{
+   static const char *const names[] = {
+#define TU_LPAC_REASON_NAME(e, s) s,
+      TU_LPAC_GFX_REASONS(TU_LPAC_REASON_NAME)
+#undef TU_LPAC_REASON_NAME
+   };
+   return reason < ARRAY_SIZE(names) ? names[reason] : "?";
 }
 
 bool
@@ -4425,6 +4723,8 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
 
    cmd_buffer->device = device;
    cmd_buffer->queue_family_index = pool->queue_family_index;
+   cmd_buffer->lpac_family =
+      device->physical_device->queue_families[pool->queue_family_index].lpac;
 
    u_trace_init(&cmd_buffer->trace, &device->trace_context);
    u_trace_init(&cmd_buffer->rp_trace, &device->trace_context);
@@ -4823,6 +5123,8 @@ tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
    tu_cache_init(&cmd_buffer->state.cache);
    tu_cache_init(&cmd_buffer->state.renderpass_cache);
    cmd_buffer->usage_flags = pBeginInfo->flags;
+   cmd_buffer->lpac_rec = cmd_buffer->lpac_family;
+   cmd_buffer->lpac_gfx_reason = TU_LPAC_GFX_REASON_NONE;
 
    tu_cs_begin(&cmd_buffer->cs);
    tu_cs_begin(&cmd_buffer->draw_cs);
@@ -4852,9 +5154,33 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 
    /* setup initial configuration into command buffer */
    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
-      if (cmd_buffer->device->physical_device->queue_families[
+      if (cmd_buffer->lpac_family) {
+         /* TU_LPAC_COMPUTE: the batch may run on LPAC or, if a command
+          * needs graphics hardware, on the BR fallback ring. Emit both
+          * inits, each selected by the executing CP (MR !39889).
+          */
+         struct tu_cs *cs = &cmd_buffer->cs;
+         tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
+                                CP_COND_REG_EXEC_0_LPAC);
+         TU_CALLX(cmd_buffer->device, tu6_init_hw_lpac)(cmd_buffer, cs);
+         tu_cond_exec_end(cs);
+
+         if (cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)
+            tu_cs_set_writeable(cs, true);
+         tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
+                                CP_COND_REG_EXEC_0_BR |
+                                CP_COND_REG_EXEC_0_BV);
+         TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, cs, true);
+         tu_cond_exec_end(cs);
+         if (cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)
+            tu_cs_set_writeable(cs, false);
+
+         result = tu_cs_get_status(cs);
+         if (result != VK_SUCCESS)
+            return vk_command_buffer_set_error(&cmd_buffer->vk, result);
+      } else if (cmd_buffer->device->physical_device->queue_families[
              cmd_buffer->queue_family_index].type == TU_QUEUE_GFX) {
-         TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, &cmd_buffer->cs);
+         TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, &cmd_buffer->cs, false);
          result = tu_cs_get_status(&cmd_buffer->cs);
          if (result != VK_SUCCESS)
             return vk_command_buffer_set_error(&cmd_buffer->vk, result);
@@ -5837,9 +6163,14 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
       tu_emit_cache_flush_renderpass<CHIP>(cmd_buffer);
    } else {
       tu_clean_all_pending(&cmd_buffer->state.cache);
-      cmd_buffer->state.cache.flush_bits |=
-         TU_CMD_FLAG_CCU_CLEAN_COLOR |
-         TU_CMD_FLAG_CCU_CLEAN_DEPTH;
+      /* An LPAC-mode buffer never wrote through CCU (tu6_emit_flushes_lpac
+       * would drop these anyway); one that switched to BR mode has.
+       */
+      if (!cmd_buffer->lpac_rec) {
+         cmd_buffer->state.cache.flush_bits |=
+            TU_CMD_FLAG_CCU_CLEAN_COLOR |
+            TU_CMD_FLAG_CCU_CLEAN_DEPTH;
+      }
       tu_emit_cache_flush<CHIP>(cmd_buffer);
    }
 
@@ -6844,6 +7175,16 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
    VkResult result;
 
    assert(commandBufferCount > 0);
+
+   /* A secondary that needed BR makes the whole batch BR; switch before the
+    * flush below so it is emitted in BR mode, and so the primary's
+    * end-of-buffer CCU clean covers the secondaries' CCU writes.
+    */
+   for (uint32_t i = 0; i < commandBufferCount; i++) {
+      VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
+      if (secondary->lpac_gfx_reason)
+         tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_SECONDARY);
+   }
 
    /* Emit any pending flushes. */
    if (cmd->state.pass) {
@@ -10443,6 +10784,12 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
        (info->blocks[0] == 0 || info->blocks[1] == 0 || info->blocks[2] == 0))
       return;
 
+   /* CP_RUN_OPENCL and CP scratch-register arithmetic are unvalidated on
+    * LPAC (and CP scratch registers may be shared with BR).
+    */
+   if (info->unaligned)
+      tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_UNALIGNED_DISPATCH);
+
    struct tu_cs *cs = &cmd->cs;
    struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
 
@@ -10460,6 +10807,18 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    }
 
    emit_instrlen_workaround &= cmd->device->cs_isz_wa;
+
+   /* The CS instrlen workaround writes SP_PS_INSTR_SIZE (a graphics context
+    * register) and, with TU_CS_ISZ_RESTORE, restores it in all contexts. It
+    * is required on BR; from LPAC it could reach BR's FS state if that
+    * register is not banked per CP. Run such dispatches on BR, where the
+    * reviewed workaround applies unchanged.
+    */
+   static const bool cs_isz_on_lpac =
+      debug_get_option("TU_LPAC_CS_ISZ", NULL) &&
+      !strcmp(debug_get_option("TU_LPAC_CS_ISZ", ""), "lpac");
+   if (emit_instrlen_workaround && !cs_isz_on_lpac)
+      tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_CS_ISZ);
 
    /* We don't use draw states for dispatches, so the bound pipeline
     * could be overwritten by reg stomping in a renderpass or blit.
@@ -10496,7 +10855,10 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
     */
    tu_emit_cache_flush<CHIP>(cmd);
 
-   {
+   /* CP scratch registers may be shared with BR (the kernel fault handler
+    * reads BR's): no hang tags from LPAC.
+    */
+   if (!cmd->lpac_rec) {
       char prefix[9];
       memcpy(prefix, shader->variant->blake3_str, 8);
       prefix[8] = 0;
@@ -11048,6 +11410,7 @@ tu_CmdTraceRaysKHR(VkCommandBuffer commandBuffer,
                    uint32_t depth)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_TRACE_RAYS);
    if (!width || !height || !depth)
       return;
    struct tu_cs_memory mem;
@@ -11070,6 +11433,7 @@ tu_CmdTraceRaysIndirectKHR(VkCommandBuffer commandBuffer,
                            VkDeviceAddress indirectDeviceAddress)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_TRACE_RAYS);
    if (!cmd->state.rt_pipeline || !cmd->state.rt_pipeline->shaders[MESA_SHADER_COMPUTE])
       return;
    struct tu_cs_memory mem;
@@ -11099,6 +11463,7 @@ tu_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
                             VkDeviceAddress indirectDeviceAddress)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_TRACE_RAYS);
    if (CHIP >= A7XX && (tu_rt_fov_mode(cmd->device) & TU_RT_FOV_SHARE)) {
       if (!cmd->state.rt_pipeline || !cmd->state.rt_pipeline->shaders[MESA_SHADER_COMPUTE])
          return;
@@ -11546,6 +11911,8 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
 
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_COND_RENDER);
+
    cmd->state.predication_active = true;
 
    struct tu_cs *cs = cmd->state.pass ? &cmd->draw_cs : &cmd->cs;
@@ -11662,6 +12029,9 @@ tu_CmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer,
    /* Almost the same as tu_write_event, but also allowed in renderpass */
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
+
+   /* RB_DONE_TS and a CCU flush: BR only. */
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_MARKER);
 
    uint64_t va = vk_buffer_address(&buffer->vk, dstOffset);
 

@@ -83,6 +83,10 @@ enum tu_kgsl_dma_type
 struct tu_queue_family {
    enum tu_queue_type type;
    const VkQueueFamilyProperties *properties;
+   /* TU_LPAC_COMPUTE=1: the compute-only family is backed by an LPAC
+    * (concurrent compute CP, ring 4) submitqueue instead of a BR ring.
+    */
+   bool lpac;
 };
 
 extern uint64_t os_page_size;
@@ -152,6 +156,13 @@ struct tu_physical_device
 
    bool has_preemption;
    bool has_compute_queue;
+
+   /* Kernel accepted an MSM_SUBMITQUEUE_LPAC probe (only probed when
+    * TU_LPAC_COMPUTE is set).
+    */
+   bool has_lpac_submitqueue;
+   /* TU_LPAC_COMPUTE=1 and every LPAC precondition held. */
+   bool lpac_compute;
 
    bool expose_double_threadsize;
 

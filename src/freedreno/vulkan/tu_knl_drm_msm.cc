@@ -161,12 +161,32 @@ msm_submitqueue_new(struct tu_device *dev, struct tu_queue *queue)
          .prio = queue->priority,
       };
 
+      /* LPAC ring: the kernel ignores preemption for it (no yield, no
+       * preempt trigger), but keeps ALLOW_PREEMPT's IB1LIST markers, as in
+       * MR !39889.
+       */
+      if (queue->lpac)
+         req.flags |= MSM_SUBMITQUEUE_LPAC;
+
       ret = drmCommandWriteRead(dev->fd,
                                 DRM_MSM_SUBMITQUEUE_NEW, &req, sizeof(req));
       if (ret)
          return ret;
 
       queue->msm_queue_id = req.id;
+
+      if (queue->lpac) {
+         /* Ordering timeline shared with the hidden BR fallback queue. */
+         struct tu_queue_order *order = static_cast<struct tu_queue_order *>(
+            vk_zalloc(&dev->vk.alloc, sizeof(*order), 8,
+                      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
+         ret = order ? drmSyncobjCreate(dev->fd, 0, &order->syncobj) : -ENOMEM;
+         if (ret) {
+            vk_free(&dev->vk.alloc, order);
+            goto fail_sparse;
+         }
+         queue->order = order;
+      }
    }
 
    if (queue->type == TU_QUEUE_SPARSE ||
@@ -203,6 +223,11 @@ fail_gfx_syncobj:
                       &queue->sparse_queue_id, sizeof(uint32_t));
    }
 fail_sparse:
+   if (queue->lpac && queue->order) {
+      drmSyncobjDestroy(dev->fd, queue->order->syncobj);
+      vk_free(&dev->vk.alloc, queue->order);
+      queue->order = NULL;
+   }
    if (queue->type == TU_QUEUE_GFX) {
       drmCommandWrite(dev->fd, DRM_MSM_SUBMITQUEUE_CLOSE,
                       &queue->msm_queue_id, sizeof(uint32_t));
@@ -227,6 +252,13 @@ msm_submitqueue_close(struct tu_device *dev, struct tu_queue *queue)
    if (queue->type == TU_QUEUE_GFX && dev->physical_device->has_vm_bind) {
       drmSyncobjDestroy(dev->fd, queue->sparse_syncobj);
       drmSyncobjDestroy(dev->fd, queue->gfx_syncobj);
+   }
+
+   /* The LPAC queue owns the ordering timeline; its fallback only borrows it. */
+   if (queue->lpac && queue->order) {
+      drmSyncobjDestroy(dev->fd, queue->order->syncobj);
+      vk_free(&dev->vk.alloc, queue->order);
+      queue->order = NULL;
    }
 }
 
@@ -1026,10 +1058,24 @@ msm_queue_submit(struct tu_queue *queue, void *_submit,
    uint32_t extra_signal_count =
       (queue->type == TU_QUEUE_GFX && has_vm_bind) ? 1 : 0;
 
+   /* TU_LPAC_COMPUTE: the LPAC queue and its hidden BR fallback queue are
+    * two kernel rings behind one VkQueue. Every submission to either signals
+    * the next point of a shared timeline syncobj; a submission that lands on
+    * a different ring than the previous one first waits for that previous
+    * point. Same-ring submissions are already ordered by the ring. Never set
+    * when TU_LPAC_COMPUTE is unset.
+    */
+   struct tu_queue_order *order = queue->order;
+   const bool order_wait = order && order->point && order->last != queue;
+   const uint64_t order_point = order ? order->point + 1 : 0;
+   const uint32_t order_wait_count = order_wait ? 1 : 0;
+   const uint32_t order_signal_count = order ? 1 : 0;
+   assert(!order || (queue->type == TU_QUEUE_GFX && submit->binds.size == 0));
+
    /* Allocate without wait timeline semaphores */
    in_syncobjs = static_cast<struct drm_msm_syncobj *>(vk_zalloc(
       &queue->device->vk.alloc,
-      (wait_count + extra_wait_count) * sizeof(*in_syncobjs), 8,
+      (wait_count + extra_wait_count + order_wait_count) * sizeof(*in_syncobjs), 8,
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
    if (in_syncobjs == NULL) {
@@ -1040,7 +1086,7 @@ msm_queue_submit(struct tu_queue *queue, void *_submit,
    /* Allocate with signal timeline semaphores considered */
    out_syncobjs = static_cast<struct drm_msm_syncobj *>(vk_zalloc(
       &queue->device->vk.alloc,
-      (signal_count + extra_signal_count) * sizeof(*out_syncobjs), 8,
+      (signal_count + extra_signal_count + order_signal_count) * sizeof(*out_syncobjs), 8,
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
 
    if (out_syncobjs == NULL) {
@@ -1207,11 +1253,26 @@ msm_queue_submit(struct tu_queue *queue, void *_submit,
    } else {
       uint32_t flags = MSM_PIPE_3D0;
 
-      if (wait_count || extra_wait_count)
+      if (wait_count || extra_wait_count || order_wait_count)
          flags |= MSM_SUBMIT_SYNCOBJ_IN;
 
-      if (signal_count || extra_signal_count)
+      if (signal_count || extra_signal_count || order_signal_count)
          flags |= MSM_SUBMIT_SYNCOBJ_OUT;
+
+      if (order_wait) {
+         in_syncobjs[wait_count + extra_wait_count] = (struct drm_msm_syncobj) {
+            .handle = order->syncobj,
+            .flags = 0,
+            .point = order->point,
+         };
+      }
+      if (order) {
+         out_syncobjs[signal_count + extra_signal_count] = (struct drm_msm_syncobj) {
+            .handle = order->syncobj,
+            .flags = 0,
+            .point = order_point,
+         };
+      }
 
       if (has_vm_bind) {
          if (extra_wait_count) {
@@ -1282,8 +1343,8 @@ msm_queue_submit(struct tu_queue *queue, void *_submit,
          .queueid = queue->msm_queue_id,
          .in_syncobjs = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(in_syncobjs)),
          .out_syncobjs = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(out_syncobjs)),
-         .nr_in_syncobjs = wait_count + extra_wait_count,
-         .nr_out_syncobjs = signal_count + extra_signal_count,
+         .nr_in_syncobjs = wait_count + extra_wait_count + order_wait_count,
+         .nr_out_syncobjs = signal_count + extra_signal_count + order_signal_count,
          .syncobj_stride = sizeof(struct drm_msm_syncobj),
       };
 
@@ -1313,11 +1374,31 @@ msm_queue_submit(struct tu_queue *queue, void *_submit,
    if (queue->type != TU_QUEUE_SPARSE)
       p_atomic_set(&queue->fence, fence);
 
+   if (order) {
+      /* Callers hold device->submit_mutex, which serializes both rings. */
+      if (order_wait)
+         order->switches++;
+      if (queue->lpac)
+         order->lpac_submits++;
+      else
+         order->gfx_submits++;
+      order->point = order_point;
+      order->last = queue;
+   }
+
    if (debug_get_bool_option("TU_MULTI_QUEUE_LOG", false)) {
-      mesa_logi("tu-multiqueue submit family=%u index=%u msm=%u priority=%d commands=%u waits=%u signals=%u fence=%u",
-                queue->vk.queue_family_index, queue->vk.index_in_family,
-                queue->msm_queue_id, queue->priority, entry_count,
-                wait_count, signal_count, fence);
+      if (order) {
+         mesa_logi("tu-multiqueue submit family=%u index=%u msm=%u ring=%s priority=%d commands=%u waits=%u signals=%u fence=%u order=%" PRIu64 " order_wait=%u",
+                   queue->vk.queue_family_index, queue->vk.index_in_family,
+                   queue->msm_queue_id, queue->lpac ? "lpac" : "gfx-fallback",
+                   queue->priority, entry_count, wait_count, signal_count,
+                   fence, order_point, order_wait);
+      } else {
+         mesa_logi("tu-multiqueue submit family=%u index=%u msm=%u priority=%d commands=%u waits=%u signals=%u fence=%u",
+                   queue->vk.queue_family_index, queue->vk.index_in_family,
+                   queue->msm_queue_id, queue->priority, entry_count,
+                   wait_count, signal_count, fence);
+      }
    }
 
 #if HAVE_PERFETTO
@@ -1442,6 +1523,15 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
    device->has_sparse_prr = tu_drm_get_param_or(fd, MSM_PARAM_HAS_PRR, &val, false);
 
    device->has_preemption = msm_common_has_preemption(device->local_fd, device->submitqueue_priority_count / 2);
+
+   /* Opt-in only: with TU_LPAC_COMPUTE unset no LPAC ioctl is issued. Probe
+    * with the flags msm_submitqueue_new will use (chip >= 7 is re-checked
+    * in tu_physical_device_init).
+    */
+   if (debug_get_bool_option("TU_LPAC_COMPUTE", false))
+      device->has_lpac_submitqueue = msm_common_has_lpac(
+         device->local_fd,
+         device->has_preemption ? MSM_SUBMITQUEUE_ALLOW_PREEMPT : 0);
 
    device->is_perf_cntr_selectable = true;
 

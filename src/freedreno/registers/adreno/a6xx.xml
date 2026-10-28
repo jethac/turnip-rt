@@ -286,6 +286,9 @@ by a particular renderpass/blit.
 		<bitfield name="ACCESS_PROT_EN" pos="0" type="boolean"/>
 	</bitset>
 
+	<!-- LPAC registers below are from MR !39416 (names only). -->
+	<reg32 offset="0x0B09" name="CP_LPAC_PROTECT_CNTL" type="a6xx_cp_protect_cntl" variants="A6XX-A7XX"/>
+
 	<reg32 offset="0x084e" name="CP_PROTECT_CNTL_PIPE" type="a8xx_cp_protect_cntl" variants="A8XX-"/>
 
 	<array offset="0x0883" name="CP_SCRATCH" stride="1" length="8" variants="A6XX-A7XX">
@@ -514,14 +517,24 @@ by a particular renderpass/blit.
 	<reg32 offset="0x0ad0" name="CP_BV_APRIV_CNTL" variants="A7XX"/>
 	<reg32 offset="0x0ada" name="CP_BV_CHICKEN_DBG" variants="A7XX"/>
 
+	<reg64 offset="0x0b00" name="CP_LPAC_RB_BASE" variants="A7XX"/>
+	<reg32 offset="0x0b02" name="CP_LPAC_RB_CNTL" variants="A7XX"/>
+	<reg64 offset="0x0b04" name="CP_LPAC_RB_RPTR_ADDR" variants="A7XX"/>
+	<reg32 offset="0x0b06" name="CP_LPAC_RB_RPTR" variants="A7XX"/>
+	<reg32 offset="0x0b07" name="CP_LPAC_RB_WPTR" variants="A7XX"/>
 	<reg32 offset="0x0b0a" name="CP_LPAC_DRAW_STATE_ADDR" variants="A7XX"/>
 	<reg32 offset="0x0b0b" name="CP_LPAC_DRAW_STATE_DATA" variants="A7XX"/>
 	<reg32 offset="0x0b0c" name="CP_LPAC_ROQ_DBG_ADDR" variants="A7XX"/>
+	<reg64 offset="0x0b0d" name="CP_LPAC_IB1_BASE" variants="A7XX"/>
+	<reg32 offset="0x0b0f" name="CP_LPAC_IB1_REM_SIZE" variants="A7XX"/>
+	<reg64 offset="0x0b10" name="CP_LPAC_IB2_BASE" variants="A7XX"/>
+	<reg32 offset="0x0b12" name="CP_LPAC_IB2_REM_SIZE" variants="A7XX"/>
 	<reg32 offset="0x0b27" name="CP_SQE_AC_UCODE_DBG_ADDR" variants="A7XX"/>
 	<reg32 offset="0x0b28" name="CP_SQE_AC_UCODE_DBG_DATA" variants="A7XX"/>
 	<reg32 offset="0x0b29" name="CP_SQE_AC_STAT_ADDR" variants="A7XX"/>
 	<reg32 offset="0x0b2a" name="CP_SQE_AC_STAT_DATA" variants="A7XX"/>
 
+	<reg32 offset="0x0b30" name="CP_LPAC_CHICKEN_DBG" variants="A7XX"/>
 	<reg32 offset="0x0b31" name="CP_LPAC_APRIV_CNTL" variants="A7XX"/>
 	<reg32 offset="0x0b34" name="CP_LPAC_PROG_FIFO_SIZE" variants="A7XX"/>
 	<reg32 offset="0x0b35" name="CP_LPAC_ROQ_DBG_DATA" variants="A7XX"/>
@@ -4430,6 +4443,7 @@ by a particular renderpass/blit.
 	<array offset="0xae80" name="SP_PERFCTR_SP_SEL" stride="1" length="36" variants="A7XX-"/>
 	<!-- TODO: there are 4 more percntr select registers (0xae28-0xae2b) -->
 	<!-- TODO: there are a few unknown registers in the 0xae30-0xae52 range -->
+	<reg32 offset="0xaf84" name="SP_LPAC_CHICKEN_BITS_2" variants="A7XX"/>
 	<reg32 offset="0xae52" name="SP_CONTEXT_SWITCH_GFX_PREEMPTION_SAFE_MODE"/>
 
 	<reg64 offset="0xae10" name="SP_HLSQ_GC_GMEM_RANGE_MIN" variants="A8XX-"/>

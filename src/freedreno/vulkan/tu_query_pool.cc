@@ -1453,6 +1453,8 @@ tu_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
    VK_FROM_HANDLE(tu_query_pool, pool, queryPool);
+
+   tu_lpac_require_gfx(cmdbuf, TU_LPAC_GFX_REASON_QUERY);
    assert(query < pool->size);
 
    switch (pool->vk.query_type) {
@@ -2063,6 +2065,8 @@ tu_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
    VK_FROM_HANDLE(tu_query_pool, pool, queryPool);
+
+   tu_lpac_require_gfx(cmdbuf, TU_LPAC_GFX_REASON_QUERY);
    assert(query < pool->size);
 
    switch (pool->vk.query_type) {

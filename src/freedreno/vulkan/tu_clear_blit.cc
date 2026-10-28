@@ -2843,6 +2843,8 @@ tu_CmdBlitImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_image, src_image, pBlitImageInfo->srcImage);
    VK_FROM_HANDLE(tu_image, dst_image, pBlitImageInfo->dstImage);
 
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_BLIT_RESOLVE);
+
    for (uint32_t i = 0; i < pBlitImageInfo->regionCount; ++i) {
       /* can't blit both depth and stencil at once with D32_S8
        * TODO: more advanced 3D blit path to support it instead?
@@ -3027,6 +3029,8 @@ tu_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_image, dst_image, pCopyBufferToImageInfo->dstImage);
    VK_FROM_HANDLE(tu_buffer, src_buffer, pCopyBufferToImageInfo->srcBuffer);
+
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_COPY);
 
    trace_start_copy_buffer_to_image(&cmd->trace, &cmd->cs, cmd, dst_image->vk.format);
 
@@ -3248,6 +3252,8 @@ tu_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_image, src_image, pCopyImageToBufferInfo->srcImage);
    VK_FROM_HANDLE(tu_buffer, dst_buffer, pCopyImageToBufferInfo->dstBuffer);
+
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_COPY);
 
    trace_start_copy_image_to_buffer(&cmd->trace, &cmd->cs, cmd, src_image->vk.format);
 
@@ -3612,6 +3618,8 @@ tu_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_image, src_image, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(tu_image, dst_image, pCopyImageInfo->dstImage);
 
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_COPY);
+
    trace_start_copy_image(&cmd->trace, &cmd->cs, cmd, src_image->vk.format,
                           dst_image->vk.format);
 
@@ -3885,6 +3893,8 @@ tu_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_buffer, src_buffer, pCopyBufferInfo->srcBuffer);
    VK_FROM_HANDLE(tu_buffer, dst_buffer, pCopyBufferInfo->dstBuffer);
 
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_COPY);
+
    trace_start_copy_buffer(&cmd->trace, &cmd->cs, cmd);
 
    /* Choose the largest common block size for all copy regions
@@ -3935,6 +3945,8 @@ tu_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
 
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_FILL_UPDATE);
+
    struct tu_cs_memory tmp;
    VkResult result = tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(dataSize, 64), 64 / 4, &tmp);
    if (result != VK_SUCCESS) {
@@ -3971,6 +3983,8 @@ tu_cmd_fill_buffer(VkCommandBuffer commandBuffer,
                    uint32_t data)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_FILL_UPDATE);
    const struct blit_ops *ops = &r2d_ops<CHIP>;
    struct tu_cs *cs = &cmd->cs;
 
@@ -4060,6 +4074,8 @@ tu_CmdResolveImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_image, src_image, pResolveImageInfo->srcImage);
    VK_FROM_HANDLE(tu_image, dst_image, pResolveImageInfo->dstImage);
+
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_BLIT_RESOLVE);
    struct tu_cs *cs = &cmd->cs;
 
    trace_start_resolve_image(&cmd->trace, &cmd->cs, cmd, src_image->vk.format,
@@ -4448,6 +4464,8 @@ tu_CmdClearColorImage(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_image, image, image_h);
 
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_CLEAR);
+
    trace_start_clear_color_image(&cmd->trace, &cmd->cs, cmd, image->vk.format);
 
    bool use_generic_clear = use_generic_clear_for_image_clear(cmd, image);
@@ -4490,6 +4508,8 @@ tu_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_image, image, image_h);
+
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_CLEAR);
 
    trace_start_clear_depth_stencil_image(&cmd->trace, &cmd->cs, cmd,
                                          image->vk.format);
@@ -5263,6 +5283,8 @@ tu_CmdClearAttachments(VkCommandBuffer commandBuffer,
                        const VkClearRect *pRects)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_CLEAR);
 
    for (uint32_t j = 0; j < attachmentCount; j++) {
       if ((pAttachments[j].aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) == 0)

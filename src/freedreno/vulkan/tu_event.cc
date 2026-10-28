@@ -112,6 +112,8 @@ tu_CmdSetEvent2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_event, event, _event);
+
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_EVENT);
    VkPipelineStageFlags2 src_stage_mask =
       vk_collect_dependency_info_src_stages(pDependencyInfo);
 
@@ -134,6 +136,8 @@ tu_CmdResetEvent2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_event, event, _event);
+
+   tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_EVENT);
 
    tu_write_event<CHIP>(cmd, event, stageMask, 0);
 }

@@ -21,8 +21,10 @@
 #include "tu_knl.h"
 #include "tu_free_log.h"
 
+#include "util/os_time.h"
 #include "util/set.h"
 #include "util/u_debug.h"
+#include "c11/threads.h"
 
 static int
 tu_get_submitqueue_priority(const struct tu_physical_device *pdevice,
@@ -392,6 +394,278 @@ resolve_cb_control_patchpoints(struct tu_queue *queue,
    return VK_SUCCESS;
 }
 
+/* TU_RING_TS_LOG: each slot is 32 bytes of data (start, end, submit,
+ * reserved) followed, in a separate region, by two 32-byte IBs that stamp
+ * it: a CP_REG_TO_MEM of CP_ALWAYS_ON_COUNTER when the CP reaches the start
+ * of the submission, and a pipelined ALWAYSON event write after the
+ * submission's work (RB_DONE_TS on BR rings, CACHE_CLEAN on LPAC, which has
+ * no RB). Ticks are the 19.2 MHz always-on counter.
+ */
+#define TU_RING_TS_SLOTS 4096
+#define TU_RING_TS_SLOT_BYTES 32
+#define TU_RING_TS_IB_BYTES 32
+
+static void
+tu_ring_ts_init(struct tu_queue *queue)
+{
+   struct tu_device *dev = queue->device;
+   if (!debug_get_bool_option("TU_RING_TS_LOG", false) ||
+       dev->physical_device->info->chip != 7)
+      return;
+
+   struct tu_ring_ts *rt = static_cast<struct tu_ring_ts *>(
+      vk_zalloc(&dev->vk.alloc, sizeof(*rt), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
+   if (!rt)
+      return;
+   rt->slots = TU_RING_TS_SLOTS;
+   uint64_t size = (uint64_t) rt->slots *
+                   (TU_RING_TS_SLOT_BYTES + 2 * TU_RING_TS_IB_BYTES);
+   if (tu_bo_init_new(dev, NULL, &rt->bo, size,
+                      (enum tu_bo_alloc_flags) (TU_BO_ALLOC_INTERNAL_RESOURCE |
+                                                TU_BO_ALLOC_ALLOW_DUMP),
+                      "ring ts") != VK_SUCCESS) {
+      vk_free(&dev->vk.alloc, rt);
+      return;
+   }
+   if (tu_bo_map(dev, rt->bo, NULL) != VK_SUCCESS) {
+      tu_bo_finish(dev, rt->bo);
+      vk_free(&dev->vk.alloc, rt);
+      return;
+   }
+   memset(rt->bo->map, 0, size);
+
+   const uint64_t ib_base = (uint64_t) rt->slots * TU_RING_TS_SLOT_BYTES;
+   for (uint32_t i = 0; i < rt->slots; i++) {
+      uint64_t slot_iova = rt->bo->iova + (uint64_t) i * TU_RING_TS_SLOT_BYTES;
+      uint32_t *start = reinterpret_cast<uint32_t *>(
+         static_cast<char *>(rt->bo->map) + ib_base +
+         (uint64_t) i * 2 * TU_RING_TS_IB_BYTES);
+      struct tu_cs cs;
+      tu_cs_init_external(&cs, dev, start, start + 2 * TU_RING_TS_IB_BYTES / 4,
+                          rt->bo->iova + ib_base +
+                             (uint64_t) i * 2 * TU_RING_TS_IB_BYTES,
+                          false);
+      tu_cs_begin(&cs);
+      /* Only BR (BR rings) or LPAC stamps; BV may run ahead of BR. */
+      const uint32_t not_bv = CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
+                              CP_COND_REG_EXEC_0_BR | CP_COND_REG_EXEC_0_LPAC;
+      /* CP_ALWAYS_ON_COUNTER (A6XX-A7XX offset 0x0980), 64-bit. */
+      tu_cond_exec_start(&cs, not_bv);
+      tu_cs_emit_pkt7(&cs, CP_REG_TO_MEM, 3);
+      tu_cs_emit(&cs, CP_REG_TO_MEM_0_REG(0x0980) | CP_REG_TO_MEM_0_CNT(2) |
+                      CP_REG_TO_MEM_0_IS_64B);
+      tu_cs_emit_qw(&cs, slot_iova);
+      tu_cond_exec_end(&cs);
+      tu_cs_emit_pkt7(&cs, CP_NOP, 0);
+      tu_cond_exec_start(&cs, not_bv);
+      tu_cs_emit_pkt7(&cs, CP_EVENT_WRITE7, 3);
+      tu_cs_emit(&cs, CP_EVENT_WRITE7_0(.event = queue->lpac ? CACHE_CLEAN : RB_DONE_TS,
+                                        .write_src = EV_WRITE_ALWAYSON,
+                                        .write_dst = EV_DST_RAM,
+                                        .write_enabled = true).value);
+      tu_cs_emit_qw(&cs, slot_iova + 8);
+      tu_cond_exec_end(&cs);
+      tu_cs_emit_pkt7(&cs, CP_NOP, 0);
+      tu_cs_end(&cs);
+      assert(cs.cur == start + 2 * TU_RING_TS_IB_BYTES / 4);
+   }
+   queue->ring_ts = rt;
+   mesa_logi("tu-ring-ts init family=%u msm=%u ring=%s slots=%u",
+             queue->vk.queue_family_index, queue->msm_queue_id,
+             queue->lpac ? "lpac" : (queue->order ? "gfx-fallback" : "gfx"),
+             rt->slots);
+}
+
+static uint64_t *
+tu_ring_ts_slot(struct tu_ring_ts *rt, uint32_t i)
+{
+   return reinterpret_cast<uint64_t *>(
+      static_cast<char *>(rt->bo->map) + (uint64_t) i * TU_RING_TS_SLOT_BYTES);
+}
+
+/* Logs landed slots in order; stops at the first one still in flight. */
+static void
+tu_ring_ts_drain(struct tu_queue *queue)
+{
+   struct tu_ring_ts *rt = queue->ring_ts;
+   while (rt->pending != rt->next) {
+      uint64_t *s = tu_ring_ts_slot(rt, rt->pending % rt->slots);
+      uint64_t start = p_atomic_read(&s[0]), end = p_atomic_read(&s[1]);
+      if (!start || !end)
+         break;
+      mesa_logi("tu-ring-ts family=%u msm=%u ring=%s submit=%" PRIu64
+                " start=%" PRIu64 " end=%" PRIu64,
+                queue->vk.queue_family_index, queue->msm_queue_id,
+                queue->lpac ? "lpac" : (queue->order ? "gfx-fallback" : "gfx"),
+                s[2], start, end);
+      rt->pending++;
+   }
+}
+
+static void
+submit_add_entries(struct tu_device *dev, void *submit,
+                   struct util_dynarray *dump_cmds,
+                   struct tu_cs_entry *entries, unsigned num_entries);
+
+/* Claims a slot, adds its start IB to the submit and returns its end IB,
+ * which the caller appends after every other entry.
+ */
+static void
+tu_ring_ts_begin(struct tu_queue *queue, void *submit, struct util_dynarray *dump_cmds,
+                 uint32_t submission, struct tu_cs_entry *end_entry)
+{
+   struct tu_ring_ts *rt = queue->ring_ts;
+   tu_ring_ts_drain(queue);
+   if (rt->next - rt->pending >= rt->slots) {
+      /* Oldest slot never landed (or 4096 submissions in flight): drop it. */
+      rt->pending++;
+      rt->dropped++;
+   }
+   uint32_t i = rt->next++ % rt->slots;
+   uint64_t *s = tu_ring_ts_slot(rt, i);
+   s[0] = 0;
+   s[1] = 0;
+   s[2] = submission;
+   const uint32_t ib = rt->slots * TU_RING_TS_SLOT_BYTES + i * 2 * TU_RING_TS_IB_BYTES;
+   struct tu_cs_entry start = { .bo = rt->bo, .size = TU_RING_TS_IB_BYTES, .offset = ib };
+   submit_add_entries(queue->device, submit, dump_cmds, &start, 1);
+   *end_entry = (struct tu_cs_entry) {
+      .bo = rt->bo, .size = TU_RING_TS_IB_BYTES, .offset = ib + TU_RING_TS_IB_BYTES };
+}
+
+static void
+tu_ring_ts_finish(struct tu_queue *queue)
+{
+   struct tu_ring_ts *rt = queue->ring_ts;
+   if (!rt)
+      return;
+   tu_ring_ts_drain(queue);
+   mesa_logi("tu-ring-ts finish family=%u msm=%u unlanded=%u dropped=%" PRIu64,
+             queue->vk.queue_family_index, queue->msm_queue_id,
+             rt->next - rt->pending, rt->dropped);
+   tu_bo_finish(queue->device, rt->bo);
+   vk_free(&queue->device->vk.alloc, rt);
+   queue->ring_ts = NULL;
+}
+
+/* TU_LPAC_COMPUTE: per-reason routing counters, logged periodically. */
+static uint64_t tu_lpac_reason_counts[TU_LPAC_GFX_REASON_COUNT];
+
+static void
+tu_lpac_log_stats(const struct tu_queue *queue, const char *when)
+{
+   const struct tu_queue_order *o = queue->order;
+   char buf[512];
+   int n = 0;
+   for (unsigned r = 1; r < TU_LPAC_GFX_REASON_COUNT && n < (int) sizeof(buf); r++) {
+      uint64_t c = p_atomic_read(&tu_lpac_reason_counts[r]);
+      if (c)
+         n += snprintf(buf + n, sizeof(buf) - n, " %s=%" PRIu64,
+                       tu_lpac_gfx_reason_name((enum tu_lpac_gfx_reason) r), c);
+   }
+   if (n == 0)
+      buf[0] = 0;
+   mesa_logi("tu-lpac stats %s family=%u lpac_msm=%u fallback_msm=%u lpac_submits=%" PRIu64
+             " gfx_fallback_submits=%" PRIu64 " ring_switch_waits=%" PRIu64 " order_point=%" PRIu64
+             " fallback_reasons:%s",
+             when, queue->vk.queue_family_index, queue->msm_queue_id,
+             queue->gfx_fallback ? queue->gfx_fallback->msm_queue_id : 0,
+             o->lpac_submits, o->gfx_submits, o->switches, o->point, buf);
+}
+
+/* TU_LPAC_COMPUTE backstop. The running kernel never declares an LPAC hang:
+ * check_ring_timeout() uses get_ctx_timestamp(), which returns -EBUSY for
+ * any ring other than cur_ring (a BR ring), and the fallback
+ * last_active_ctxcycles is only written by the BR preemption postamble; the
+ * drm_sched timeout is MAX_SCHEDULE_TIMEOUT. Nothing would ever report the
+ * hang or bump the fault count. This thread watches the LPAC submitqueue's
+ * fence and, if pending work makes no progress for TU_LPAC_WATCHDOG_MS
+ * (default 5000, 0 = off), logs "tu-lpac WATCHDOG" and marks the device
+ * lost. It cannot unblock waits already inside the kernel or reset the
+ * ring: an external stall detector must still stop the process.
+ */
+struct tu_lpac_watchdog
+{
+   struct tu_queue *queue;
+   thrd_t thread;
+   uint32_t ms;
+   uint32_t stop;
+};
+
+static int
+tu_lpac_watchdog_main(void *arg)
+{
+   struct tu_lpac_watchdog *w = static_cast<struct tu_lpac_watchdog *>(arg);
+   struct tu_queue *q = w->queue;
+   int mark = -1;          /* oldest pending fence seen since last progress */
+   uint64_t since = os_time_get_nano();
+   bool fired = false;
+
+   while (!p_atomic_read(&w->stop)) {
+      os_time_sleep(100000);
+      int submitted = p_atomic_read(&q->fence);
+      uint64_t now = os_time_get_nano();
+      if (submitted < 0 ||
+          tu_queue_wait_fence(q, submitted, 0) == VK_SUCCESS) {
+         mark = -1; /* idle */
+         since = now;
+         continue;
+      }
+      if (mark < 0 || tu_queue_wait_fence(q, mark, 0) == VK_SUCCESS) {
+         mark = submitted; /* first pending work, or progress since */
+         since = now;
+         continue;
+      }
+      if (!fired && now - since > (uint64_t) w->ms * 1000000ull) {
+         fired = true;
+         mesa_loge("tu-lpac WATCHDOG: LPAC ring made no progress for %u ms "
+                   "(family=%u msm=%u pending fence %d, last submitted %d); "
+                   "the kernel does not detect LPAC hangs; marking device lost",
+                   w->ms, q->vk.queue_family_index, q->msm_queue_id, mark,
+                   submitted);
+         vk_device_set_lost(&q->device->vk,
+                            "LPAC ring hang detected by TU_LPAC_WATCHDOG_MS");
+      }
+   }
+   return 0;
+}
+
+static void
+tu_lpac_watchdog_start(struct tu_queue *queue)
+{
+   uint32_t ms = debug_get_num_option("TU_LPAC_WATCHDOG_MS", 5000);
+   if (!ms)
+      return;
+   struct tu_lpac_watchdog *w = static_cast<struct tu_lpac_watchdog *>(
+      vk_zalloc(&queue->device->vk.alloc, sizeof(*w), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
+   if (!w)
+      return;
+   w->queue = queue;
+   w->ms = ms;
+   if (thrd_create(&w->thread, tu_lpac_watchdog_main, w) != thrd_success) {
+      vk_free(&queue->device->vk.alloc, w);
+      mesa_loge("tu-lpac watchdog thread creation failed");
+      return;
+   }
+   queue->watchdog = w;
+   mesa_logi("tu-lpac watchdog family=%u msm=%u threshold_ms=%u",
+             queue->vk.queue_family_index, queue->msm_queue_id, ms);
+}
+
+static void
+tu_lpac_watchdog_stop(struct tu_queue *queue)
+{
+   struct tu_lpac_watchdog *w = queue->watchdog;
+   if (!w)
+      return;
+   p_atomic_set(&w->stop, 1);
+   thrd_join(w->thread, NULL);
+   vk_free(&queue->device->vk.alloc, w);
+   queue->watchdog = NULL;
+}
+
 static VkResult
 queue_submit_sparse(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
 {
@@ -481,6 +755,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    bool rd_selected = false;
    bool rd_bridge = false;
    uint64_t rd_root_dwords = 0;
+   struct tu_cs_entry ring_ts_end = {};
 
    if (vk_submit->buffer_bind_count ||
        vk_submit->image_bind_count ||
@@ -520,12 +795,48 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
 
    struct tu_u_trace_submission_data *u_trace_submission_data = NULL;
 
+   /* TU_LPAC_COMPUTE: route the whole batch to the hidden BR queue if any
+    * command buffer recorded something LPAC cannot run, or if submit-level
+    * streams (perf pass, autotune) are needed. The command streams of an
+    * LPAC-family buffer are valid on both rings (dual init, see
+    * tu_BeginCommandBuffer). target == queue whenever LPAC is off.
+    */
+   struct tu_queue *target = queue;
+   bool autotune_done = false;
+   if (queue->lpac) {
+      enum tu_lpac_gfx_reason reason = TU_LPAC_GFX_REASON_NONE;
+      for (uint32_t i = 0; i < cmdbuf_count && !reason; i++) {
+         if (cmd_buffers[i]->lpac_gfx_reason)
+            reason = cmd_buffers[i]->lpac_gfx_reason;
+      }
+      if (!reason && perf_pass_index != ~0)
+         reason = TU_LPAC_GFX_REASON_PERF_PASS;
+      autotune_cs = device->autotune->on_submit(cmd_buffers, cmdbuf_count);
+      autotune_done = true;
+      if (!reason && autotune_cs)
+         reason = TU_LPAC_GFX_REASON_AUTOTUNE;
+      if (reason) {
+         target = queue->gfx_fallback;
+         p_atomic_inc(&tu_lpac_reason_counts[reason]);
+      }
+      if (((queue->order->lpac_submits + queue->order->gfx_submits) & 4095) == 4095)
+         tu_lpac_log_stats(queue, "periodic");
+   }
+
    void *submit = tu_submit_create(device);
    if (!submit) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       pthread_mutex_unlock(&device->submit_mutex);
       goto fail_create_submit;
    }
+
+   if (unlikely(target->ring_ts_wanted)) {
+      /* Created lazily: queue init runs before the device can allocate. */
+      target->ring_ts_wanted = false;
+      tu_ring_ts_init(target);
+   }
+   if (target->ring_ts)
+      tu_ring_ts_begin(target, submit, &dump_cmds, device->submit_count, &ring_ts_end);
 
    result = resolve_vis_stream_patchpoints(queue, submit, &dump_cmds,
                                            cmd_buffers, cmdbuf_count);
@@ -577,11 +888,15 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
                          cs->entry_count);
    }
 
-   autotune_cs = device->autotune->on_submit(cmd_buffers, cmdbuf_count);
+   if (!autotune_done)
+      autotune_cs = device->autotune->on_submit(cmd_buffers, cmdbuf_count);
    if (autotune_cs) {
       submit_add_entries(device, submit, &dump_cmds, autotune_cs->entries,
                          autotune_cs->entry_count);
    }
+
+   if (ring_ts_end.bo)
+      submit_add_entries(device, submit, &dump_cmds, &ring_ts_end, 1);
 
    if (FD_RD_DUMP(ENABLE)) {
       util_dynarray_foreach (&dump_cmds, struct tu_cs_entry, cmd)
@@ -674,7 +989,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
                 " omitted_bytes=%" PRIu64 " content=%" PRIu64 " content_bytes=%" PRIu64
                 " content_max=0x%" PRIx64 " over_int=%" PRIu64 " bytes=%" PRIu64 " limit=%" PRIu64
                 " valid=%u reason=%s",
-                device, queue, queue->msm_queue_id, device->submit_count,
+                device, target, target->msm_queue_id, device->submit_count,
                 rd->name ? rd->name : "-", scope, cmdbuf_count,
                 (unsigned)util_dynarray_num_elements(&dump_cmds, struct tu_cs_entry),
                 rd_root_dwords, debug_get_option_rd_min_root_dwords(), listed, listed_max, over_u32, marked, marked_bytes, bound, bound_bytes,
@@ -685,7 +1000,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
       } else if (fd_rd_output_begin_selected(rd, device->vk.current_frame,
                                              device->submit_count, bytes)) {
          mesa_logi("RD_CAPTURE_BEGIN device=%p queue=%p msm_queue=%u submit=%u capture=%u bytes=%" PRIu64 " file=%s namespace=%s",
-                   device, queue, queue->msm_queue_id, device->submit_count,
+                   device, target, target->msm_queue_id, device->submit_count,
                    rd->captures, bytes, rd->capture_path, rd->name ? rd->name : "-");
          fd_rd_output_write_section(rd, RD_CHIP_ID, &device->physical_device->dev_id.chip_id, 8);
          fd_rd_output_write_section(rd, RD_CMD, "tu-dump", 8);
@@ -728,12 +1043,12 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
          uint32_t capture = rd_selected ? rd->captures : 0;
          util_dynarray_foreach (&dump_cmds, struct tu_cs_entry, cmd) {
             mesa_logi("RD_CAPTURE_ROOT device=%p queue=%p msm_queue=%u submit=%u capture=%u iova=0x%" PRIx64 " dwords=%u gem=%u namespace=%s",
-                      device, queue, queue->msm_queue_id, device->submit_count, capture,
+                      device, target, target->msm_queue_id, device->submit_count, capture,
                       cmd->bo->iova + cmd->offset, cmd->size >> 2, cmd->bo->gem_handle,
                       rd->name ? rd->name : "-");
          }
          mesa_logi("RD_CAPTURE_PRE_SUBMIT device=%p queue=%p msm_queue=%u submit=%u capture=%u selected=%u complete=%u file=%s namespace=%s",
-                   device, queue, queue->msm_queue_id, device->submit_count,
+                   device, target, target->msm_queue_id, device->submit_count,
                    capture, rd_selected, rd_selected && !rd->failed,
                    rd_selected ? rd->capture_path : "-", rd->name ? rd->name : "-");
       } else if (rd->bridge_records != UINT64_MAX) {
@@ -752,15 +1067,15 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    }
 #endif
 
-   tu_free_log_calibration(device, queue, queue->msm_queue_id, device->submit_count);
+   tu_free_log_calibration(device, target, target->msm_queue_id, device->submit_count);
    result =
-      tu_queue_submit(queue, submit, vk_submit->waits, vk_submit->wait_count,
+      tu_queue_submit(target, submit, vk_submit->waits, vk_submit->wait_count,
                       vk_submit->signals, vk_submit->signal_count,
                       u_trace_submission_data);
    if (rd_bridge) {
       mesa_logi("RD_CAPTURE_POST_SUBMIT device=%p queue=%p msm_queue=%u submit=%u capture=%u result=%d fence=%d fence_valid=%u file=%s namespace=%s",
-                device, queue, queue->msm_queue_id, device->submit_count,
-                rd_selected ? device->rd_output.captures : 0, result, queue->fence,
+                device, target, target->msm_queue_id, device->submit_count,
+                rd_selected ? device->rd_output.captures : 0, result, target->fence,
                 result == VK_SUCCESS,
                 rd_selected ? device->rd_output.capture_path : "-",
                 device->rd_output.name ? device->rd_output.name : "-");
@@ -775,8 +1090,8 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
 
    if (u_trace_submission_data) {
       u_trace_submission_data->submission_id = device->submit_count;
-      u_trace_submission_data->queue = queue;
-      u_trace_submission_data->fence = queue->fence;
+      u_trace_submission_data->queue = target;
+      u_trace_submission_data->fence = target->fence;
 
       for (uint32_t i = 0; i < u_trace_submission_data->cmd_buffer_count; i++) {
          bool free_data =
@@ -793,6 +1108,11 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
                        true);
       }
    }
+
+   if (target->ring_ts)
+      tu_ring_ts_drain(target);
+   if (target != queue && queue->ring_ts)
+      tu_ring_ts_drain(queue);
 
    device->submit_count++;
 
@@ -853,13 +1173,66 @@ tu_queue_init(struct tu_device *device,
    queue->priority = priority;
    queue->vk.driver_submit =
       (type == TU_QUEUE_SPARSE) ? queue_submit_sparse : queue_submit;
+   queue->lpac =
+      device->physical_device->queue_families[create_info->queueFamilyIndex].lpac;
 
    int ret = tu_drm_submitqueue_new(device, queue);
    if (ret) {
       vk_queue_finish(&queue->vk);
       return vk_startup_errorf(device->instance, VK_ERROR_INITIALIZATION_FAILED,
-                               "submitqueue create failed");
+                               queue->lpac ? "LPAC submitqueue create failed" :
+                                             "submitqueue create failed");
    }
+
+   if (queue->lpac) {
+      /* Hidden BR queue for batches that need graphics hardware. Not a
+       * VkQueue: only the fields the submit path reads are set up.
+       */
+      assert(queue->order);
+      struct tu_queue *fb = static_cast<struct tu_queue *>(
+         vk_zalloc(&device->vk.alloc, sizeof(*fb), 8,
+                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE));
+      if (!fb) {
+         tu_drm_submitqueue_close(device, queue);
+         vk_queue_finish(&queue->vk);
+         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      vk_object_base_init(&device->vk, &fb->vk.base, VK_OBJECT_TYPE_QUEUE);
+      fb->vk.queue_family_index = queue->vk.queue_family_index;
+      fb->vk.index_in_family = queue->vk.index_in_family;
+      fb->device = device;
+      fb->type = TU_QUEUE_GFX;
+      fb->fence = -1;
+      /* Same kernel ring as this priority but a different drm_sched
+       * priority, hence a different scheduler entity than a graphics
+       * VkQueue of the same priority: a fallback job blocked on the order
+       * wait must not hold up graphics jobs queued behind it in one FIFO
+       * entity. ring = prio / 3 is unchanged.
+       */
+      fb->priority = (priority % 3 == 2) ? priority - 1 : priority + 1;
+      if (fb->priority >= (int) device->physical_device->submitqueue_priority_count)
+         fb->priority = priority;
+      fb->order = queue->order;
+      ret = tu_drm_submitqueue_new(device, fb);
+      if (ret) {
+         vk_object_base_finish(&fb->vk.base);
+         vk_free(&device->vk.alloc, fb);
+         tu_drm_submitqueue_close(device, queue);
+         vk_queue_finish(&queue->vk);
+         return vk_startup_errorf(device->instance, VK_ERROR_INITIALIZATION_FAILED,
+                                  "LPAC fallback submitqueue create failed");
+      }
+      queue->gfx_fallback = fb;
+      fb->ring_ts_wanted = debug_get_bool_option("TU_RING_TS_LOG", false);
+      mesa_logi("tu-lpac queue family=%u index=%u lpac_msm=%u priority=%d "
+                "fallback_msm=%u fallback_priority=%d",
+                queue->vk.queue_family_index, queue->vk.index_in_family,
+                queue->msm_queue_id, priority, fb->msm_queue_id, fb->priority);
+      tu_lpac_watchdog_start(queue);
+   }
+
+   if (type != TU_QUEUE_SPARSE)
+      queue->ring_ts_wanted = debug_get_bool_option("TU_RING_TS_LOG", false);
 
    return VK_SUCCESS;
 }
@@ -868,7 +1241,19 @@ void
 tu_queue_finish(struct tu_queue *queue)
 {
    bool emulated = vk_queue_is_emulated(&queue->vk);
+   tu_lpac_watchdog_stop(queue);
    vk_queue_finish(&queue->vk);
+   /* After vk_queue_finish: no submission can still be in the submit path. */
+   if (queue->gfx_fallback) {
+      struct tu_queue *fb = queue->gfx_fallback;
+      tu_lpac_log_stats(queue, "finish");
+      tu_ring_ts_finish(fb);
+      tu_drm_submitqueue_close(queue->device, fb);
+      vk_object_base_finish(&fb->vk.base);
+      vk_free(&queue->device->vk.alloc, fb);
+      queue->gfx_fallback = NULL;
+   }
+   tu_ring_ts_finish(queue);
    if (!emulated)
       tu_drm_submitqueue_close(queue->device, queue);
 }

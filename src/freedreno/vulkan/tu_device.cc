@@ -1951,11 +1951,34 @@ tu_physical_device_init(struct tu_physical_device *device,
    }
 
    device->has_compute_queue = strcmp(instance->knl->name, "msm") == 0;
+
+   /* TU_LPAC_COMPUTE=1 (opt-in): back the compute-only family with the LPAC
+    * ring (a separate compute-only CP that runs concurrently with BR/BV)
+    * instead of another BR ring. Based on MR !39889 (TU_DEBUG=lpac). Unset:
+    * nothing below changes and no LPAC ioctl was issued.
+    */
+   if (debug_get_bool_option("TU_LPAC_COMPUTE", false)) {
+      const char *why =
+         !device->has_compute_queue ? "no compute-only family (kernel driver not msm)" :
+         info.chip != 7 ? "not an a7xx GPU" :
+         !info.props.has_lpac ? "GPU has no LPAC" :
+         !device->has_lpac_submitqueue ? "kernel rejected MSM_SUBMITQUEUE_LPAC" :
+         /* The non-VM_BIND zombie-VMA path only tracks VkQueue fences, not
+          * the hidden fallback queue's.
+          */
+         !device->has_vm_bind ? "requires VM_BIND" :
+         NULL;
+      device->lpac_compute = why == NULL;
+      mesa_logi("tu-lpac TU_LPAC_COMPUTE=1: %s%s", why ? "disabled: " : "enabled",
+                why ? why : "");
+   }
+
    if (device->has_compute_queue) {
       device->queue_families[device->num_queue_families++] =
          (struct tu_queue_family) {
             .type = TU_QUEUE_GFX,
             .properties = &tu_compute_queue_family_properties,
+            .lpac = device->lpac_compute,
          };
    }
 
@@ -2397,6 +2420,31 @@ tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
                            CP_EVENT_WRITE_0_TIMESTAMP);
       tu_cs_emit_qw(ts_cs, bo->iova + offset_B);
       tu_cs_emit(ts_cs, 0x00000000);
+   } else if (CHIP == A7XX && ts_cs->device->physical_device->lpac_compute &&
+              ts_cs->cond_stack_depth < TU_COND_EXEC_STACK_SIZE) {
+      /* TU_LPAC_COMPUTE: an LPAC-family stream may run on LPAC (no RB, so
+       * no RB_DONE_TS) or on its BR fallback ring. Pick per CP at runtime.
+       */
+      tu_cond_exec_start(ts_cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
+                                CP_COND_REG_EXEC_0_BR | CP_COND_REG_EXEC_0_BV);
+      tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE7, 3);
+      tu_cs_emit(ts_cs, CP_EVENT_WRITE7_0(.event = RB_DONE_TS,
+                                          .write_src = EV_WRITE_ALWAYSON,
+                                          .write_dst = EV_DST_RAM,
+                                          .write_enabled = true)
+                           .value);
+      tu_cs_emit_qw(ts_cs, bo->iova + offset_B);
+      tu_cond_exec_end(ts_cs);
+      tu_cond_exec_start(ts_cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
+                                CP_COND_REG_EXEC_0_LPAC);
+      tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE7, 3);
+      tu_cs_emit(ts_cs, CP_EVENT_WRITE7_0(.event = CACHE_CLEAN,
+                                          .write_src = EV_WRITE_ALWAYSON,
+                                          .write_dst = EV_DST_RAM,
+                                          .write_enabled = true)
+                           .value);
+      tu_cs_emit_qw(ts_cs, bo->iova + offset_B);
+      tu_cond_exec_end(ts_cs);
    } else {
       tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE7, 3);
       tu_cs_emit(ts_cs, CP_EVENT_WRITE7_0(.event = RB_DONE_TS,
