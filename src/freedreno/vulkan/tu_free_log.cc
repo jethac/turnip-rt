@@ -338,6 +338,17 @@ tu_free_log_config(bool epw_broad, bool cs_isz_wa, uint32_t cs_isz_restore)
 }
 
 void
+tu_free_log_cs_trim(const char *name, const char *reason, uint32_t bo_count,
+                    uint64_t retained_bytes, uint64_t used_bytes,
+                    uint64_t next_bytes)
+{
+   fl_line("cs_trim name=%s reason=%s bos=%u retained=0x%" PRIx64
+           " used=0x%" PRIx64 " next=0x%" PRIx64,
+           fl_intern(name), reason, bo_count, retained_bytes, used_bytes,
+           next_bytes);
+}
+
+void
 tu_free_log_cs_isz(const char *bin, uint32_t instrlen, bool wa,
                    uint32_t restore, uint32_t cond)
 {

@@ -2931,6 +2931,8 @@ tu_device_destroy_mutexes(struct tu_device *device)
    mtx_destroy(&device->wave_pvtmem_bo.mtx);
    mtx_destroy(&device->vis_stream_mtx);
    mtx_destroy(&device->vis_stream_suballocator_mtx);
+   mtx_destroy(&device->cs_park_mtx);
+   cnd_destroy(&device->cs_park_cnd);
    mtx_destroy(&device->mutex);
    mtx_destroy(&device->copy_timestamp_cs_pool_mutex);
    mtx_destroy(&device->softfloat_mutex);
@@ -3067,6 +3069,15 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    mtx_init(&device->wave_pvtmem_bo.mtx, mtx_plain);
    mtx_init(&device->vis_stream_mtx, mtx_plain);
    mtx_init(&device->vis_stream_suballocator_mtx, mtx_plain);
+   mtx_init(&device->cs_park_mtx, mtx_plain);
+   cnd_init(&device->cs_park_cnd);
+   list_inithead(&device->cs_park_lru);
+   device->cs_park_budget =
+      (uint64_t) MAX2(debug_get_num_option("TU_CS_PARK_BUDGET_MB", 256), 0)
+      << 20;
+   device->cs_park_idle_ns =
+      (uint64_t) MAX2(debug_get_num_option("TU_CS_PARK_IDLE_MS", 5000), 0) *
+      1000000ull;
    mtx_init(&device->mutex, mtx_plain);
    mtx_init(&device->copy_timestamp_cs_pool_mutex, mtx_plain);
    mtx_init(&device->softfloat_mutex, mtx_plain);
