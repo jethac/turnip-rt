@@ -9,6 +9,9 @@
 
 #include "tu_device.h"
 
+#include <time.h>
+#include <unistd.h>
+
 #include "drm-uapi/drm_fourcc.h"
 #include "git_sha1.h"
 #include "perfcntrs/freedreno_perfcntr.h"
@@ -2486,6 +2489,57 @@ tu_trace_get_data(struct u_trace_context *utctx,
    return static_cast<char *>(tu_suballoc_bo_map(bo)) + offset_B;
 }
 
+static once_flag tu_gpu_trace_gate_once = ONCE_FLAG_INIT;
+static char *tu_gpu_trace_gate_path;
+static uint64_t tu_gpu_trace_gate_mask;
+static uint64_t tu_gpu_trace_gate_next_ns;
+static uint32_t tu_gpu_trace_gate_open;
+
+static void
+tu_gpu_trace_gate_once_init(void)
+{
+   const char *path = os_get_option("TU_GPU_TRACE_GATE");
+   if (!path || !*path)
+      return;
+   tu_gpu_trace_gate_path = strdup(path);
+   if (!tu_gpu_trace_gate_path)
+      return;
+   /* Runs after tu_gpu_tracepoint_config_variable(): keep the configured
+    * mask and start closed. */
+   tu_gpu_trace_gate_mask = p_atomic_read(&tu_gpu_tracepoint);
+   p_atomic_set(&tu_gpu_tracepoint, 0);
+   mesa_logi("TU_GPU_TRACE_GATE config path=%s mask=0x%" PRIx64 " state=closed",
+             tu_gpu_trace_gate_path, tu_gpu_trace_gate_mask);
+}
+
+void
+tu_gpu_trace_gate_init(void)
+{
+   call_once(&tu_gpu_trace_gate_once, tu_gpu_trace_gate_once_init);
+}
+
+void
+tu_gpu_trace_gate_poll(struct tu_device *device)
+{
+   if (!tu_gpu_trace_gate_path)
+      return;
+   struct timespec ts;
+   if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0)
+      return;
+   uint64_t now = (uint64_t) ts.tv_sec * 1000000000ull + ts.tv_nsec;
+   uint64_t next = p_atomic_read(&tu_gpu_trace_gate_next_ns);
+   if (now < next ||
+       p_atomic_cmpxchg(&tu_gpu_trace_gate_next_ns, next, now + 250000000ull) != next)
+      return;
+   uint32_t open = access(tu_gpu_trace_gate_path, F_OK) == 0;
+   if (p_atomic_xchg(&tu_gpu_trace_gate_open, open) == open)
+      return;
+   p_atomic_set(&tu_gpu_tracepoint, open ? tu_gpu_trace_gate_mask : 0);
+   mesa_logi("TU_GPU_TRACE_GATE state=%s raw_ns=%" PRIu64 " device=%p submit=%u frame=%u",
+             open ? "open" : "closed", now, (void *) device,
+             device->submit_count, (unsigned) device->vk.current_frame);
+}
+
 VkResult
 tu_create_copy_timestamp_cs(struct tu_u_trace_submission_data *submission_data,
                             struct tu_cmd_buffer **cmd_buffers,
@@ -3342,6 +3396,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    device->use_lrz = !TU_DEBUG_START(NOLRZ);
 
    tu_gpu_tracepoint_config_variable();
+   tu_gpu_trace_gate_init();
 
    device->submit_count = 0;
    list_inithead(&device->copy_timestamp_cs_pool);
