@@ -495,6 +495,8 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    if (TU_DEBUG(LOG_SKIP_GMEM_OPS))
       tu_dbg_log_gmem_load_store_skips(device);
 
+   tu_gpu_trace_gate_poll(device);
+
    pthread_mutex_lock(&device->submit_mutex);
 
    struct tu_cmd_buffer **cmd_buffers =

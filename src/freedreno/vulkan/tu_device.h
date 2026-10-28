@@ -678,6 +678,15 @@ tu_copy_buffer(struct u_trace_context *utctx, void *cmdstream,
                void *ts_to, uint64_t to_offset_B,
                uint64_t size_B);
 
+/* Opt-in tracing window: TU_GPU_TRACE_GATE=<path>. Tracepoints stay off
+ * until <path> exists; polled at most every 250 ms from queue submission.
+ * Only command buffers recorded while the gate is open carry trace points. */
+void
+tu_gpu_trace_gate_init(void);
+
+void
+tu_gpu_trace_gate_poll(struct tu_device *device);
+
 VkResult
 tu_create_copy_timestamp_cs(struct tu_u_trace_submission_data *submission_data,
                             struct tu_cmd_buffer **cmd_buffers,
