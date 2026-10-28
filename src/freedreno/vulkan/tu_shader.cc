@@ -1344,6 +1344,14 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
    return true;
 }
 
+#define TU_UBO_WITNESS_MAX 64
+
+struct tu_ubo_witness {
+   uint32_t set;
+   uint32_t binding;
+   uint32_t index;
+};
+
 struct lower_instr_params {
    struct tu_device *dev;
    struct tu_shader *shader;
@@ -1352,6 +1360,12 @@ struct lower_instr_params {
    bool dynamic_renderpass;
    bool ray_tracing;
    struct ir3_const_allocations *const_allocs;
+
+   /* TU_UBO_WITNESS_SPECULATE: push-descriptor UBO descriptors that every
+    * terminating invocation dynamically accesses (see collect_ubo_witnesses).
+    */
+   unsigned num_ubo_witnesses;
+   struct tu_ubo_witness ubo_witnesses[TU_UBO_WITNESS_MAX];
 };
 
 static bool
@@ -1533,6 +1547,182 @@ can_speculate_resource(nir_def *def,
 }
 
 static bool
+tu_ubo_witness_speculate_enabled(void)
+{
+   static const bool enabled =
+      debug_get_bool_option("TU_UBO_WITNESS_SPECULATE", false);
+   return enabled;
+}
+
+/* Resolves a UBO resource source to a single push-descriptor UNIFORM_BUFFER
+ * descriptor with a constant, in-range, non-variable array index (the same
+ * descriptor-address proof can_speculate_descriptor_load() requires).
+ */
+static bool
+get_push_ubo_descriptor(nir_def *def, const struct tu_pipeline_layout *layout,
+                        struct tu_ubo_witness *w)
+{
+   nir_scalar comp1 = nir_scalar_resolved(def, 0);
+   nir_scalar comp2 = nir_scalar_resolved(def, 1);
+
+   if (comp1.def != comp2.def || comp1.comp != 0 || comp2.comp != 1)
+      return false;
+
+   nir_instr *instr = nir_def_instr(comp1.def);
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_load_vulkan_descriptor)
+      return false;
+
+   nir_instr *resource = nir_def_instr(intr->src[0].ssa);
+   if (resource->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *resource_intr = nir_instr_as_intrinsic(resource);
+   if (resource_intr->intrinsic != nir_intrinsic_vulkan_resource_index)
+      return false;
+
+   unsigned set = nir_intrinsic_desc_set(resource_intr);
+   unsigned binding = nir_intrinsic_binding(resource_intr);
+   if (set >= layout->num_sets || !layout->set[set].layout)
+      return false;
+
+   const struct tu_descriptor_set_layout *set_layout = layout->set[set].layout;
+   if (!(set_layout->flags &
+         VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) ||
+       binding >= set_layout->binding_count ||
+       set_layout->binding[binding].type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+       !can_speculate_descriptor_load(resource_intr->src[0], set_layout,
+                                      binding))
+      return false;
+
+   w->set = set;
+   w->binding = binding;
+   w->index = nir_src_as_uint(resource_intr->src[0]);
+   return true;
+}
+
+/* Whether a UBO byte offset is a compile-time constant, possibly added to the
+ * offset component of a constant-index descriptor (unoptimized vtn output is
+ * "descriptor.z + (C << 4)"). No invocation-dependent value is accepted, so
+ * such offsets cannot be dynamically indexed.
+ */
+static bool
+ubo_offset_is_static(nir_scalar s, unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_const(s))
+      return true;
+   if (depth == 0)
+      return false;
+
+   if (nir_scalar_is_alu(s)) {
+      nir_op op = nir_scalar_alu_op(s);
+      if (op != nir_op_iadd && op != nir_op_ishl && op != nir_op_imul)
+         return false;
+      for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
+         if (!ubo_offset_is_static(nir_scalar_chase_alu_src(s, i), depth - 1))
+            return false;
+      }
+      return true;
+   }
+
+   if (nir_scalar_is_intrinsic(s) &&
+       nir_scalar_intrinsic_op(s) == nir_intrinsic_load_vulkan_descriptor) {
+      nir_instr *resource = nir_def_instr(nir_def_as_intrinsic(s.def)->src[0].ssa);
+      return resource->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(resource)->intrinsic ==
+                nir_intrinsic_vulkan_resource_index &&
+             nir_src_is_const(nir_instr_as_intrinsic(resource)->src[0]);
+   }
+
+   return false;
+}
+
+static bool
+has_ubo_witness(const struct lower_instr_params *params,
+                const struct tu_ubo_witness *w)
+{
+   for (unsigned i = 0; i < params->num_ubo_witnesses; i++) {
+      const struct tu_ubo_witness *o = &params->ubo_witnesses[i];
+      if (o->set == w->set && o->binding == w->binding && o->index == w->index)
+         return true;
+   }
+   return false;
+}
+
+/* TU_UBO_WITNESS_SPECULATE (opt-in, compute only, never ray tracing).
+ *
+ * A push-descriptor UBO binding in a descriptor-buffer layout is treated as
+ * partially bound, so its contents only need to be valid if the access is
+ * dynamically executed. This collects descriptors that ARE dynamically
+ * accessed whenever the dispatch runs at all: a live load_ubo through the
+ * descriptor in a block that dominates the end block, i.e. that every
+ * invocation which terminates executes. Any other load through the same
+ * descriptor with a constant offset may then be speculated: it either runs in
+ * an invocation (which also executes the witness) or in a non-early preamble,
+ * which only runs when at least one wave/invocation exists. Early preamble is
+ * disabled for such shaders (see no_early_preamble), because it can run with
+ * zero invocations. Out-of-range offsets remain bounds-checked by the UBO
+ * descriptor size, as for every other speculated descriptor access.
+ */
+static void
+collect_ubo_witnesses(nir_shader *shader, struct lower_instr_params *params)
+{
+   params->num_ubo_witnesses = 0;
+   if (!tu_ubo_witness_speculate_enabled() ||
+       shader->info.stage != MESA_SHADER_COMPUTE || params->ray_tracing)
+      return;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_metadata_require(impl, nir_metadata_block_index | nir_metadata_dominance);
+
+   /* NIR does not compute dominance for the end block itself, so require
+    * the witness block to dominate every reachable predecessor of it. With
+    * no reachable predecessor (no terminating path), there is no witness.
+    */
+   bool exit_reachable = false;
+   nir_foreach_pred (pred, impl->end_block) {
+      if (!nir_block_is_unreachable(pred))
+         exit_reachable = true;
+   }
+   if (!exit_reachable)
+      return;
+
+   nir_foreach_block (block, impl) {
+      if (nir_block_is_unreachable(block))
+         continue;
+
+      bool dominates_exit = true;
+      nir_foreach_pred (pred, impl->end_block) {
+         if (!nir_block_is_unreachable(pred) &&
+             !nir_block_dominates(block, pred))
+            dominates_exit = false;
+      }
+      if (!dominates_exit)
+         continue;
+
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+         if (intrin->intrinsic != nir_intrinsic_load_ubo ||
+             nir_def_is_unused(&intrin->def))
+            continue;
+
+         struct tu_ubo_witness w;
+         if (!get_push_ubo_descriptor(intrin->src[0].ssa, params->layout, &w) ||
+             has_ubo_witness(params, &w) ||
+             params->num_ubo_witnesses == TU_UBO_WITNESS_MAX)
+            continue;
+         params->ubo_witnesses[params->num_ubo_witnesses++] = w;
+      }
+   }
+}
+
+static bool
 set_speculate_intrinsic(nir_intrinsic_instr *intrin,
                         struct lower_instr_params *params)
 {
@@ -1556,6 +1746,17 @@ set_speculate_intrinsic(nir_intrinsic_instr *intrin,
 
    default:
       return false;
+   }
+
+   if (intrin->intrinsic == nir_intrinsic_load_ubo && !can_speculate &&
+       can_speculate_descriptor && params->num_ubo_witnesses &&
+       ubo_offset_is_static(nir_get_scalar(intrin->src[1].ssa, 0), 8)) {
+      struct tu_ubo_witness w;
+      if (get_push_ubo_descriptor(intrin->src[0].ssa, params->layout, &w) &&
+          has_ubo_witness(params, &w)) {
+         can_speculate = true;
+         params->shader->ubo_witness_speculated = true;
+      }
    }
 
    if ((intrin->intrinsic == nir_intrinsic_load_ubo ||
@@ -1841,6 +2042,8 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
                                                nir_metadata_none,
                                                &params);
    }
+
+   collect_ubo_witnesses(shader, &params);
 
    progress |= nir_shader_instructions_pass(shader,
                                             set_speculate_instr,
@@ -4101,6 +4304,7 @@ tu_shader_create(struct tu_device *dev,
       .push_consts_dwords = shader->const_state.push_consts.dwords,
       .const_allocs = const_allocs,
       .nir_options = nir_options,
+      .no_early_preamble = shader->ubo_witness_speculated,
       .rt_part = rt && rt->part,
       .rt_scalar_pvtmem = rt && debug_get_bool_option("TU_RT_LINK_PERWAVE", false),
       .rt_blobs = rt ? rt->blobs : NULL,
@@ -4155,6 +4359,10 @@ tu_shader_create(struct tu_device *dev,
                 shader->variant->blake3_str,
                 shader->variant->info.instrs_count,
                 shader->variant->constlen);
+   if (log_hashes && shader->variant && shader->ubo_witness_speculated)
+      mesa_logi("tu-ubo-witness: bin=%.12s witnessed push-UBO speculation, "
+                "early_preamble=%d", shader->variant->blake3_str,
+                shader->variant->early_preamble);
 
    if (ir3_exceeds_safe_constlen(shader->variant)) {
       struct ir3_shader_key safe_constlen_key = *ir3_key;

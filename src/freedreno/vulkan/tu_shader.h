@@ -81,6 +81,11 @@ struct tu_shader
    uint32_t view_mask;
    uint8_t active_desc_sets;
 
+   /* Set while compiling when TU_UBO_WITNESS_SPECULATE granted resource
+    * speculation to at least one UBO load; forces a non-early preamble.
+    */
+   bool ubo_witness_speculated;
+
    /* The dynamic buffer descriptor size for descriptor sets that we know
     * about. This is used when linking to piece together the sizes and from
     * there calculate the offsets. It's -1 if we don't know because the

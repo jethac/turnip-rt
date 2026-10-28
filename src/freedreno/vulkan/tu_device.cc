@@ -139,6 +139,7 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
       debug_get_bool_option("TU_ATOMIC_EARLY_OUT", true),
       debug_get_bool_option("TU_LANE_SHUFFLE", false),
       debug_get_bool_option("TU_FOVEATE", false),
+      debug_get_bool_option("TU_UBO_WITNESS_SPECULATE", false),
    };
    _mesa_blake3_update(&ctx, env_flags, sizeof(env_flags));
    if (tu_gaze_block_enabled())
