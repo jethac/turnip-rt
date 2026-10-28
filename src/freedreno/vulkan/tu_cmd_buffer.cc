@@ -4753,6 +4753,9 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
          }
       }
 
+      if (pass_continue && unlikely(tu_vrs_enabled()))
+         cmd_buffer->state.vrs.inherited = true;
+
       if (pass_continue) {
          const VkCommandBufferInheritanceRenderingInfo *rendering_info =
             vk_find_struct_const(pBeginInfo->pInheritanceInfo->pNext,
@@ -7196,12 +7199,184 @@ tu7_emit_subpass_clear(struct tu_cmd_buffer *cmd, struct tu_resolve_group *resol
       tu_cs_set_writeable(cs, false);
 }
 
+/* TU_VRS: rate-image layout identical to what tu_image would pick for an
+ * optimal R8_UINT VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT image of
+ * the same size (TILE6_3, no UBWC; linear below 16 texels wide), unless
+ * TU_VRS_LINEAR forces linear (VRS-HARVEST "V5" experiment).
+ */
+static void
+tu_vrs_layout(struct tu_device *dev, uint32_t tw, uint32_t th,
+              struct fdl_layout *layout)
+{
+   enum a6xx_tile_mode tile_mode =
+      (tu_vrs_linear() || tw < 16) ? TILE6_LINEAR : TILE6_3;
+   memset(layout, 0, sizeof(*layout));
+   layout->tile_mode = tile_mode;
+   layout->ubwc = false;
+   struct fdl_image_params params = {
+      .format = PIPE_FORMAT_R8_UINT,
+      .nr_samples = 1,
+      .width0 = tw,
+      .height0 = th,
+      .depth0 = 1,
+      .mip_levels = 1,
+      .array_size = 1,
+      .tile_mode = tile_mode,
+      .ubwc = false,
+   };
+   fdl6_layout_image(layout, &dev->physical_device->dev_info, &params, NULL);
+}
+
+#define TU_VRS_FLAT_MAX_TEXELS 2048 /* 16384 / 8 */
+
+static struct tu_bo *
+tu_vrs_flat_bo(struct tu_device *dev, uint64_t *size_out)
+{
+   simple_mtx_lock(&dev->vrs_flat_mtx);
+   if (!dev->vrs_flat_bo) {
+      struct fdl_layout layout;
+      tu_vrs_layout(dev, TU_VRS_FLAT_MAX_TEXELS, TU_VRS_FLAT_MAX_TEXELS, &layout);
+      struct fdl_layout lin;
+      memset(&lin, 0, sizeof(lin));
+      lin.tile_mode = TILE6_LINEAR;
+      struct fdl_image_params params = {
+         .format = PIPE_FORMAT_R8_UINT, .nr_samples = 1,
+         .width0 = TU_VRS_FLAT_MAX_TEXELS, .height0 = TU_VRS_FLAT_MAX_TEXELS,
+         .depth0 = 1, .mip_levels = 1, .array_size = 1,
+         .tile_mode = TILE6_LINEAR,
+      };
+      fdl6_layout_image(&lin, &dev->physical_device->dev_info, &params, NULL);
+      uint64_t size = align64(MAX2(layout.size, lin.size), 4096);
+      struct tu_bo *bo = NULL;
+      VkResult result = tu_bo_init_new(dev, NULL, &bo, size,
+                                       TU_BO_ALLOC_INTERNAL_RESOURCE,
+                                       "vrs_flat");
+      if (result == VK_SUCCESS) {
+         result = tu_bo_map(dev, bo, NULL);
+         if (result == VK_SUCCESS) {
+            memset(bo->map, 0, size);
+            if (bo->cached_non_coherent)
+               tu_bo_sync_cache(dev, bo, 0, size, TU_MEM_SYNC_CACHE_TO_GPU);
+            dev->vrs_flat_bo = bo;
+            mesa_logi("tu-vrs: flat (1x1) quality buffer %" PRIu64 " bytes at 0x%" PRIx64,
+                      size, bo->iova);
+         } else {
+            tu_bo_finish(dev, bo);
+         }
+      }
+      if (!dev->vrs_flat_bo)
+         mesa_loge("tu-vrs: flat quality buffer allocation failed (%d)", result);
+   }
+   struct tu_bo *bo = dev->vrs_flat_bo;
+   *size_out = bo ? bo->size : 0;
+   simple_mtx_unlock(&dev->vrs_flat_mtx);
+   return bo;
+}
+
+/* Emit the injected quality buffer for a pass without an app attachment.
+ * Returns false only if no buffer could be provided (the caller then emits
+ * the stock null state).
+ */
+template <chip CHIP>
+static bool
+tu7_emit_vrs_quality_buffer(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   struct tu_device *dev = cmd->device;
+   const struct tu_framebuffer *fb = cmd->state.framebuffer;
+   uint32_t w = fb->width, h = fb->height;
+   struct fdl_layout layout;
+   uint64_t iova = 0;
+   enum tu_vrs_pass_kind kind = TU_VRS_PASS_FLAT;
+
+   if (cmd->state.vrs.pass_eligible) {
+      struct tu_vrs_frame f;
+      tu_vrs_frame_get(dev, &f);
+      kind = TU_VRS_PASS_OFF;
+      if (f.state != TU_VRS_OFF) {
+         uint32_t tw = DIV_ROUND_UP(w, TU_VRS_TEXEL);
+         uint32_t th = DIV_ROUND_UP(h, TU_VRS_TEXEL);
+         tu_vrs_layout(dev, tw, th, &layout);
+         if (cmd->state.vrs.map_valid && cmd->state.vrs.map_epoch == f.epoch &&
+             cmd->state.vrs.map_w == w && cmd->state.vrs.map_h == h) {
+            iova = cmd->state.vrs.map_iova;
+         } else {
+            struct tu_cs_memory mem;
+            VkResult result =
+               tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(layout.size, 4096), 1024, &mem);
+            if (result != VK_SUCCESS) {
+               vk_command_buffer_set_error(&cmd->vk, result);
+            } else {
+               memset(mem.map, 0, align64(layout.size, 4096));
+               bool tiled = layout.tile_mode != TILE6_LINEAR;
+               uint32_t pitch = fdl_pitch(&layout, 0);
+               uint8_t *lin = tiled ? (uint8_t *) malloc((size_t) tw * th) :
+                                      (uint8_t *) mem.map;
+               if (lin) {
+                  tu_vrs_build_map(&f, w, h, lin, tiled ? tw : pitch);
+                  tu_vrs_dump_map(&f, w, h, lin, tiled ? tw : pitch);
+                  if (tiled) {
+                     fdl6_memcpy_linear_to_tiled(0, 0, tw, th, (char *) mem.map,
+                                                 (const char *) lin, &layout, 0, tw,
+                                                 &dev->physical_device->ubwc_config);
+                     free(lin);
+                  }
+                  iova = mem.iova;
+                  cmd->state.vrs.map_valid = true;
+                  cmd->state.vrs.map_epoch = f.epoch;
+                  cmd->state.vrs.map_w = w;
+                  cmd->state.vrs.map_h = h;
+                  cmd->state.vrs.map_iova = iova;
+               }
+            }
+         }
+         if (iova)
+            kind = TU_VRS_PASS_GAZE;
+      }
+   }
+
+   if (!iova) {
+      uint32_t tw = MIN2(DIV_ROUND_UP(w, TU_VRS_TEXEL), TU_VRS_FLAT_MAX_TEXELS);
+      uint32_t th = MIN2(DIV_ROUND_UP(h, TU_VRS_TEXEL), TU_VRS_FLAT_MAX_TEXELS);
+      uint64_t size;
+      struct tu_bo *bo = tu_vrs_flat_bo(dev, &size);
+      tu_vrs_layout(dev, tw, th, &layout);
+      if (!bo || layout.size > size)
+         return false;
+      iova = bo->iova;
+   }
+
+   tu_cs_emit_regs(
+      cs,
+      GRAS_QUALITY_BUFFER_INFO(
+         CHIP, .layered = true,
+         .tile_mode = static_cast<a6xx_tile_mode>(layout.tile_mode), ),
+      GRAS_QUALITY_BUFFER_DIMENSION(CHIP, .width = layout.width0,
+                                    .height = layout.height0));
+   /* array_pitch 0: every layer/view reads the same map. */
+   tu_cs_emit_regs(
+      cs, GRAS_QUALITY_BUFFER_PITCH(CHIP, .pitch = fdl_pitch(&layout, 0),
+                                    .array_pitch = 0));
+   tu_cs_emit_regs(cs, GRAS_QUALITY_BUFFER_BASE(CHIP, .qword = iova));
+
+   tu_emit_raw_event_write<A7XX>(cmd, cs, LRZ_Q_CACHE_INVALIDATE, false);
+   cmd->prev_fsr_is_null = false;
+   tu_vrs_note_pass(kind);
+   return true;
+}
+
 template <chip CHIP>
 static void
 tu7_emit_subpass_shading_rate(struct tu_cmd_buffer *cmd,
                               const struct tu_subpass *subpass,
                               struct tu_cs *cs)
 {
+   if (unlikely(tu_vrs_enabled())) {
+      if (subpass->fsr_attachment != VK_ATTACHMENT_UNUSED)
+         tu_vrs_note_pass(TU_VRS_PASS_APP);
+      else if (tu7_emit_vrs_quality_buffer<CHIP>(cmd, cs))
+         return;
+   }
+
    if (subpass->fsr_attachment == VK_ATTACHMENT_UNUSED) {
       tu_cs_emit_regs(cs, GRAS_QUALITY_BUFFER_INFO(CHIP),
                       GRAS_QUALITY_BUFFER_DIMENSION(CHIP));
@@ -7429,6 +7604,8 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
    tu_set_render_area(cmd, &pRenderPassBegin->renderArea,
                       pRenderPassBegin->pNext);
    cmd->state.fdm_per_layer = pass->has_layered_fdm;
+   if (unlikely(tu_vrs_enabled()))
+      cmd->state.vrs.pass_eligible = false;
 
    if (pass->attachment_count > 0) {
       VK_MULTIALLOC(ma);
@@ -7543,6 +7720,50 @@ tu_emit_rendering_attachment_locations(struct tu_cmd_buffer *cmd)
                                 TU_ACCESS_CCU_COLOR_INCOHERENT_WRITE);
       cache->flush_bits |= TU_CMD_FLAG_WAIT_FOR_IDLE;
    }
+}
+
+/* TU_VRS per-pass decision: no app rate attachment, render area on the
+ * TU_VRS_DIMS allowlist, at least one colour attachment and a depth
+ * attachment all of one size, single view/layer, no FDM, no MSRTSS, single
+ * subpass. Input attachments and feedback loops are vetoed per draw.
+ */
+static bool
+tu_vrs_rendering_eligible(struct tu_cmd_buffer *cmd,
+                          const VkRenderingInfo *info)
+{
+   const struct tu_subpass *subpass = &cmd->dynamic_subpasses[0];
+   if (subpass->fsr_attachment != VK_ATTACHMENT_UNUSED)
+      return false;
+   if (cmd->dynamic_pass.subpass_count != 1 ||
+       cmd->dynamic_pass.fragment_density_map.attachment != VK_ATTACHMENT_UNUSED)
+      return false;
+   if (info->viewMask || info->layerCount > 1)
+      return false;
+   if (vk_find_struct_const(info->pNext,
+                            MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT))
+      return false;
+   uint32_t w = info->renderArea.offset.x + info->renderArea.extent.width;
+   uint32_t h = info->renderArea.offset.y + info->renderArea.extent.height;
+   if (!tu_vrs_dims_ok(w, h))
+      return false;
+   const VkRenderingAttachmentInfo *d = info->pDepthAttachment;
+   if (!d || d->imageView == VK_NULL_HANDLE)
+      return false;
+   VK_FROM_HANDLE(tu_image_view, dview, d->imageView);
+   uint32_t dw = dview->vk.extent.width, dh = dview->vk.extent.height;
+   if (dw < w || dh < h)
+      return false;
+   bool color = false;
+   for (uint32_t i = 0; i < info->colorAttachmentCount; i++) {
+      VkImageView handle = info->pColorAttachments[i].imageView;
+      if (handle == VK_NULL_HANDLE)
+         continue;
+      VK_FROM_HANDLE(tu_image_view, cview, handle);
+      if (cview->vk.extent.width != dw || cview->vk.extent.height != dh)
+         return false;
+      color = true;
+   }
+   return color;
 }
 
 template <chip CHIP>
@@ -7694,6 +7915,11 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
       vk_command_buffer_set_error(&cmd->vk, result);
       return;
    }
+
+   if (unlikely(tu_vrs_enabled()) &&
+       !(pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT))
+      cmd->state.vrs.pass_eligible =
+         tu_vrs_rendering_eligible(cmd, pRenderingInfo);
 
    tu_choose_gmem_layout(cmd);
 

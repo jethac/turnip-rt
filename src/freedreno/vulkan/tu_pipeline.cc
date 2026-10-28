@@ -4327,13 +4327,44 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
               &cmd->vk.dynamic_graphics_state.cb);
 
    if (cmd->device->physical_device->info->props.has_attachment_shading_rate) {
-      DRAW_STATE_COND(fragment_shading_rate,
-               TU_DYNAMIC_STATE_A7XX_FRAGMENT_SHADING_RATE,
-               cmd->state.dirty & (TU_CMD_DIRTY_SUBPASS | TU_CMD_DIRTY_SHADING_RATE),
-               &cmd->vk.dynamic_graphics_state.fsr,
-               cmd->state.subpass->fsr_attachment != VK_ATTACHMENT_UNUSED,
-               cmd->state.program.writes_shading_rate,
-               cmd->state.program.reads_shading_rate);
+      if (unlikely(tu_vrs_enabled())) {
+         /* TU_VRS: only dynamic FSR state reaches here (static pipeline FSR
+          * is skipped by DRAW_STATE_COND), i.e. vkd3d-vetted pipelines.
+          */
+         struct vk_fragment_shading_rate_state vrs_fsr =
+            cmd->vk.dynamic_graphics_state.fsr;
+         bool att = cmd->state.subpass->fsr_attachment != VK_ATTACHMENT_UNUSED;
+         if (!att && (cmd->state.vrs.pass_eligible || cmd->state.vrs.inherited)) {
+            att = tu_vrs_pipeline_fsr(
+               cmd->state.shaders[MESA_SHADER_FRAGMENT],
+               cmd->vk.dynamic_graphics_state.ms.rasterization_samples,
+               cmd->state.pipeline_feedback_loops ||
+                  cmd->vk.dynamic_graphics_state.feedback_loops,
+               &vrs_fsr);
+         }
+         DRAW_STATE_COND(fragment_shading_rate,
+                  TU_DYNAMIC_STATE_A7XX_FRAGMENT_SHADING_RATE,
+                  (cmd->state.dirty & (TU_CMD_DIRTY_SUBPASS |
+                                       TU_CMD_DIRTY_SHADING_RATE |
+                                       TU_CMD_DIRTY_FS |
+                                       TU_CMD_DIRTY_PROGRAM)) ||
+                  BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                              MESA_VK_DYNAMIC_ATTACHMENT_FEEDBACK_LOOP_ENABLE) ||
+                  BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                              MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES),
+                  &vrs_fsr,
+                  att,
+                  cmd->state.program.writes_shading_rate,
+                  cmd->state.program.reads_shading_rate);
+      } else {
+         DRAW_STATE_COND(fragment_shading_rate,
+                  TU_DYNAMIC_STATE_A7XX_FRAGMENT_SHADING_RATE,
+                  cmd->state.dirty & (TU_CMD_DIRTY_SUBPASS | TU_CMD_DIRTY_SHADING_RATE),
+                  &cmd->vk.dynamic_graphics_state.fsr,
+                  cmd->state.subpass->fsr_attachment != VK_ATTACHMENT_UNUSED,
+                  cmd->state.program.writes_shading_rate,
+                  cmd->state.program.reads_shading_rate);
+      }
    }
    /* For SW multiview (no HW multiview), don't enable HW multiview
     * registers -- the driver handles multiview via draw duplication.

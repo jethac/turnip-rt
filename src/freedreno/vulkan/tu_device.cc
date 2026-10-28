@@ -3014,6 +3014,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    mtx_init(&device->vis_stream_mtx, mtx_plain);
    mtx_init(&device->vis_stream_suballocator_mtx, mtx_plain);
    mtx_init(&device->mutex, mtx_plain);
+   simple_mtx_init(&device->vrs_flat_mtx, mtx_plain);
    mtx_init(&device->copy_timestamp_cs_pool_mutex, mtx_plain);
    mtx_init(&device->softfloat_mutex, mtx_plain);
 #ifdef HAVE_PERFETTO
@@ -3523,6 +3524,10 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (device->null_accel_struct_bo)
       tu_bo_finish(device, device->null_accel_struct_bo);
+
+   if (device->vrs_flat_bo)
+      tu_bo_finish(device, device->vrs_flat_bo);
+   simple_mtx_destroy(&device->vrs_flat_mtx);
 
    tu_refit_every_finish(device);
 

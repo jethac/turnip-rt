@@ -683,6 +683,21 @@ struct tu_cmd_state
 
    unsigned tile_render_pass_count;
    bool renderpass_cb_disabled;
+
+   /* TU_VRS (only touched when tu_vrs_enabled()). */
+   struct {
+      /* The current pass, begun in this command buffer, gets the gaze map. */
+      bool pass_eligible;
+      /* Secondary continuing a pass begun elsewhere: dimensions unknown, the
+       * primary's quality buffer decides (gaze map or flat).
+       */
+      bool inherited;
+      /* Command-buffer-local map cache, one per (epoch, dims). */
+      bool map_valid;
+      uint64_t map_epoch;
+      uint32_t map_w, map_h;
+      uint64_t map_iova;
+   } vrs;
 };
 
 struct tu_vis_stream_patchpoint {
