@@ -177,6 +177,33 @@ tu_destroy_softfloat(struct tu_device *device);
 bool
 tu_nir_lower_emulated_subgroups(nir_shader *shader, unsigned subgroup_size);
 
+struct tu_sg32_cfg {
+   bool v2, l1, l2, l2b, l4;
+};
+
+struct tu_sg32_report {
+   bool active;       /* v2 path ran (emulated compute shader) */
+   bool native;       /* L4: emulation dropped */
+   const char *reason;
+   unsigned l1;       /* subgroup ops removed by L1 */
+   unsigned l2;       /* ops lowered by L2 */
+   unsigned l2b;      /* ALU pushed through half selects */
+};
+
+bool
+tu_sg32_v2_enabled(void);
+
+const char *
+tu_sg32_uuid_string(void);
+
+struct ir3_compiler;
+bool
+tu_nir_sg32_v2(nir_shader *nir, struct ir3_compiler *compiler,
+               unsigned subgroup_size, struct tu_sg32_report *rep);
+
+unsigned
+tu_nir_sg32_l2b(nir_shader *nir);
+
 bool
 tu_nir_opt_lane_shuffles(nir_shader *shader, unsigned lanes);
 

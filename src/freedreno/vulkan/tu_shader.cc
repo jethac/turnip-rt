@@ -429,8 +429,14 @@ tu_spirv_to_nir(struct tu_device *dev,
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_lower_is_helper_invocation);
 
-   if (key->emulated_subgroup_size)
-      NIR_PASS(_, nir, tu_nir_lower_emulated_subgroups, key->emulated_subgroup_size);
+   struct tu_sg32_report sg32 = {};
+   if (key->emulated_subgroup_size) {
+      if (tu_sg32_v2_enabled() && stage == MESA_SHADER_COMPUTE)
+         NIR_PASS(_, nir, tu_nir_sg32_v2, dev->compiler,
+                  key->emulated_subgroup_size, &sg32);
+      else
+         NIR_PASS(_, nir, tu_nir_lower_emulated_subgroups, key->emulated_subgroup_size);
+   }
 
    if (stage == MESA_SHADER_COMPUTE && tu_lane_shuffle_enabled() &&
        dev->compiler->has_shfl) {
@@ -445,6 +451,22 @@ tu_spirv_to_nir(struct tu_device *dev,
 
    struct ir3_optimize_options optimize_options = {};
    ir3_optimize_loop(dev->compiler, &optimize_options, nir);
+
+   if (sg32.active && !sg32.native) {
+      sg32.l2b = tu_nir_sg32_l2b(nir);
+      if (sg32.l2b)
+         ir3_optimize_loop(dev->compiler, &optimize_options, nir);
+   }
+   if (sg32.active) {
+      static const bool log_sg32 =
+         debug_get_bool_option("TU_LOG_SHADER_HASHES", false);
+      if (log_sg32)
+         mesa_logi("tu-sg32: %s src=%08x%08x %s reason=%s l1=%u l2=%u l2b=%u",
+                   mesa_shader_stage_name(stage), nir->info.source_blake3[0],
+                   nir->info.source_blake3[1],
+                   sg32.native ? "native" : "emulated", sg32.reason,
+                   sg32.l1, sg32.l2, sg32.l2b);
+   }
 
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 0,

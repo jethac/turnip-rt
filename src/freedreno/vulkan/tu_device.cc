@@ -144,6 +144,10 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
    _mesa_blake3_update(&ctx, env_flags, sizeof(env_flags));
    if (tu_gaze_block_enabled())
       _mesa_blake3_update(&ctx, "TU_GAZE_BLOCK", 13);
+   /* Only when non-default, so the default cache UUID is unchanged. */
+   const char *sg32 = tu_sg32_uuid_string();
+   if (sg32)
+      _mesa_blake3_update(&ctx, sg32, strlen(sg32));
    const uint64_t cs_constlen_cap =
       (uint64_t) debug_get_num_option("TU_CS_CONSTLEN_CAP", 0);
    _mesa_blake3_update(&ctx, &cs_constlen_cap, sizeof(cs_constlen_cap));

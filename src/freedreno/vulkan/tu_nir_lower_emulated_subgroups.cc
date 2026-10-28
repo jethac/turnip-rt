@@ -8,6 +8,9 @@
 
 #include "tu_shader.h"
 
+#include "ir3/ir3_nir.h"
+#include "util/os_misc.h"
+
 #define TU_HW_WAVE 64
 #define TU_LANE_SHFL_MAX_DELTAS 4
 #define TU_LANE_SHFL_CACHE 4
@@ -17,7 +20,73 @@
 struct emu_state {
    unsigned size;
    unsigned log2;
+   bool direct; /* TU_SG32_EMU=v2 layer L2 */
 };
+
+/* TU_SG32_EMU selects the emulated-wave32 (requiredSubgroupSize < 64)
+ * lowering. "v1" (default) is the original lowering, unchanged. "v2" adds,
+ * for compute shaders:
+ *   L1  uniform-first elimination (before emulation, API-subgroup level),
+ *   L4  native wave64 when no subgroup-size-observable op remains,
+ *   L2  half-uniform direct broadcasts (no divergent-index shuffle loop),
+ *   L2b ALU pushed through the L2 half select onto the two uniform halves.
+ * TU_SG32_EMU_DISABLE=l1,l2,l2b,l4 disables individual layers. The setting
+ * is folded into the cache UUID only when it differs from the default.
+ */
+static bool
+sg32_disabled(const char *list, const char *layer)
+{
+   if (!list)
+      return false;
+   size_t n = strlen(layer);
+   for (const char *p = list; *p;) {
+      const char *e = strchr(p, ',');
+      size_t len = e ? (size_t)(e - p) : strlen(p);
+      if (len == n && !strncmp(p, layer, n))
+         return true;
+      if (!e)
+         break;
+      p = e + 1;
+   }
+   return false;
+}
+
+static const struct tu_sg32_cfg *
+tu_sg32_cfg(void)
+{
+   static struct tu_sg32_cfg cfg;
+   static bool init;
+   if (!init) {
+      const char *v = os_get_option("TU_SG32_EMU");
+      const char *d = os_get_option("TU_SG32_EMU_DISABLE");
+      cfg.v2 = v && !strcmp(v, "v2");
+      cfg.l1 = cfg.v2 && !sg32_disabled(d, "l1");
+      cfg.l2 = cfg.v2 && !sg32_disabled(d, "l2");
+      cfg.l2b = cfg.v2 && !sg32_disabled(d, "l2b");
+      cfg.l4 = cfg.v2 && !sg32_disabled(d, "l4");
+      init = true;
+   }
+   return &cfg;
+}
+
+bool
+tu_sg32_v2_enabled(void)
+{
+   return tu_sg32_cfg()->v2;
+}
+
+/* Normalised non-default setting for the cache UUID, or NULL for v1. */
+const char *
+tu_sg32_uuid_string(void)
+{
+   static char buf[64];
+   const struct tu_sg32_cfg *c = tu_sg32_cfg();
+   if (!c->v2)
+      return NULL;
+   snprintf(buf, sizeof(buf), "TU_SG32_EMU=v2:%d%d%d%d", c->l1, c->l2, c->l2b,
+            c->l4);
+   return buf;
+}
 
 static nir_def *
 emu_lane(nir_builder *b)
@@ -72,6 +141,89 @@ emu_shuffle_to(nir_builder *b, const struct emu_state *s, nir_def *x, nir_def *s
 {
    nir_def *idx = nir_iadd(b, emu_base(b, s), nir_iand_imm(b, sub_idx, s->size - 1));
    return nir_shuffle(b, x, idx);
+}
+
+/* Direct per-half helpers (TU_SG32_EMU=v2 L2, size 32 on the 64-lane wave).
+ * The hardware ballot of all active lanes is wave-uniform, so the first
+ * active lane of the upper half is a wave-uniform index. An emulated
+ * subgroup is exactly one 32-lane half (emu_base), and only active lanes
+ * consume results.
+ */
+static nir_def *
+emu_upper_half(nir_builder *b)
+{
+   return nir_uge_imm(b, emu_lane(b), 32);
+}
+
+struct emu_halves {
+   nir_def *lo_any;     /* lower half has an active lane */
+   nir_def *hi_any;     /* upper half has an active lane */
+   nir_def *first;      /* first active lane of the wave */
+   nir_def *upper;      /* first active lane of the upper half, else first */
+};
+
+/* All values are wave-uniform (derived from ballot(true)) and always name
+ * an active lane, so they are valid read_invocation indices.
+ */
+static struct emu_halves
+emu_halves(nir_builder *b)
+{
+   nir_def *hw = nir_ballot(b, 1, 64, nir_imm_true(b));
+   nir_def *lo = nir_unpack_64_2x32_split_x(b, hw);
+   nir_def *hi = nir_unpack_64_2x32_split_y(b, hw);
+   struct emu_halves h;
+   h.lo_any = nir_ine_imm(b, lo, 0);
+   h.hi_any = nir_ine_imm(b, hi, 0);
+   nir_def *lo_first = nir_find_lsb(b, lo);
+   nir_def *hi_first = nir_iadd_imm(b, nir_find_lsb(b, hi), 32);
+   h.first = nir_bcsel(b, h.lo_any, lo_first, hi_first);
+   h.upper = nir_bcsel(b, h.hi_any, hi_first, lo_first);
+   return h;
+}
+
+/* readFirstInvocation of each emulated 32-lane subgroup. The hardware
+ * read_first_invocation returns the first active lane of the wave: for a
+ * lower-half lane that is its own half's first active lane (it is active,
+ * so the lower half is non-empty); for an upper-half lane it is that only if
+ * the lower half is empty, otherwise use the upper half's first lane.
+ */
+static nir_def *
+emu_direct_read_first(nir_builder *b, nir_def *x)
+{
+   nir_def *first = nir_read_first_invocation(b, x);
+   nir_def *upper = nir_read_invocation(b, x, emu_halves(b).upper);
+   return nir_bcsel(b, emu_upper_half(b), upper, first);
+}
+
+/* readInvocation(x, idx) with idx uniform within each emulated subgroup
+ * (it may differ between the halves). Fetch each half's idx with a uniform
+ * index, then x from the selected lane of that half.
+ */
+static nir_def *
+emu_direct_read_invocation(nir_builder *b, nir_def *x, nir_def *idx)
+{
+   struct emu_halves h = emu_halves(b);
+   nir_def *lo_lane, *hi_lane;
+   if (nir_src_is_const(nir_src_for_ssa(idx))) {
+      uint32_t i = nir_src_as_uint(nir_src_for_ssa(idx)) & 31;
+      lo_lane = nir_imm_int(b, i);
+      hi_lane = nir_imm_int(b, 32 + i);
+   } else {
+      /* read_first_invocation reads the lower half whenever it has an
+       * active lane; h.upper is an upper-half lane whenever that half has
+       * one. A half with no active lane has no consumer.
+       */
+      nir_def *idx_lo = nir_read_first_invocation(b, idx);
+      nir_def *idx_hi = nir_read_invocation(b, idx, h.upper);
+      lo_lane = nir_iand_imm(b, idx_lo, 31);
+      hi_lane = nir_iadd_imm(b, nir_iand_imm(b, idx_hi, 31), 32);
+   }
+   /* Keep both indices on active lanes even when a half is empty. */
+   lo_lane = nir_bcsel(b, h.lo_any, lo_lane, h.first);
+   hi_lane = nir_bcsel(b, h.hi_any, hi_lane, h.first);
+   nir_def *lo = nir_read_invocation(b, x, lo_lane);
+   nir_def *hi = nir_read_invocation(b, x, hi_lane);
+   return nir_bcsel(b, emu_upper_half(b), hi, lo);
 }
 
 static nir_def *
@@ -173,7 +325,8 @@ lower_emulated_subgroups(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_vote_ieq:
    case nir_intrinsic_vote_feq: {
       nir_def *x = intr->src[0].ssa;
-      nir_def *first = emu_shuffle_to(b, s, x, emu_first_lane(b, s));
+      nir_def *first = s->direct ? emu_direct_read_first(b, x)
+                                 : emu_shuffle_to(b, s, x, emu_first_lane(b, s));
       nir_def *eq = intr->intrinsic == nir_intrinsic_vote_feq ? nir_feq(b, x, first)
                                                               : nir_ieq(b, x, first);
       nir_def *all = nir_channel(b, eq, 0);
@@ -192,9 +345,17 @@ lower_emulated_subgroups(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       rep = nir_ieq(b, emu_sub(b, s), emu_first_lane(b, s));
       break;
    case nir_intrinsic_read_first_invocation:
-      rep = emu_shuffle_to(b, s, intr->src[0].ssa, emu_first_lane(b, s));
+      if (s->direct)
+         rep = emu_direct_read_first(b, intr->src[0].ssa);
+      else
+         rep = emu_shuffle_to(b, s, intr->src[0].ssa, emu_first_lane(b, s));
       break;
    case nir_intrinsic_read_invocation:
+      if (s->direct) {
+         rep = emu_direct_read_invocation(b, intr->src[0].ssa, intr->src[1].ssa);
+         break;
+      }
+      FALLTHROUGH;
    case nir_intrinsic_shuffle:
       rep = emu_shuffle_to(b, s, intr->src[0].ssa, intr->src[1].ssa);
       break;
@@ -243,13 +404,370 @@ tu_nir_lower_emulated_subgroups(nir_shader *shader, unsigned subgroup_size)
 {
    assert(subgroup_size >= 4 && subgroup_size <= 32 &&
           util_is_power_of_two_nonzero(subgroup_size));
-   struct emu_state s = { subgroup_size, util_logbase2(subgroup_size) };
+   struct emu_state s = { subgroup_size, util_logbase2(subgroup_size), false };
    bool p = nir_shader_intrinsics_pass(shader, lower_emulated_subgroups,
                                        nir_metadata_none, &s);
    shader->info.api_subgroup_size = TU_HW_WAVE;
    shader->info.min_subgroup_size = TU_HW_WAVE;
    shader->info.max_subgroup_size = TU_HW_WAVE;
    return p;
+}
+
+/* ---- TU_SG32_EMU=v2 ---------------------------------------------------- */
+
+/* L1: exact identities for subgroup ops whose operand is uniform within the
+ * API (emulated, 32-lane) subgroup. Runs before emulation on API-level NIR,
+ * so NIR divergence analysis' "uniform" means uniform within the emulated
+ * subgroup. Only exact (bit-identical) rewrites: no float reductions.
+ */
+static bool
+sg32_l1_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   unsigned *count = (unsigned *) data;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *rep = NULL;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_read_first_invocation:
+   case nir_intrinsic_read_invocation:
+   case nir_intrinsic_shuffle:
+   case nir_intrinsic_shuffle_xor:
+   case nir_intrinsic_shuffle_up:
+   case nir_intrinsic_shuffle_down:
+   case nir_intrinsic_rotate:
+   case nir_intrinsic_vote_any:
+   case nir_intrinsic_vote_all:
+      if (nir_src_is_divergent(&intr->src[0]))
+         return false;
+      rep = intr->src[0].ssa;
+      break;
+   case nir_intrinsic_vote_ieq:
+      if (nir_src_is_divergent(&intr->src[0]))
+         return false;
+      rep = nir_imm_true(b);
+      break;
+   case nir_intrinsic_vote_feq: {
+      if (nir_src_is_divergent(&intr->src[0]))
+         return false;
+      nir_def *x = intr->src[0].ssa;
+      b->fp_math_ctrl = nir_fp_preserve_nan | nir_fp_preserve_inf;
+      nir_def *eq = nir_feq(b, x, x);
+      b->fp_math_ctrl = nir_fp_fast_math;
+      rep = nir_channel(b, eq, 0);
+      for (unsigned c = 1; c < eq->num_components; c++)
+         rep = nir_iand(b, rep, nir_channel(b, eq, c));
+      break;
+   }
+   case nir_intrinsic_reduce:
+   case nir_intrinsic_inclusive_scan:
+   case nir_intrinsic_exclusive_scan: {
+      if (nir_src_is_divergent(&intr->src[0]))
+         return false;
+      if (nir_intrinsic_has_cluster_size(intr) &&
+          nir_intrinsic_cluster_size(intr) != 0)
+         return false;
+      nir_op op = (nir_op) nir_intrinsic_reduction_op(intr);
+      nir_def *x = intr->src[0].ssa;
+      switch (op) {
+      case nir_op_imin: case nir_op_umin: case nir_op_fmin:
+      case nir_op_imax: case nir_op_umax: case nir_op_fmax:
+      case nir_op_iand: case nir_op_ior:
+         if (intr->intrinsic == nir_intrinsic_exclusive_scan)
+            return false;
+         rep = x;
+         break;
+      case nir_op_iadd:
+      case nir_op_ixor: {
+         nir_def *ballot = nir_ballot(b, 1, 32, nir_imm_true(b));
+         if (intr->intrinsic == nir_intrinsic_inclusive_scan)
+            ballot = nir_iand(b, ballot, nir_load_subgroup_le_mask(b, 1, 32));
+         else if (intr->intrinsic == nir_intrinsic_exclusive_scan)
+            ballot = nir_iand(b, ballot, nir_load_subgroup_lt_mask(b, 1, 32));
+         nir_def *cnt = nir_bit_count(b, ballot);
+         if (op == nir_op_ixor)
+            cnt = nir_iand_imm(b, cnt, 1);
+         rep = nir_imul(b, x, nir_u2uN(b, cnt, x->bit_size));
+         break;
+      }
+      default:
+         return false;
+      }
+      break;
+   }
+   default:
+      return false;
+   }
+
+   nir_def_replace(&intr->def, rep);
+   (*count)++;
+   return true;
+}
+
+/* L4: an op whose result can depend on the subgroup size or on which lanes
+ * share a subgroup. Conservative: any subgroup-flavoured intrinsic.
+ */
+static const char *
+sg32_observable(nir_intrinsic_instr *intr)
+{
+   const char *n = nir_intrinsic_infos[intr->intrinsic].name;
+   if (!strncmp(n, "load_local_invocation", 21) ||
+       !strncmp(n, "load_global_invocation", 22) ||
+       !strncmp(n, "load_base_global_invocation", 27))
+      return NULL;
+   static const char *const pat[] = {
+      "subgroup", "ballot", "vote", "shuffle", "quad", "scan", "reduce",
+      "invocation", "elect", "rotate", "shfl", "brcst", "swizzle", "lane",
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(pat); i++) {
+      if (strstr(n, pat[i]))
+         return n;
+   }
+   return NULL;
+}
+
+static const char *
+sg32_first_observable(nir_shader *nir)
+{
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const char *n = sg32_observable(nir_instr_as_intrinsic(instr));
+            if (n)
+               return n;
+         }
+      }
+   }
+   return NULL;
+}
+
+static unsigned
+sg32_count_direct(nir_shader *nir)
+{
+   unsigned n = 0;
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_read_first_invocation:
+            case nir_intrinsic_read_invocation:
+            case nir_intrinsic_vote_ieq:
+            case nir_intrinsic_vote_feq:
+               n++;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return n;
+}
+
+bool
+tu_nir_sg32_v2(nir_shader *nir, struct ir3_compiler *compiler,
+               unsigned subgroup_size, struct tu_sg32_report *rep)
+{
+   const struct tu_sg32_cfg *cfg = tu_sg32_cfg();
+   memset(rep, 0, sizeof(*rep));
+   rep->active = true;
+
+   if (cfg->l1 || cfg->l4) {
+      /* Expose SSA values to divergence analysis (vars to SSA, copy-prop). */
+      struct ir3_optimize_options o = {};
+      ir3_optimize_loop(compiler, &o, nir);
+   }
+
+   if (cfg->l1) {
+      nir_divergence_analysis(nir);
+      nir_shader_intrinsics_pass(nir, sg32_l1_instr, nir_metadata_control_flow,
+                                 &rep->l1);
+      if (rep->l1)
+         nir_opt_dce(nir);
+   }
+
+   const char *obs = sg32_first_observable(nir);
+   if (cfg->l4 && !obs) {
+      /* Nothing can observe the 32-lane subgroup: compile as the native
+       * wave64 shader (same as the emulation pass leaves info).
+       */
+      nir->info.api_subgroup_size = TU_HW_WAVE;
+      nir->info.min_subgroup_size = TU_HW_WAVE;
+      nir->info.max_subgroup_size = TU_HW_WAVE;
+      rep->native = true;
+      rep->reason = "no-observable-op";
+      return rep->l1 != 0;
+   }
+   rep->reason = obs ? obs : "l4-disabled";
+
+   bool direct = cfg->l2 && subgroup_size == 32;
+   if (direct)
+      rep->l2 = sg32_count_direct(nir);
+   struct emu_state s = { subgroup_size, util_logbase2(subgroup_size), direct };
+   nir_shader_intrinsics_pass(nir, lower_emulated_subgroups, nir_metadata_none, &s);
+   nir->info.api_subgroup_size = TU_HW_WAVE;
+   nir->info.min_subgroup_size = TU_HW_WAVE;
+   nir->info.max_subgroup_size = TU_HW_WAVE;
+   return true;
+}
+
+/* L2b: push pure ALU through the L2 half select. For a select
+ * H = bcsel(lane >= 32, hi, lo) with uniform hi/lo, and an ALU A whose other
+ * sources are uniform, A(.., H, ..) == bcsel(lane >= 32, A(.., hi, ..),
+ * A(.., lo, ..)) exactly (A is a pure per-lane function), and both arms are
+ * uniform, so they can stay scalar. Repeats along chains.
+ */
+static bool
+sg32_is_upper_pred(nir_def *d)
+{
+   nir_alu_instr *a = nir_def_as_alu_or_null(d);
+   if (!a || a->op != nir_op_uge || a->def.num_components != 1)
+      return false;
+   nir_scalar l = nir_scalar_chase_movs(nir_get_scalar(a->src[0].src.ssa, a->src[0].swizzle[0]));
+   nir_scalar c = nir_scalar_chase_movs(nir_get_scalar(a->src[1].src.ssa, a->src[1].swizzle[0]));
+   return nir_scalar_is_intrinsic(l) &&
+          nir_scalar_intrinsic_op(l) == nir_intrinsic_load_subgroup_invocation &&
+          nir_scalar_is_const(c) && nir_scalar_as_uint(c) == 32;
+}
+
+static nir_alu_instr *
+sg32_half_select(nir_def *d)
+{
+   nir_alu_instr *a = nir_def_as_alu_or_null(d);
+   if (!a || a->op != nir_op_bcsel || a->def.num_components != 1 ||
+       a->src[0].swizzle[0] != 0 || !sg32_is_upper_pred(a->src[0].src.ssa) ||
+       a->src[1].src.ssa->divergent || a->src[2].src.ssa->divergent)
+      return NULL;
+   return a;
+}
+
+#define TU_SG32_L2B_MAX 4096
+
+/* phi(H_0, .., H_n) of half selects -> bcsel(P, phi(hi_i), phi(lo_i)). */
+static bool
+sg32_l2b_phi(nir_shader *nir, nir_phi_instr *phi)
+{
+   if (phi->def.num_components != 1)
+      return false;
+   /* Profitability: the new per-half phis are only wave-uniform when the
+    * merge follows an if with a wave-uniform condition (not a loop header,
+    * not a branch the two halves can take differently).
+    */
+   nir_cf_node *prev = nir_cf_node_prev(&phi->instr.block->cf_node);
+   if (!prev || prev->type != nir_cf_node_if ||
+       nir_cf_node_as_if(prev)->condition.ssa->divergent)
+      return false;
+   nir_alu_instr *first = NULL;
+   nir_foreach_phi_src (src, phi) {
+      nir_alu_instr *h = sg32_half_select(src->src.ssa);
+      if (!h)
+         return false;
+      for (unsigned k = 1; k <= 2; k++) {
+         if (h->src[k].swizzle[0] != 0 || h->src[k].src.ssa->num_components != 1)
+            return false;
+      }
+      if (!first)
+         first = h;
+   }
+   if (!first)
+      return false;
+
+   nir_def *arm[2];
+   for (unsigned k = 0; k < 2; k++) {
+      nir_phi_instr *n = nir_phi_instr_create(nir);
+      nir_def_init(&n->instr, &n->def, 1, phi->def.bit_size);
+      nir_foreach_phi_src (src, phi) {
+         nir_alu_instr *h = sg32_half_select(src->src.ssa);
+         nir_phi_instr_add_src(n, src->pred, h->src[1 + k].src.ssa);
+      }
+      nir_instr_insert_before(&phi->instr, &n->instr);
+      arm[k] = &n->def;
+   }
+   /* The selects' predicates live in the predecessors; rebuild it here. */
+   nir_builder b = nir_builder_at(nir_after_phis(phi->instr.block));
+   nir_def *pred = nir_uge_imm(&b, nir_load_subgroup_invocation(&b), 32);
+   nir_def *r = nir_bcsel(&b, pred, arm[0], arm[1]);
+   nir_def_replace(&phi->def, r);
+   return true;
+}
+
+unsigned
+tu_nir_sg32_l2b(nir_shader *nir)
+{
+   if (!tu_sg32_cfg()->l2b)
+      return 0;
+   unsigned pushed = 0;
+   nir_foreach_function_impl (impl, nir) {
+      bool progress;
+      do {
+         progress = false;
+         nir_metadata_require(impl, nir_metadata_block_index);
+         nir_divergence_analysis_impl(impl, nir->options->divergence_analysis_options);
+         nir_foreach_block (block, impl) {
+            nir_foreach_phi_safe (phi, block) {
+               if (pushed < TU_SG32_L2B_MAX && sg32_l2b_phi(nir, phi)) {
+                  pushed++;
+                  progress = true;
+               }
+            }
+            nir_foreach_instr_safe (instr, block) {
+               if (instr->type != nir_instr_type_alu || pushed >= TU_SG32_L2B_MAX)
+                  continue;
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               if (alu->def.num_components != 1 || sg32_half_select(&alu->def))
+                  continue;
+               const nir_op_info *info = &nir_op_infos[alu->op];
+               nir_alu_instr *sel = NULL;
+               bool ok = true;
+               for (unsigned i = 0; i < info->num_inputs && ok; i++) {
+                  nir_def *s = alu->src[i].src.ssa;
+                  nir_alu_instr *h = sg32_half_select(s);
+                  if (h) {
+                     if (!sel)
+                        sel = h;
+                  } else if (s->divergent) {
+                     ok = false;
+                  }
+               }
+               if (!ok || !sel)
+                  continue;
+
+               nir_builder b = nir_builder_at(nir_before_instr(instr));
+               nir_def *arm[2];
+               for (unsigned k = 0; k < 2; k++) {
+                  nir_alu_instr *c = nir_alu_instr_create(nir, alu->op);
+                  c->no_signed_wrap = alu->no_signed_wrap;
+                  c->no_unsigned_wrap = alu->no_unsigned_wrap;
+                  c->fp_math_ctrl = alu->fp_math_ctrl;
+                  for (unsigned i = 0; i < info->num_inputs; i++) {
+                     nir_alu_instr *h = sg32_half_select(alu->src[i].src.ssa);
+                     if (!h) {
+                        nir_alu_src_copy(&c->src[i], &alu->src[i]);
+                        continue;
+                     }
+                     /* src[1] = hi (lane >= 32), src[2] = lo. h is scalar. */
+                     nir_alu_src *as = &h->src[1 + k];
+                     c->src[i].src = nir_src_for_ssa(as->src.ssa);
+                     for (unsigned j = 0; j < NIR_MAX_VEC_COMPONENTS; j++)
+                        c->src[i].swizzle[j] = as->swizzle[0];
+                  }
+                  nir_def_init(&c->instr, &c->def, 1, alu->def.bit_size);
+                  nir_builder_instr_insert(&b, &c->instr);
+                  arm[k] = &c->def;
+               }
+               nir_def *r = nir_bcsel(&b, sel->src[0].src.ssa, arm[0], arm[1]);
+               nir_def_replace(&alu->def, r);
+               pushed++;
+               progress = true;
+            }
+         }
+      } while (progress && pushed < TU_SG32_L2B_MAX);
+      nir_progress(pushed != 0, impl, nir_metadata_control_flow);
+   }
+   return pushed;
 }
 
 struct lane_shfl_class {
