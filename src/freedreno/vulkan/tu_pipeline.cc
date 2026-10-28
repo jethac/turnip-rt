@@ -4334,14 +4334,20 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
          struct vk_fragment_shading_rate_state vrs_fsr =
             cmd->vk.dynamic_graphics_state.fsr;
          bool att = cmd->state.subpass->fsr_attachment != VK_ATTACHMENT_UNUSED;
-         if (!att && (cmd->state.vrs.pass_eligible || cmd->state.vrs.inherited)) {
-            att = tu_vrs_pipeline_fsr(
-               cmd->state.shaders[MESA_SHADER_FRAGMENT],
-               cmd->vk.dynamic_graphics_state.ms.rasterization_samples,
-               cmd->state.pipeline_feedback_loops ||
-                  cmd->vk.dynamic_graphics_state.feedback_loops,
-               &vrs_fsr);
-         }
+         /* Inherited (RENDER_PASS_CONTINUE) secondaries: the inheritance info
+          * carries no rate attachment and dynamic_subpasses[0].fsr_attachment
+          * is not reset for them, so it cannot be trusted. The primary's
+          * quality buffer (gaze map, flat, or the app's own) decides; only
+          * the per-pipeline veto applies here. A veto keeps stock behaviour.
+          */
+         if ((cmd->state.vrs.inherited || (!att && cmd->state.vrs.pass_eligible)) &&
+             tu_vrs_pipeline_fsr(
+                cmd->state.shaders[MESA_SHADER_FRAGMENT],
+                cmd->vk.dynamic_graphics_state.ms.rasterization_samples,
+                cmd->state.pipeline_feedback_loops ||
+                   cmd->vk.dynamic_graphics_state.feedback_loops,
+                &vrs_fsr))
+            att = true;
          DRAW_STATE_COND(fragment_shading_rate,
                   TU_DYNAMIC_STATE_A7XX_FRAGMENT_SHADING_RATE,
                   (cmd->state.dirty & (TU_CMD_DIRTY_SUBPASS |
