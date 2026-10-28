@@ -118,6 +118,14 @@ struct tu_cs
    /* Owned by a tu_cmd_buffer; tags new BOs for RD submit scoping. */
    bool rd_cmdbuf_owned;
    uint32_t next_bo_size;
+   /* Size passed to tu_cs_init(); next_bo_size returns toward it when
+    * retained BOs are trimmed (see tu_cs_reset_trim()). */
+   uint32_t initial_size;
+   /* Consecutive resets in which the retained BOs were at least 4x larger
+    * than what was recorded, and the largest recording seen during that run
+    * (dwords). */
+   uint32_t trim_underuse;
+   uint32_t trim_window_max;
    VkResult status;
 
    struct tu_cs_entry *entries;
@@ -349,6 +357,18 @@ tu_cs_draw_state(struct tu_cs *sub_cs, struct tu_cs *cs, uint32_t size)
 
 void
 tu_cs_reset(struct tu_cs *cs);
+
+void
+tu_cs_reset_trim(struct tu_cs *cs, bool release_resources);
+
+void
+tu_cs_release(struct tu_cs *cs, const char *reason);
+
+uint64_t
+tu_cs_retained_bytes(const struct tu_cs *cs);
+
+bool
+tu_cs_retain_trim_enabled(void);
 
 VkResult
 tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target);

@@ -398,6 +398,16 @@ struct tu_device
    struct tu_suballocator vis_stream_suballocator;
    mtx_t vis_stream_suballocator_mtx;
 
+   /* Initial-state command buffers that still retain stream BOs, least
+    * recently reset first; see tu_cmd_buffer_park().
+    */
+   mtx_t cs_park_mtx;
+   cnd_t cs_park_cnd;
+   struct list_head cs_park_lru;
+   uint64_t cs_parked_bytes;
+   uint64_t cs_park_budget;
+   uint64_t cs_park_idle_ns;
+
    /* Lazily allocated, protected by the device mutex. */
    struct tu_bo *tess_bo;
 

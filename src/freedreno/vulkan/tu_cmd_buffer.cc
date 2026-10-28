@@ -9,6 +9,7 @@
 
 #include "tu_foveate.h"
 #include "util/os_time.h"
+#include <array>
 #include <atomic>
 #include "tu_cmd_buffer.h"
 
@@ -4463,6 +4464,129 @@ tu_create_cmd_buffer(struct vk_command_pool *pool,
    return VK_SUCCESS;
 }
 
+/* Every command-stream owned by a command buffer. */
+static std::array<struct tu_cs *, 7>
+tu_cmd_buffer_streams(struct tu_cmd_buffer *cmd_buffer)
+{
+   return { &cmd_buffer->cs, &cmd_buffer->draw_cs,
+            &cmd_buffer->tile_store_cs, &cmd_buffer->draw_epilogue_cs,
+            &cmd_buffer->sub_cs, &cmd_buffer->pre_chain.draw_cs,
+            &cmd_buffer->pre_chain.draw_epilogue_cs };
+}
+
+/* Idle retained-stream eviction.
+ *
+ * After a reset, a command buffer is in the initial state: nothing recorded,
+ * not pending, but each stream still holds its last BO.  Such command
+ * buffers are put on a device-wide LRU.  Whenever a command buffer is
+ * parked, the least recently reset ones have their streams freed while they
+ * have been idle longer than TU_CS_PARK_IDLE_MS (default 5000) or the LRU
+ * holds more than TU_CS_PARK_BUDGET_MB (default 256) of stream BOs.  Hot
+ * command buffers (reset and re-begun every frame or so) stay below both.
+ * Any entry point that uses the streams again (begin, reset, destroy) first
+ * takes the command buffer off the LRU under the same lock, so eviction
+ * never races with recording.
+ */
+/* Driver-internal dynamic-rendering command buffers are recycled once a
+ * CP_MEM_WRITE fence passes, which does not prove the 3D pipeline has
+ * finished reading their streams.  Keep the previous retention for them.
+ */
+static bool
+tu_cmd_buffer_is_internal(const struct tu_cmd_buffer *cmd_buffer)
+{
+   return vk_command_pool_to_handle(cmd_buffer->vk.pool) ==
+          cmd_buffer->device->dynamic_rendering_pool;
+}
+
+/* Maximum command buffers evicted per park call, bounding the work one
+ * reset can pick up when many command buffers go stale together.
+ */
+#define TU_CS_PARK_MAX_EVICT 16
+
+static void
+tu_cmd_buffer_unpark(struct tu_cmd_buffer *cmd_buffer)
+{
+   if (!tu_cs_retain_trim_enabled())
+      return;
+
+   struct tu_device *device = cmd_buffer->device;
+   mtx_lock(&device->cs_park_mtx);
+   /* Another thread may be freeing this command buffer's streams outside
+    * the lock; wait until it is done before the owner touches them.
+    */
+   while (cmd_buffer->cs_evicting)
+      cnd_wait(&device->cs_park_cnd, &device->cs_park_mtx);
+   if (cmd_buffer->cs_parked) {
+      list_del(&cmd_buffer->cs_park_link);
+      device->cs_parked_bytes -= cmd_buffer->cs_park_bytes;
+      cmd_buffer->cs_parked = false;
+      cmd_buffer->cs_park_bytes = 0;
+   }
+   mtx_unlock(&device->cs_park_mtx);
+}
+
+static void
+tu_cmd_buffer_park(struct tu_cmd_buffer *cmd_buffer)
+{
+   if (!tu_cs_retain_trim_enabled() || tu_cmd_buffer_is_internal(cmd_buffer))
+      return;
+
+   uint64_t bytes = 0;
+   for (struct tu_cs *cs : tu_cmd_buffer_streams(cmd_buffer))
+      bytes += tu_cs_retained_bytes(cs);
+   if (!bytes)
+      return;
+
+   struct tu_device *device = cmd_buffer->device;
+   const uint64_t now = os_time_get_nano();
+   struct tu_cmd_buffer *victims[TU_CS_PARK_MAX_EVICT];
+   unsigned victim_count = 0;
+
+   mtx_lock(&device->cs_park_mtx);
+   assert(!cmd_buffer->cs_parked && !cmd_buffer->cs_evicting);
+   cmd_buffer->cs_parked = true;
+   cmd_buffer->cs_park_bytes = bytes;
+   cmd_buffer->cs_park_time_ns = now;
+   list_addtail(&cmd_buffer->cs_park_link, &device->cs_park_lru);
+   device->cs_parked_bytes += bytes;
+
+   while (victim_count < TU_CS_PARK_MAX_EVICT &&
+          !list_is_empty(&device->cs_park_lru)) {
+      struct tu_cmd_buffer *victim =
+         list_first_entry(&device->cs_park_lru, struct tu_cmd_buffer,
+                          cs_park_link);
+      /* Park times come from different threads; never underflow. */
+      const bool stale =
+         now > victim->cs_park_time_ns + device->cs_park_idle_ns;
+      if (device->cs_parked_bytes <= device->cs_park_budget && !stale)
+         break;
+      list_del(&victim->cs_park_link);
+      device->cs_parked_bytes -= victim->cs_park_bytes;
+      victim->cs_parked = false;
+      victim->cs_park_bytes = 0;
+      victim->cs_evicting = true;
+      victims[victim_count++] = victim;
+   }
+   mtx_unlock(&device->cs_park_mtx);
+
+   if (!victim_count)
+      return;
+
+   /* Free outside the lock (munmap / VM unbind / GEM close).  Victims are
+    * marked cs_evicting, so their owners wait in unpark meanwhile.
+    */
+   for (unsigned i = 0; i < victim_count; i++) {
+      for (struct tu_cs *cs : tu_cmd_buffer_streams(victims[i]))
+         tu_cs_release(cs, "evict");
+   }
+
+   mtx_lock(&device->cs_park_mtx);
+   for (unsigned i = 0; i < victim_count; i++)
+      victims[i]->cs_evicting = false;
+   cnd_broadcast(&device->cs_park_cnd);
+   mtx_unlock(&device->cs_park_mtx);
+}
+
 static void
 tu_cmd_release_embedded_sampler_layouts(struct tu_cmd_buffer *cmd_buffer)
 {
@@ -4477,6 +4601,8 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
 {
    struct tu_cmd_buffer *cmd_buffer =
       container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
+
+   tu_cmd_buffer_unpark(cmd_buffer);
 
    tu_cs_finish(&cmd_buffer->cs);
    tu_cs_finish(&cmd_buffer->draw_cs);
@@ -4552,10 +4678,12 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
 
 static void
 tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
-                    UNUSED VkCommandBufferResetFlags flags)
+                    VkCommandBufferResetFlags flags)
 {
    struct tu_cmd_buffer *cmd_buffer =
       container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
+
+   tu_cmd_buffer_unpark(cmd_buffer);
 
    VkResult status_check_result = VK_SUCCESS;
    if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS))
@@ -4568,13 +4696,19 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
        cmd_buffer->vk.record_result = status_check_result;
     }
 
-   tu_cs_reset(&cmd_buffer->cs);
-   tu_cs_reset(&cmd_buffer->draw_cs);
-   tu_cs_reset(&cmd_buffer->tile_store_cs);
-   tu_cs_reset(&cmd_buffer->draw_epilogue_cs);
-   tu_cs_reset(&cmd_buffer->sub_cs);
-   tu_cs_reset(&cmd_buffer->pre_chain.draw_cs);
-   tu_cs_reset(&cmd_buffer->pre_chain.draw_epilogue_cs);
+   /* Not pending (Vulkan rule for every reset path), so retained stream BOs
+    * may be trimmed; RELEASE_RESOURCES (also used by the runtime when it
+    * recycles a freed command buffer onto the pool free list) frees them.
+    */
+   const bool internal = tu_cmd_buffer_is_internal(cmd_buffer);
+   const bool release =
+      flags & VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT;
+   for (struct tu_cs *cs : tu_cmd_buffer_streams(cmd_buffer)) {
+      if (internal)
+         tu_cs_reset(cs);
+      else
+         tu_cs_reset_trim(cs, release);
+   }
 
    cmd_buffer->autotune_ctx.reset(*cmd_buffer->device->autotune);
 
@@ -4647,6 +4781,8 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
 
    util_dynarray_clear(&cmd_buffer->vis_stream_bos);
    util_dynarray_clear(&cmd_buffer->vis_stream_cs_bos);
+
+   tu_cmd_buffer_park(cmd_buffer);
 }
 
 const struct vk_command_buffer_ops tu_cmd_buffer_ops = {
@@ -4674,6 +4810,8 @@ tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
                     const VkCommandBufferBeginInfo *pBeginInfo)
 {
    vk_command_buffer_begin(&cmd_buffer->vk, pBeginInfo);
+   /* After any implicit reset above, which parks the command buffer. */
+   tu_cmd_buffer_unpark(cmd_buffer);
 
    memset(&cmd_buffer->state, 0, sizeof(cmd_buffer->state));
    vk_dynamic_graphics_state_init(&cmd_buffer->vk.dynamic_graphics_state);

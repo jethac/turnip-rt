@@ -6,6 +6,7 @@
 #include "tu_cs.h"
 
 #include "tu_device.h"
+#include "tu_free_log.h"
 #include "tu_rmv.h"
 #include "tu_suballoc.h"
 
@@ -36,6 +37,7 @@ tu_cs_init(struct tu_cs *cs,
    cs->device = device;
    cs->mode = mode;
    cs->next_bo_size = initial_size;
+   cs->initial_size = initial_size;
    cs->name = name;
 }
 
@@ -578,6 +580,213 @@ tu_cs_reset(struct tu_cs *cs)
    }
 
    cs->entry_count = 0;
+}
+
+/* Bounded retention of command-buffer stream BOs.
+ *
+ * tu_cs_reset() keeps the last (and, because sizes double, normally the
+ * largest) BO of each array so steady workloads do not reallocate, and
+ * next_bo_size never shrinks.  An application that reuses command buffers
+ * for different workloads therefore ratchets each one up to its historical
+ * peak, and one that keeps many reset-but-idle command buffers around (AC8
+ * via vkd3d-proton: 837 allocators, ~770 idle for minutes) keeps all of
+ * those peaks resident.
+ *
+ * tu_cs_reset_trim() frees the retained BOs after N (default 8) consecutive
+ * resets in which the recording used at most a quarter of the retained
+ * capacity, and restores next_bo_size to the power of two covering the
+ * largest recording in that window.  tu_cs_release() frees them outright;
+ * the command buffer layer uses it for RELEASE_RESOURCES resets and to evict
+ * idle (initial-state) command buffers beyond a device-wide budget.
+ *
+ * Callers only use these on streams of command buffers that are not
+ * pending: reset paths (which Vulkan forbids while pending, and where
+ * tu_cs_reset() already frees every non-last BO) or initial-state command
+ * buffers.  RD snapshot BO references are refcounted as before.  No emitted
+ * GPU commands change.  TU_CS_RETAIN_TRIM=0 restores the old retention.
+ */
+bool
+tu_cs_retain_trim_enabled(void)
+{
+   static const bool enabled =
+      debug_get_bool_option("TU_CS_RETAIN_TRIM", true);
+   return enabled;
+}
+
+/* TU_CS_RETAIN_TRIM_RESETS=1 trims on every qualifying reset; used to stress
+ * the release paths in validation.
+ */
+static uint32_t
+tu_cs_trim_resets(void)
+{
+   static const uint32_t resets = CLAMP(
+      debug_get_num_option("TU_CS_RETAIN_TRIM_RESETS", 8), 1, 1024);
+   return resets;
+}
+
+static bool
+tu_cs_trim_applies(const struct tu_cs *cs)
+{
+   return tu_cs_retain_trim_enabled() &&
+          (cs->mode == TU_CS_MODE_GROW || cs->mode == TU_CS_MODE_SUB_STREAM) &&
+          !cs->refcount_bo;
+}
+
+static uint64_t
+tu_cs_array_used_dwords(const struct tu_bo_array *bos, const uint32_t *pos)
+{
+   if (!bos->bo_count)
+      return 0;
+
+   uint64_t used = 0;
+   for (uint32_t i = 0; i + 1 < bos->bo_count; i++)
+      used += bos->bos[i]->size / sizeof(uint32_t);
+
+   const struct tu_bo *last = bos->bos[bos->bo_count - 1];
+   const uint32_t *map = static_cast<const uint32_t *>(last->map);
+   if (pos && pos >= map && pos <= map + last->size / sizeof(uint32_t))
+      used += pos - map;
+   else
+      used += last->size / sizeof(uint32_t);
+   return used;
+}
+
+/* Dwords recorded since the last reset (upper bound: non-last BOs count as
+ * full).  Must be called before tu_cs_reset() frees the non-last BOs.
+ */
+static uint64_t
+tu_cs_used_dwords(const struct tu_cs *cs)
+{
+   /* At reset the stream is not writeable: cs->cur points into the last
+    * read-only BO and read_write.start holds the read-write position saved
+    * by tu_cs_set_writeable().
+    */
+   return tu_cs_array_used_dwords(&cs->read_only, cs->cur) +
+          tu_cs_array_used_dwords(&cs->read_write, cs->read_write.start);
+}
+
+static uint64_t
+tu_cs_retained_dwords(const struct tu_cs *cs)
+{
+   uint64_t retained = 0;
+   for (uint32_t i = 0; i < cs->read_only.bo_count; i++)
+      retained += cs->read_only.bos[i]->size / sizeof(uint32_t);
+   for (uint32_t i = 0; i < cs->read_write.bo_count; i++)
+      retained += cs->read_write.bos[i]->size / sizeof(uint32_t);
+   return retained;
+}
+
+uint64_t
+tu_cs_retained_bytes(const struct tu_cs *cs)
+{
+   if (cs->mode == TU_CS_MODE_EXTERNAL || cs->refcount_bo)
+      return 0;
+   return tu_cs_retained_dwords(cs) * sizeof(uint32_t);
+}
+
+/* Free every BO of a stream that has been reset and return it to the state
+ * tu_cs_init() leaves it in; the next reservation allocates afresh with
+ * next_bo_size = MAX2(initial_size, next_pow2(size_hint)).
+ */
+static void
+tu_cs_release_bos(struct tu_cs *cs, uint64_t size_hint, const char *reason,
+                  uint64_t used)
+{
+   assert(!cs->writeable && !cs->entry_count);
+
+   const uint32_t bo_count = cs->read_only.bo_count + cs->read_write.bo_count;
+   const uint64_t retained = tu_cs_retained_dwords(cs);
+
+   for (uint32_t i = 0; i < cs->read_only.bo_count; ++i) {
+      TU_RMV(resource_destroy, cs->device, cs->read_only.bos[i]);
+      tu_bo_finish(cs->device, cs->read_only.bos[i]);
+   }
+   for (uint32_t i = 0; i < cs->read_write.bo_count; ++i) {
+      TU_RMV(resource_destroy, cs->device, cs->read_write.bos[i]);
+      tu_bo_finish(cs->device, cs->read_write.bos[i]);
+   }
+   cs->read_only.bo_count = 0;
+   cs->read_only.start = NULL;
+   cs->read_write.bo_count = 0;
+   cs->read_write.start = NULL;
+   cs->start = cs->cur = cs->reserved_end = cs->end = NULL;
+
+   uint32_t next = cs->initial_size;
+   if (size_hint > next)
+      next = tu_sanitize_ib_size(
+         util_next_power_of_two((uint32_t) MIN2(size_hint, 0x0fffff)));
+   cs->next_bo_size = MAX2(next, cs->initial_size);
+   cs->trim_underuse = 0;
+   cs->trim_window_max = 0;
+
+   if (unlikely(tu_free_log_on))
+      tu_free_log_cs_trim(cs->name, reason, bo_count,
+                          retained * sizeof(uint32_t), used * sizeof(uint32_t),
+                          cs->next_bo_size * sizeof(uint32_t));
+}
+
+/**
+ * tu_cs_reset() for command-buffer owned streams, applying bounded retention.
+ * \a release_resources (VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT, also
+ * used by the runtime when recycling a freed command buffer) frees all BOs.
+ */
+void
+tu_cs_reset_trim(struct tu_cs *cs, bool release_resources)
+{
+   if (!tu_cs_trim_applies(cs)) {
+      tu_cs_reset(cs);
+      return;
+   }
+
+   const uint64_t used = tu_cs_used_dwords(cs);
+   tu_cs_reset(cs);
+
+   const uint64_t retained = tu_cs_retained_dwords(cs);
+   if (!retained) {
+      cs->trim_underuse = 0;
+      cs->trim_window_max = 0;
+      return;
+   }
+
+   if (release_resources) {
+      tu_cs_release_bos(cs, 0, "release", used);
+      return;
+   }
+
+   /* A stream that recorded nothing but only holds an initial-size BO is
+    * left alone here, so occasionally-empty streams of active command
+    * buffers do not churn small allocations; idle eviction handles those.
+    */
+   const bool underused =
+      used * 4 <= retained && retained > cs->initial_size;
+   if (!underused) {
+      cs->trim_underuse = 0;
+      cs->trim_window_max = 0;
+      return;
+   }
+
+   cs->trim_window_max = MAX2(cs->trim_window_max, (uint32_t) used);
+   if (++cs->trim_underuse < tu_cs_trim_resets())
+      return;
+
+   tu_cs_release_bos(cs, cs->trim_window_max, "underuse", used);
+}
+
+/**
+ * Free all retained BOs of a stream that has been reset and not recorded
+ * since, returning next_bo_size to the initial size.
+ */
+void
+tu_cs_release(struct tu_cs *cs, const char *reason)
+{
+   if (!tu_cs_trim_applies(cs) ||
+       !(cs->read_only.bo_count || cs->read_write.bo_count))
+      return;
+
+   assert(!cs->entry_count && cs->read_only.bo_count <= 1 &&
+          cs->read_write.bo_count <= 1);
+
+   tu_cs_release_bos(cs, 0, reason, 0);
 }
 
 uint64_t

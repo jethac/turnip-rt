@@ -810,6 +810,16 @@ struct tu_cmd_buffer
     */
    struct util_dynarray embedded_sampler_layouts;
 
+   /* Idle retained-stream LRU membership (tu_device::cs_park_*), protected
+    * by tu_device::cs_park_mtx.
+    */
+   struct list_head cs_park_link;
+   uint64_t cs_park_bytes;
+   uint64_t cs_park_time_ns;
+   bool cs_parked;
+   /* Streams being freed by another thread's eviction (outside the lock). */
+   bool cs_evicting;
+
    uint32_t vsc_draw_strm_pitch;
    uint32_t vsc_prim_strm_pitch;
    uint32_t vsc_draw_strm_offset, vsc_draw_strm_size_offset;
