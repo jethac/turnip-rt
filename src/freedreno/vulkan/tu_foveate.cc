@@ -1004,7 +1004,10 @@ tu_vrs_read_shm(int64_t now, struct tu_vrs_sample *s)
    uint64_t st = v2 && c.sample_time_ns ? c.sample_time_ns : c.v1.time_ns;
    s->age_ns = now - (int64_t) st;
    s->flags = v2 ? c.flags : 0;
-   if (!c.v1.valid) {
+   /* A tracker sample frozen past the daemon's limit is treated like a
+    * dropout (held for up to TU_VRS_HOLD_MS, then full rate).
+    */
+   if (!c.v1.valid || (v2 && (c.flags & TU_GAZE_FLAG_SAMPLE_FROZEN))) {
       s->reason = TU_VRS_R_INVALID;
       return;
    }
