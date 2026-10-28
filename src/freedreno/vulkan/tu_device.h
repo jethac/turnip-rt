@@ -497,6 +497,12 @@ struct tu_device
    struct tu_cs *dbg_cmdbuf_stomp_cs;
    struct tu_cs *dbg_renderpass_stomp_cs;
 
+   /* TU_VRS: zero (all 1x1) quality buffer for ineligible passes, created on
+    * first use only when TU_VRS is enabled.
+    */
+   simple_mtx_t vrs_flat_mtx;
+   struct tu_bo *vrs_flat_bo;
+
 #ifdef TU_HAS_VIRTIO
    struct tu_virtio_device *vdev;
 #endif
