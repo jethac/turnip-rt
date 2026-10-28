@@ -60,6 +60,7 @@ libtu_files = files(
   'tu_sampler.cc',
   'tu_query_pool.cc',
   'tu_queue.cc',
+  'tu_trace_perfcntr.cc',
   'tu_rmv.cc',
   'tu_shader.cc',
   'tu_suballoc.cc',

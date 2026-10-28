@@ -20,6 +20,7 @@
 #include "tu_image.h"
 #include "tu_knl.h"
 #include "tu_free_log.h"
+#include "tu_trace_perfcntr.h"
 
 #include "util/set.h"
 #include "util/u_debug.h"
@@ -545,6 +546,13 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    if (has_trace_points) {
       tu_u_trace_submission_data_create(
          device, cmd_buffers, cmdbuf_count, &u_trace_submission_data);
+   }
+
+   if (u_trace_submission_data && device->trace_pc) {
+      struct tu_cs_entry *select =
+         tu_trace_pc_select_set(device, &u_trace_submission_data->trace_pc_set);
+      if (select)
+         submit_add_entries(device, submit, &dump_cmds, select, 1);
    }
 
    for (uint32_t i = 0; i < cmdbuf_count; i++) {
