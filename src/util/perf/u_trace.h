@@ -293,6 +293,7 @@ struct u_trace_context {
    uint32_t id; /* process-unique id, printed with the output */
 
    uint32_t frame_nr;
+   uint32_t frames_printed;
    uint32_t batch_nr;
    uint32_t event_nr;
    bool start_of_frame;

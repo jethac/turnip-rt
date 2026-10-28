@@ -386,7 +386,7 @@ print_json_end(struct u_trace_context *utctx)
 static void
 print_json_start_of_frame(struct u_trace_context *utctx)
 {
-   if (utctx->frame_nr != 0)
+   if (utctx->frames_printed++ != 0)
       fprintf(utctx->out, ",\n");
    fprintf(utctx->out, "{\n\"ctx\": %u,\n", utctx->id);
    fprintf(utctx->out, "\"frame\": %u,\n", utctx->frame_nr);
@@ -701,6 +701,7 @@ u_trace_context_init(struct u_trace_context *utctx,
    utctx->last_time_ns = 0;
    utctx->first_time_ns = 0;
    utctx->frame_nr = 0;
+   utctx->frames_printed = 0;
    utctx->batch_nr = 0;
    utctx->event_nr = 0;
    utctx->start_of_frame = true;
@@ -969,7 +970,10 @@ process_flush(void *job, void *gdata, int thread_index)
 
    if (flush->frame_nr != U_TRACE_FRAME_UNKNOWN &&
        flush->frame_nr != utctx->frame_nr) {
-      if (utctx->out) {
+      /* Only close a frame that was opened: the first flush may carry a
+       * non-zero frame number (e.g. tracepoints enabled mid-run).
+       */
+      if (utctx->out && !utctx->start_of_frame) {
          simple_mtx_lock(&shared_out_mtx);
          utctx->out_printer->end_of_frame(utctx);
          simple_mtx_unlock(&shared_out_mtx);
