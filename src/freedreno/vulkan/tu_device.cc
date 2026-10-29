@@ -2995,6 +2995,61 @@ tu_device_destroy_mutexes(struct tu_device *device)
    }
 }
 
+/* TU_CS_ISZ_BATCH=<tokens>, comma separated:
+ *   1 | all      allow every CS_ISZ binary
+ *   <hex>        allow binaries whose 12-digit bin (TU_FREE_LOG cs_isz bin=,
+ *                TU_LOG_SHADER_HASHES) starts with <hex> (6..12 digits, max 16)
+ *   log          log retraction counts
+ * Unset or 0 = off (the command stream is unchanged).  Any unknown token turns
+ * the feature off.  It only has an effect together with TU_CS_ISZ_RESTORE.
+ */
+static void
+tu_cs_isz_batch_init(struct tu_device *device)
+{
+   device->cs_isz_batch = false;
+   device->cs_isz_batch_log = false;
+   device->cs_isz_batch_nbins = 0;
+
+   const char *env = os_get_option("TU_CS_ISZ_BATCH");
+   if (!env || !*env || !strcmp(env, "0"))
+      return;
+
+   bool all = false, bad = false;
+   char buf[512];
+   snprintf(buf, sizeof(buf), "%s", env);
+   char *save = NULL;
+   for (char *tok = strtok_r(buf, ",", &save); tok;
+        tok = strtok_r(NULL, ",", &save)) {
+      size_t len = strlen(tok);
+      if (!strcmp(tok, "1") || !strcmp(tok, "all")) {
+         all = true;
+      } else if (!strcmp(tok, "log")) {
+         device->cs_isz_batch_log = true;
+      } else if (len >= 6 && len <= 12 &&
+                 strspn(tok, "0123456789abcdef") == len &&
+                 device->cs_isz_batch_nbins < 16) {
+         memcpy(device->cs_isz_batch_bins[device->cs_isz_batch_nbins++],
+                tok, len + 1);
+      } else {
+         bad = true;
+      }
+   }
+
+   if (bad || (!all && device->cs_isz_batch_nbins == 0)) {
+      mesa_loge("tu-isz-batch: TU_CS_ISZ_BATCH=%s rejected (unknown token, "
+                "too many bins or nothing allowed), feature off", env);
+      device->cs_isz_batch_nbins = 0;
+      device->cs_isz_batch_log = false;
+      return;
+   }
+   if (all)
+      device->cs_isz_batch_nbins = 0;
+   device->cs_isz_batch = true;
+   mesa_logi("tu-isz-batch: enabled bins=%s wa=%u restore=0x%x log=%u",
+             all ? "all" : env, (unsigned) device->cs_isz_wa,
+             device->cs_isz_restore, (unsigned) device->cs_isz_batch_log);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateDevice(VkPhysicalDevice physicalDevice,
                 const VkDeviceCreateInfo *pCreateInfo,
@@ -3096,6 +3151,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       mesa_logi("tu: TU_CS_ISZ_WA=%u TU_CS_ISZ_RESTORE=0x%x",
                 (unsigned) device->cs_isz_wa, device->cs_isz_restore);
    }
+   tu_cs_isz_batch_init(device);
    if (unlikely(tu_free_log_on)) {
       tu_free_log_config(debug_get_bool_option("TU_EPW_BROAD", false),
                          device->cs_isz_wa, device->cs_isz_restore);

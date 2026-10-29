@@ -681,6 +681,20 @@ struct tu_cmd_state
    uint32_t total_renderpasses;
    uint32_t total_dispatches;
 
+   /* TU_CS_ISZ_BATCH: the CS_ISZ restore sequence emitted right after the
+    * last dispatch, kept so that an immediately following dispatch of the
+    * same binary can retract it (only when nothing else was recorded).
+    */
+   struct {
+      const struct ir3_shader_variant *variant;
+      uint32_t *start;    /* first dword of the restore sequence */
+      uint32_t *end;      /* cs->cur right after it */
+      uint32_t *cs_start; /* cs->start when it was emitted */
+      uint32_t entry_count;
+      uint32_t cond_depth;
+      bool writeable;
+   } isz_batch;
+
    unsigned tile_render_pass_count;
    bool renderpass_cb_disabled;
 
