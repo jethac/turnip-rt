@@ -4381,6 +4381,14 @@ tu_shader_create(struct tu_device *dev,
                 shader->variant->blake3_str,
                 shader->variant->info.instrs_count,
                 shader->variant->constlen);
+   /* Lane order is observable to subgroup rewrites that assume lane ==
+    * LocalInvocationIndex; log it for offline checks.
+    */
+   if (log_hashes && shader->variant && src_stage == MESA_SHADER_COMPUTE)
+      mesa_logi("tu-cs-order: bin=%.12s order=%s threadsize=%u",
+                shader->variant->blake3_str,
+                shader->variant->cs.force_linear_dispatch ? "linear" : "tiled",
+                shader->variant->info.double_threadsize ? 128 : 64);
    if (log_hashes && shader->variant && shader->ubo_witness_speculated)
       mesa_logi("tu-ubo-witness: bin=%.12s witnessed push-UBO speculation, "
                 "early_preamble=%d", shader->variant->blake3_str,
