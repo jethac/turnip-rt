@@ -10,6 +10,7 @@
 
 #include "ir3/ir3_nir.h"
 #include "util/os_misc.h"
+#include "util/u_dynarray.h"
 
 #define TU_HW_WAVE 64
 #define TU_LANE_SHFL_MAX_DELTAS 4
@@ -61,6 +62,7 @@ tu_sg32_cfg(void)
       const char *d = os_get_option("TU_SG32_EMU_DISABLE");
       cfg.v2 = v && !strcmp(v, "v2");
       cfg.l1 = cfg.v2 && !sg32_disabled(d, "l1");
+      cfg.l1u = cfg.l1 && !sg32_disabled(d, "l1u");
       cfg.l2 = cfg.v2 && !sg32_disabled(d, "l2");
       cfg.l2b = cfg.v2 && !sg32_disabled(d, "l2b");
       cfg.l4 = cfg.v2 && !sg32_disabled(d, "l4");
@@ -83,8 +85,8 @@ tu_sg32_uuid_string(void)
    const struct tu_sg32_cfg *c = tu_sg32_cfg();
    if (!c->v2)
       return NULL;
-   snprintf(buf, sizeof(buf), "TU_SG32_EMU=v2:%d%d%d%d", c->l1, c->l2, c->l2b,
-            c->l4);
+   snprintf(buf, sizeof(buf), "TU_SG32_EMU=v2:%d%d%d%d:l1u%d", c->l1, c->l2,
+            c->l2b, c->l4, c->l1u);
    return buf;
 }
 
@@ -567,6 +569,56 @@ sg32_count_direct(nir_shader *nir)
    return n;
 }
 
+/* L1u: ir3 runs divergence analysis with nir_divergence_uniform_load_tears,
+ * so at L1 time (before explicit-io lowering) every UBO load_deref without
+ * ACCESS_NON_WRITEABLE is treated as divergent, and L1 cannot see that
+ * UBO-derived operands (e.g. vote_all(cbuffer flag)) are uniform. UBO memory
+ * cannot be written by shader invocations, and ir3 itself treats the lowered
+ * load_ubo as uniform whenever its block index and offset are. Mark UBO
+ * load_derefs non-writeable for the L1 divergence analysis only, and restore
+ * the original access afterwards so later lowering and codegen see exactly
+ * the instructions they saw before.
+ */
+static unsigned
+sg32_l1u_mark(nir_shader *nir, struct util_dynarray *marked)
+{
+   unsigned n = 0;
+   nir_foreach_function_impl (impl, nir) {
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_deref)
+               continue;
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (!nir_deref_mode_is(deref, nir_var_mem_ubo))
+               continue;
+            enum gl_access_qualifier access = nir_intrinsic_access(intr);
+            if (access & (ACCESS_NON_WRITEABLE | ACCESS_VOLATILE | ACCESS_ATOMIC))
+               continue;
+            nir_intrinsic_set_access(intr, (enum gl_access_qualifier)
+                                     (access | ACCESS_NON_WRITEABLE));
+            util_dynarray_append_typed(marked, nir_intrinsic_instr *, intr);
+            n++;
+         }
+      }
+   }
+   return n;
+}
+
+static void
+sg32_l1u_restore(struct util_dynarray *marked)
+{
+   util_dynarray_foreach (marked, nir_intrinsic_instr *, p) {
+      nir_intrinsic_instr *intr = *p;
+      nir_intrinsic_set_access(intr, (enum gl_access_qualifier)
+                               (nir_intrinsic_access(intr) &
+                                ~ACCESS_NON_WRITEABLE));
+   }
+   util_dynarray_clear(marked);
+}
+
 bool
 tu_nir_sg32_v2(nir_shader *nir, struct ir3_compiler *compiler,
                unsigned subgroup_size, struct tu_sg32_report *rep)
@@ -582,9 +634,21 @@ tu_nir_sg32_v2(nir_shader *nir, struct ir3_compiler *compiler,
    }
 
    if (cfg->l1) {
+      struct util_dynarray marked;
+      util_dynarray_init(&marked, NULL);
+      if (cfg->l1u) {
+         rep->l1u = sg32_l1u_mark(nir, &marked);
+         /* Divergence must be recomputed with the marked access. */
+         nir_metadata_invalidate(nir);
+      }
       nir_divergence_analysis(nir);
       nir_shader_intrinsics_pass(nir, sg32_l1_instr, nir_metadata_control_flow,
                                  &rep->l1);
+      if (cfg->l1u) {
+         sg32_l1u_restore(&marked);
+         nir_metadata_invalidate(nir);
+      }
+      util_dynarray_fini(&marked);
       if (rep->l1)
          nir_opt_dce(nir);
    }

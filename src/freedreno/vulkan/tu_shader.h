@@ -178,7 +178,7 @@ bool
 tu_nir_lower_emulated_subgroups(nir_shader *shader, unsigned subgroup_size);
 
 struct tu_sg32_cfg {
-   bool v2, l1, l2, l2b, l4;
+   bool v2, l1, l1u, l2, l2b, l4;
 };
 
 struct tu_sg32_report {
@@ -186,6 +186,7 @@ struct tu_sg32_report {
    bool native;       /* L4: emulation dropped */
    const char *reason;
    unsigned l1;       /* subgroup ops removed by L1 */
+   unsigned l1u;      /* UBO loads treated as non-tearing for L1 */
    unsigned l2;       /* ops lowered by L2 */
    unsigned l2b;      /* ALU pushed through half selects */
 };

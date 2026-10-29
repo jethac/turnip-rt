@@ -461,11 +461,11 @@ tu_spirv_to_nir(struct tu_device *dev,
       static const bool log_sg32 =
          debug_get_bool_option("TU_LOG_SHADER_HASHES", false);
       if (log_sg32)
-         mesa_logi("tu-sg32: %s src=%08x%08x %s reason=%s l1=%u l2=%u l2b=%u",
+         mesa_logi("tu-sg32: %s src=%08x%08x %s reason=%s l1=%u l2=%u l2b=%u l1u=%u",
                    mesa_shader_stage_name(stage), nir->info.source_blake3[0],
                    nir->info.source_blake3[1],
                    sg32.native ? "native" : "emulated", sg32.reason,
-                   sg32.l1, sg32.l2, sg32.l2b);
+                   sg32.l1, sg32.l2, sg32.l2b, sg32.l1u);
    }
 
    nir_opt_peephole_select_options peephole_select_options = {
