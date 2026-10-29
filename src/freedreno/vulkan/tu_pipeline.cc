@@ -5168,12 +5168,25 @@ tu_compute_pipeline_create(VkDevice device,
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
       .requiredSubgroupSize = 32,
    };
+   /* Native wave64 rewrites of wave32 shaders (override modules) ask for
+    * the single-wave 64-lane compile with this marker; no app module
+    * carries it, so nothing else changes.
+    */
+   const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo marker64_subgroup_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+      .requiredSubgroupSize = 64,
+   };
    static const bool sg32_marker =
       debug_get_bool_option("TU_SG32_MARKER", false);
    if (!subgroup_info && sg32_marker &&
        tu_stage_has_module_processed(stage_info,
                                      "turnip.required_subgroup_size=32"))
       subgroup_info = &marker_subgroup_info;
+   else if (!subgroup_info && sg32_marker &&
+            dev->compiler->info->threadsize_base == 64 &&
+            tu_stage_has_module_processed(stage_info,
+                                          "turnip.required_subgroup_size=64"))
+      subgroup_info = &marker64_subgroup_info;
    tu_shader_key_subgroup_size(&key, allow_varying_subgroup_size,
                                require_full_subgroups, subgroup_info,
                                dev);
