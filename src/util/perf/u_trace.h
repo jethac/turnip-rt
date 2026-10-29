@@ -258,6 +258,19 @@ struct u_trace_context {
    uint64_t timestamp_size_bytes;
    uint64_t max_indirect_size_bytes;
 
+   /* Minimum number of entries per newly created timestamp/indirect buffer.
+    * u_trace_context_init() sets the historical default (0x1000); a driver
+    * may lower it after init (Turnip: TU_TRACE_BUF_ENTRIES).
+    */
+   uint32_t buffer_entries;
+
+   /* When set, u_trace_clone_append() copies only the span of each source
+    * buffer that the cloned events reference, instead of the whole source
+    * buffer, and sizes the destination allocation to that span (Turnip:
+    * TU_TRACE_COPY_USED). Default off: historical whole-buffer copies.
+    */
+   bool clone_used_span;
+
    FILE *out;
    bool out_owned; /* `out` is owned by this context and must be closed */
    struct u_trace_printer *out_printer;

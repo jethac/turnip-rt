@@ -738,6 +738,12 @@ struct tu_u_trace_submission_data
    struct u_trace **trace_per_cmd_buffer;
    struct tu_copy_timestamp_data *timestamp_copy_data;
 
+   /* TU_TRACE_COPY_USED: set once tu_trace_read_ts has waited on the fence
+    * for this submission (cloned spans no longer guarantee that the first
+    * read is at offset 0). Only touched when the knob is on.
+    */
+   bool ts_fence_waited;
+
    /* GPU time is reset on GPU power cycle and the GPU time
     * offset may change between submissions due to power cycle.
     */

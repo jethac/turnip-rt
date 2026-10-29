@@ -2425,7 +2425,16 @@ tu_trace_read_ts(struct u_trace_context *utctx,
    if (offset_B == 0) {
       tu_queue_wait_fence(submission_data->queue, submission_data->fence,
                           1000000000);
+   } else if (utctx->clone_used_span && !submission_data->ts_fence_waited) {
+      /* With used-span clones a flushed trace's first live event can sit at
+       * a nonzero offset (e.g. when the leading cloned run holds only
+       * disabled events), so wait on the first read of the submission.
+       */
+      tu_queue_wait_fence(submission_data->queue, submission_data->fence,
+                          1000000000);
    }
+   if (utctx->clone_used_span)
+      submission_data->ts_fence_waited = true;
 
    uint64_t *ts = reinterpret_cast<uint64_t *>(
       static_cast<char *>(tu_suballoc_bo_map(bo)) + offset_B);
@@ -2543,6 +2552,38 @@ tu_gpu_trace_gate_poll(struct tu_device *device)
    mesa_logi("TU_GPU_TRACE_GATE state=%s raw_ns=%" PRIu64 " device=%p submit=%u frame=%u",
              open ? "open" : "closed", now, (void *) device,
              device->submit_count, (unsigned) device->vk.current_frame);
+}
+
+/* Opt-in u_trace copy-volume knobs. Unset: u_trace keeps its historical
+ * whole-buffer clones and 0x1000-entry buffers, so command streams are
+ * unchanged.
+ *
+ * TU_TRACE_COPY_USED=1: when cloning tracepoints (per-submit copy of a
+ *   reusable command buffer's trace, per-render-pass rp_trace clone), copy
+ *   only the byte span of each source buffer that the cloned events
+ *   reference and size the destination to it.
+ * TU_TRACE_BUF_ENTRIES=n: minimum entries per new timestamp/indirect
+ *   buffer, clamped to [16, 4096] and rounded up to a multiple of 16 so
+ *   suballocations keep 8-byte alignment.
+ */
+static void
+tu_trace_copy_options_init(struct u_trace_context *utctx)
+{
+   const char *used = os_get_option("TU_TRACE_COPY_USED");
+   const char *entries = os_get_option("TU_TRACE_BUF_ENTRIES");
+
+   if (used && *used && strcmp(used, "0") != 0)
+      utctx->clone_used_span = true;
+
+   if (entries && *entries) {
+      long n = strtol(entries, NULL, 0);
+      n = CLAMP(n, 16, 0x1000);
+      utctx->buffer_entries = (uint32_t) align((uint32_t) n, 16);
+   }
+
+   if (utctx->clone_used_span || (entries && *entries))
+      mesa_logi("tu-trace-copy TU_TRACE_COPY_USED=%u TU_TRACE_BUF_ENTRIES=%u",
+                utctx->clone_used_span ? 1u : 0u, utctx->buffer_entries);
 }
 
 VkResult
@@ -3463,6 +3504,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
                      tu_trace_capture_data,
                      tu_trace_get_data,
                      tu_trace_delete_flush_data);
+   tu_trace_copy_options_init(&device->trace_context);
 
    tu_breadcrumbs_init(device);
 
