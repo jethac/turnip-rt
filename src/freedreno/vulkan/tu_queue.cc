@@ -551,6 +551,7 @@ tu_ring_ts_finish(struct tu_queue *queue)
 
 /* TU_LPAC_COMPUTE: per-reason routing counters, logged periodically. */
 static uint64_t tu_lpac_reason_counts[TU_LPAC_GFX_REASON_COUNT];
+static uint64_t tu_lpac_cs_isz_skip_submits;
 
 static void
 tu_lpac_log_stats(const struct tu_queue *queue, const char *when)
@@ -568,10 +569,11 @@ tu_lpac_log_stats(const struct tu_queue *queue, const char *when)
       buf[0] = 0;
    mesa_logi("tu-lpac stats %s family=%u lpac_msm=%u fallback_msm=%u lpac_submits=%" PRIu64
              " gfx_fallback_submits=%" PRIu64 " ring_switch_waits=%" PRIu64 " order_point=%" PRIu64
-             " fallback_reasons:%s",
+             " cs_isz_skip_lpac_submits=%" PRIu64 " fallback_reasons:%s",
              when, queue->vk.queue_family_index, queue->msm_queue_id,
              queue->gfx_fallback ? queue->gfx_fallback->msm_queue_id : 0,
-             o->lpac_submits, o->gfx_submits, o->switches, o->point, buf);
+             o->lpac_submits, o->gfx_submits, o->switches, o->point,
+             p_atomic_read(&tu_lpac_cs_isz_skip_submits), buf);
 }
 
 /* TU_LPAC_COMPUTE backstop. The running kernel never declares an LPAC hang:
@@ -818,6 +820,14 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
       if (reason) {
          target = queue->gfx_fallback;
          p_atomic_inc(&tu_lpac_reason_counts[reason]);
+      }
+      else {
+         for (uint32_t i = 0; i < cmdbuf_count; i++) {
+            if (cmd_buffers[i]->lpac_cs_isz_skipped) {
+               p_atomic_inc(&tu_lpac_cs_isz_skip_submits);
+               break;
+            }
+         }
       }
       if (((queue->order->lpac_submits + queue->order->gfx_submits) & 4095) == 4095)
          tu_lpac_log_stats(queue, "periodic");

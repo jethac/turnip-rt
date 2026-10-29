@@ -881,6 +881,7 @@ struct tu_cmd_buffer
    bool lpac_family;
    bool lpac_rec;
    enum tu_lpac_gfx_reason lpac_gfx_reason;
+   bool lpac_cs_isz_skipped;
 };
 
 struct vk_device_dispatch_table;

@@ -5125,6 +5125,7 @@ tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
    cmd_buffer->usage_flags = pBeginInfo->flags;
    cmd_buffer->lpac_rec = cmd_buffer->lpac_family;
    cmd_buffer->lpac_gfx_reason = TU_LPAC_GFX_REASON_NONE;
+   cmd_buffer->lpac_cs_isz_skipped = false;
 
    tu_cs_begin(&cmd_buffer->cs);
    tu_cs_begin(&cmd_buffer->draw_cs);
@@ -10817,8 +10818,21 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    static const bool cs_isz_on_lpac =
       debug_get_option("TU_LPAC_CS_ISZ", NULL) &&
       !strcmp(debug_get_option("TU_LPAC_CS_ISZ", ""), "lpac");
-   if (emit_instrlen_workaround && !cs_isz_on_lpac)
+   static const bool cs_isz_skip_on_lpac =
+      debug_get_option("TU_LPAC_CS_ISZ", NULL) &&
+      !strcmp(debug_get_option("TU_LPAC_CS_ISZ", ""), "skip");
+   bool isz_br_only = false;
+   if (emit_instrlen_workaround && cmd->lpac_rec && cs_isz_skip_on_lpac &&
+       cs->cond_stack_depth < TU_COND_EXEC_STACK_SIZE) {
+      isz_br_only = true;
+      cmd->lpac_cs_isz_skipped = true;
+      static bool logged;
+      if (!p_atomic_xchg(&logged, true))
+         mesa_logi("tu-lpac TU_LPAC_CS_ISZ=skip: CS instrlen workaround "
+                   "dispatch kept on LPAC, workaround packets BR/BV-only");
+   } else if (emit_instrlen_workaround && !cs_isz_on_lpac) {
       tu_lpac_require_gfx(cmd, TU_LPAC_GFX_REASON_CS_ISZ);
+   }
 
    /* We don't use draw states for dispatches, so the bound pipeline
     * could be overwritten by reg stomping in a renderpass or blit.
@@ -10844,8 +10858,14 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
     * See https://gitlab.freedesktop.org/mesa/mesa/-/issues/5892
     */
    if (emit_instrlen_workaround) {
+      if (isz_br_only)
+         tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
+                                CP_COND_REG_EXEC_0_BR |
+                                CP_COND_REG_EXEC_0_BV);
       tu_cs_emit_regs(cs, A6XX_SP_PS_INSTR_SIZE(shader->variant->instrlen));
       tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
+      if (isz_br_only)
+         tu_cond_exec_end(cs);
    }
 
    cmd->device->autotune->emit_reset_rp_hash_draw_state(cmd, cs);
@@ -11082,6 +11102,10 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
     * anyway when the next renderpass starts.
     */
    if (emit_instrlen_workaround) {
+      if (isz_br_only)
+         tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
+                                CP_COND_REG_EXEC_0_BR |
+                                CP_COND_REG_EXEC_0_BV);
       tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
 
       if (cmd->device->cs_isz_restore) {
@@ -11092,6 +11116,8 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
             tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
          }
       }
+      if (isz_br_only)
+         tu_cond_exec_end(cs);
    }
 
    cmd->state.total_dispatches++;
