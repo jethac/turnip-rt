@@ -19,6 +19,8 @@
 #include "tu_image.h"
 #include "tu_pass.h"
 #include "tu_shader.h"
+#include "tu_vrs_ps_deny.h"
+#include "vk_shader_module.h"
 #include <sys/stat.h>
 
 enum tu_gaze_src {
@@ -658,6 +660,22 @@ struct tu_vrs_ctl {
    bool parse_error;
 };
 
+/* One TU_VRS_PS_ALLOW/DENY entry: the top <bits> of the 64-bit DXIL hash
+ * (8..16 hex digits given) and the coarsest level allowed for it
+ * (0 = 1x1, 1 = 2x2, 2 = 4x4; denylist entries ignore it).
+ */
+struct tu_vrs_ps_entry {
+   uint64_t val;
+   uint8_t bits;
+   uint8_t cap;
+};
+
+struct tu_vrs_ps_list {
+   bool set;          /* the variable was given (allow: enables allow mode) */
+   struct tu_vrs_ps_entry *e;
+   uint32_t n, alloc;
+};
+
 struct tu_vrs_cfg {
    bool enabled;
    uint32_t dims[TU_VRS_MAX_DIMS][2];
@@ -674,6 +692,14 @@ struct tu_vrs_cfg {
    const char *dump;
    uint32_t dump_max;
    bool require_v2;
+   /* TU_VRS_PS_ALLOW / TU_VRS_PS_DENY / TU_VRS_PS_MODE / TU_VRS_PS_DIMS */
+   struct tu_vrs_ps_list ps_allow, ps_deny;
+   bool ps_deny_builtin;
+   bool ps_strict;      /* allowlist decides in every pass, not only depth-less */
+   bool ps_error;       /* a list failed to parse: no draw shades coarse */
+   uint32_t ps_log;
+   uint32_t ps_dims[TU_VRS_MAX_DIMS][2];
+   uint32_t ps_dims_count;
 };
 
 static struct tu_vrs_cfg vrs_cfg;
@@ -710,6 +736,13 @@ static uint32_t vrs_stat_pass[TU_VRS_PASS_KINDS];
 static uint32_t vrs_stat_texels[3];
 static uint32_t vrs_stat_maps;
 static uint32_t vrs_stat_state[4]; /* injected, capped(discard), vetoed, app-nontrivial */
+/* PS-list decisions: allowlisted, denied, not listed (skipped), no DXIL hash
+ * (skipped in allow mode), capped by an allowlist entry; depth-less passes
+ * that received the gaze map.
+ */
+enum { VRS_PS_ALLOW, VRS_PS_DENY, VRS_PS_UNLISTED, VRS_PS_UNHASHED,
+       VRS_PS_CAPPED, VRS_PS_DEPTHLESS_PASS, VRS_PS_STATS };
+static uint32_t vrs_stat_ps[VRS_PS_STATS];
 static uint32_t vrs_dumped;
 
 static const float tu_vrs_layout_eh[3][2] = {
@@ -730,19 +763,246 @@ tu_vrs_layout_index(char l)
 }
 
 static void
-tu_vrs_parse_dims(const char *s)
+tu_vrs_parse_dims_into(const char *s, uint32_t (*dims)[2], uint32_t *count)
 {
-   while (s && *s && vrs_cfg.dims_count < TU_VRS_MAX_DIMS) {
+   while (s && *s && *count < TU_VRS_MAX_DIMS) {
       uint32_t w, h;
       if (sscanf(s, "%ux%u", &w, &h) != 2)
          break;
-      vrs_cfg.dims[vrs_cfg.dims_count][0] = w;
-      vrs_cfg.dims[vrs_cfg.dims_count][1] = h;
-      vrs_cfg.dims_count++;
+      dims[*count][0] = w;
+      dims[*count][1] = h;
+      (*count)++;
       s = strchr(s, ',');
       if (s)
          s++;
    }
+}
+
+static void
+tu_vrs_parse_dims(const char *s)
+{
+   tu_vrs_parse_dims_into(s, vrs_cfg.dims, &vrs_cfg.dims_count);
+}
+
+/* ---- TU_VRS_PS_ALLOW / TU_VRS_PS_DENY ----
+ * Value: an inline list, or "@<file>" / an absolute path to a file holding
+ * one. Tokens are separated by whitespace, ',' or ';'; '#' starts a comment
+ * that runs to the end of the line. A token is
+ *   <8..16 hex digits>[:1|2|4]   DXIL hash prefix, optional coarsest rate
+ *   default                      (deny only) the built-in list (velocity,
+ *                                FSR reactive/composition inputs, HUD/UI)
+ *   none                         (deny only) no built-in list
+ * TU_VRS_PS_DENY unset means "default". Any malformed token is a parse
+ * error: logged, and then no draw shades coarse at all (fail closed).
+ */
+#define TU_VRS_PS_FILE_MAX (1u << 20)
+
+static bool
+tu_vrs_ps_add(struct tu_vrs_ps_list *l, uint64_t val, uint8_t bits, uint8_t cap)
+{
+   if (l->n == l->alloc) {
+      uint32_t na = l->alloc ? l->alloc * 2 : 16;
+      void *ne = realloc(l->e, na * sizeof(*l->e));
+      if (!ne)
+         return false;
+      l->e = (struct tu_vrs_ps_entry *) ne;
+      l->alloc = na;
+   }
+   l->e[l->n++] = (struct tu_vrs_ps_entry) { val, bits, cap };
+   return true;
+}
+
+static bool
+tu_vrs_ps_parse_token(const char *t, struct tu_vrs_ps_list *l, bool deny)
+{
+   if (deny && !strcmp(t, "none")) {
+      vrs_cfg.ps_deny_builtin = false;
+      return true;
+   }
+   if (deny && !strcmp(t, "default")) {
+      vrs_cfg.ps_deny_builtin = true;
+      return true;
+   }
+   uint64_t v = 0;
+   unsigned n = 0;
+   for (; t[n] && t[n] != ':'; n++) {
+      char c = t[n];
+      unsigned d;
+      if (c >= '0' && c <= '9')
+         d = c - '0';
+      else if (c >= 'a' && c <= 'f')
+         d = c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F')
+         d = c - 'A' + 10;
+      else
+         return false;
+      if (n >= 16)
+         return false;
+      v = (v << 4) | d;
+   }
+   if (n < 8)
+      return false;
+   uint8_t cap = 2;
+   if (t[n] == ':') {
+      if (deny || !t[n + 1] || t[n + 2])
+         return false;
+      switch (t[n + 1]) {
+      case '1': cap = 0; break;
+      case '2': cap = 1; break;
+      case '4': cap = 2; break;
+      default: return false;
+      }
+   }
+   return tu_vrs_ps_add(l, v, (uint8_t) (n * 4), cap);
+}
+
+static bool
+tu_vrs_ps_parse(const char *name, const char *spec, struct tu_vrs_ps_list *l,
+                bool deny)
+{
+   char *text = NULL;
+   if (spec[0] == '@' || spec[0] == '/') {
+      const char *path = spec[0] == '@' ? spec + 1 : spec;
+      FILE *fp = fopen(path, "rb");
+      if (!fp) {
+         mesa_loge("tu-vrs-ps: %s: cannot open %s", name, path);
+         return false;
+      }
+      text = (char *) calloc(1, TU_VRS_PS_FILE_MAX + 1);
+      size_t got = text ? fread(text, 1, TU_VRS_PS_FILE_MAX + 1, fp) : 0;
+      fclose(fp);
+      if (!text || got > TU_VRS_PS_FILE_MAX) {
+         mesa_loge("tu-vrs-ps: %s: %s unreadable or over %u bytes", name, path,
+                   TU_VRS_PS_FILE_MAX);
+         free(text);
+         return false;
+      }
+      text[got] = 0;
+   } else {
+      text = strdup(spec);
+      if (!text)
+         return false;
+   }
+   bool ok = true;
+   char *p = text;
+   while (*p) {
+      if (*p == '#') {
+         while (*p && *p != '\n')
+            p++;
+         continue;
+      }
+      if (strchr(" \t\r\n,;", *p)) {
+         p++;
+         continue;
+      }
+      char *t = p;
+      while (*p && !strchr(" \t\r\n,;#", *p))
+         p++;
+      char save = *p;
+      *p = 0;
+      if (!tu_vrs_ps_parse_token(t, l, deny)) {
+         mesa_loge("tu-vrs-ps: %s: bad token '%s'", name, t);
+         ok = false;
+      }
+      *p = save;
+   }
+   free(text);
+   return ok;
+}
+
+static bool
+tu_vrs_ps_match(const struct tu_vrs_ps_list *l, uint64_t h, uint8_t *cap)
+{
+   for (uint32_t i = 0; i < l->n; i++) {
+      const struct tu_vrs_ps_entry *e = &l->e[i];
+      if ((h >> (64 - e->bits)) == e->val) {
+         if (cap)
+            *cap = e->cap;
+         return true;
+      }
+   }
+   return false;
+}
+
+static bool
+tu_vrs_ps_builtin_denied(uint64_t h)
+{
+   uint32_t lo = 0, hi = ARRAY_SIZE(tu_vrs_ps_deny_builtin);
+   while (lo < hi) {
+      uint32_t mid = (lo + hi) / 2;
+      if (tu_vrs_ps_deny_builtin[mid] == h)
+         return true;
+      if (tu_vrs_ps_deny_builtin[mid] < h)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   return false;
+}
+
+static bool
+tu_vrs_ps_denied(uint64_t h)
+{
+   if (!h)
+      return false;
+   return (vrs_cfg.ps_deny_builtin && tu_vrs_ps_builtin_denied(h)) ||
+          tu_vrs_ps_match(&vrs_cfg.ps_deny, h, NULL);
+}
+
+static void
+tu_vrs_ps_init(void)
+{
+   vrs_cfg.ps_deny_builtin = true;
+   const char *allow = os_get_option("TU_VRS_PS_ALLOW");
+   const char *deny = os_get_option("TU_VRS_PS_DENY");
+   if (allow && *allow) {
+      vrs_cfg.ps_allow.set = true;
+      if (!tu_vrs_ps_parse("TU_VRS_PS_ALLOW", allow, &vrs_cfg.ps_allow, false))
+         vrs_cfg.ps_error = true;
+   }
+   if (deny && *deny) {
+      vrs_cfg.ps_deny.set = true;
+      if (!tu_vrs_ps_parse("TU_VRS_PS_DENY", deny, &vrs_cfg.ps_deny, true))
+         vrs_cfg.ps_error = true;
+   }
+   const char *mode = os_get_option("TU_VRS_PS_MODE");
+   vrs_cfg.ps_strict = true;
+   if (mode && !strcmp(mode, "extend"))
+      vrs_cfg.ps_strict = false;
+   else if (mode && strcmp(mode, "strict")) {
+      mesa_loge("tu-vrs-ps: TU_VRS_PS_MODE=%s unknown (strict|extend)", mode);
+      vrs_cfg.ps_error = true;
+   }
+   tu_vrs_parse_dims_into(os_get_option("TU_VRS_PS_DIMS"), vrs_cfg.ps_dims,
+                          &vrs_cfg.ps_dims_count);
+   vrs_cfg.ps_log = debug_get_num_option("TU_VRS_PS_LOG", 0);
+   if (vrs_cfg.ps_error)
+      mesa_loge("tu-vrs-ps: list/mode parse error: no draw will shade coarse");
+
+   mesa_logi("tu-vrs-ps: allow=%s entries=%u mode=%s deny builtin=%d(%u) extra=%u ps_dims=%u error=%d log=%u",
+             vrs_cfg.ps_allow.set ? "on" : "off", vrs_cfg.ps_allow.n,
+             vrs_cfg.ps_strict ? "strict" : "extend", vrs_cfg.ps_deny_builtin,
+             (unsigned) ARRAY_SIZE(tu_vrs_ps_deny_builtin), vrs_cfg.ps_deny.n,
+             vrs_cfg.ps_dims_count, vrs_cfg.ps_error, vrs_cfg.ps_log);
+   for (uint32_t i = 0; i < vrs_cfg.ps_allow.n; i++) {
+      const struct tu_vrs_ps_entry *e = &vrs_cfg.ps_allow.e[i];
+      /* Report allow entries a deny entry shadows (deny wins). */
+      bool shadowed = false;
+      for (uint32_t j = 0; j < ARRAY_SIZE(tu_vrs_ps_deny_builtin) &&
+                           vrs_cfg.ps_deny_builtin && !shadowed; j++)
+         shadowed = (tu_vrs_ps_deny_builtin[j] >> (64 - e->bits)) == e->val;
+      for (uint32_t j = 0; j < vrs_cfg.ps_deny.n && !shadowed; j++) {
+         const struct tu_vrs_ps_entry *d = &vrs_cfg.ps_deny.e[j];
+         uint8_t b = MIN2(d->bits, e->bits);
+         shadowed = (d->val >> (d->bits - b)) == (e->val >> (e->bits - b));
+      }
+      mesa_logi("tu-vrs-ps: allow[%u]=%0*" PRIx64 " cap=%ux%u%s", i,
+                (int) (e->bits / 4), e->val, 1u << e->cap, 1u << e->cap,
+                shadowed ? " SHADOWED-BY-DENY" : "");
+   }
+   for (uint32_t i = 0; i < vrs_cfg.ps_dims_count; i++)
+      mesa_logi("tu-vrs-ps: ps_dims[%u]=%ux%u", i, vrs_cfg.ps_dims[i][0],
+                vrs_cfg.ps_dims[i][1]);
 }
 
 /* Control word / ctl file grammar (whitespace or comma separated tokens):
@@ -804,7 +1064,11 @@ tu_vrs_init_once(void)
       return;
 
    const char *dims = os_get_option("TU_VRS_DIMS");
-   tu_vrs_parse_dims(dims ? dims : "1712x960,856x960");
+   /* Scene render sizes: today's 1712x960 SBS (856x960/eye) and FSR
+    * Performance 1280x720 SBS (640x720/eye).
+    */
+   tu_vrs_parse_dims(dims ? dims : "1712x960,856x960,1280x720,640x720");
+   tu_vrs_ps_init();
 
    struct tu_vrs_ctl *e = &vrs_cfg.env;
    e->on = true;
@@ -865,6 +1129,21 @@ bool
 tu_vrs_linear(void)
 {
    return vrs_cfg.linear;
+}
+
+bool
+tu_vrs_ps_allow_mode(void)
+{
+   return vrs_cfg.ps_allow.set && !vrs_cfg.ps_error;
+}
+
+bool
+tu_vrs_ps_dims_ok(uint32_t w, uint32_t h)
+{
+   for (uint32_t i = 0; i < vrs_cfg.ps_dims_count; i++)
+      if (vrs_cfg.ps_dims[i][0] == w && vrs_cfg.ps_dims[i][1] == h)
+         return true;
+   return tu_vrs_dims_ok(w, h);
 }
 
 bool
@@ -1066,6 +1345,15 @@ tu_vrs_log_interval(struct tu_vrs_latch *l)
              l->age_n ? l->age_sum_ns / 1e6 / l->age_n : 0.0, l->age_max_ns / 1e6,
              l->age_n, f->r0, f->r1, f->scale[0][0] > 0.f ? "deg" : "eh", f->cap,
              f->flags, l->ctl_changes);
+   if (vrs_cfg.ps_allow.set || vrs_cfg.ps_deny.set || vrs_cfg.ps_error) {
+      uint32_t ps[VRS_PS_STATS];
+      for (unsigned i = 0; i < VRS_PS_STATS; i++)
+         ps[i] = p_atomic_xchg(&vrs_stat_ps[i], 0);
+      mesa_logi("tu-vrs-ps: epoch=%" PRIu64 " decisions allow=%u deny=%u unlisted=%u unhashed=%u listcap=%u depthless_gaze_passes=%u error=%d",
+                l->key, ps[VRS_PS_ALLOW], ps[VRS_PS_DENY], ps[VRS_PS_UNLISTED],
+                ps[VRS_PS_UNHASHED], ps[VRS_PS_CAPPED],
+                ps[VRS_PS_DEPTHLESS_PASS], vrs_cfg.ps_error);
+   }
    l->epochs = l->epochs_active = 0;
    l->age_sum_ns = l->age_max_ns = 0;
    l->age_n = 0;
@@ -1323,12 +1611,147 @@ tu_vrs_note_pass(enum tu_vrs_pass_kind kind)
    p_atomic_inc(&vrs_stat_pass[kind]);
 }
 
+/* SPIR-V header scan for vkd3d-proton's module name, an OpString holding
+ * exactly "<16 hex>.dxil" (or ".dxbc"). Stops at the first OpFunction.
+ */
+uint64_t
+tu_spirv_dxil_hash(const uint32_t *words, size_t size)
+{
+   size_t n = size / sizeof(uint32_t);
+   if (!words || n < 5 || words[0] != 0x07230203)
+      return 0;
+   for (size_t i = 5; i < n;) {
+      uint32_t op = words[i] & 0xffff, len = words[i] >> 16;
+      if (!len || len > n - i || op == 54 /* OpFunction */)
+         break;
+      if (op == 7 /* OpString */ && len > 2) {
+         const char *str = (const char *) (words + i + 2);
+         size_t sl = strnlen(str, (len - 2) * sizeof(uint32_t));
+         if (sl == 21 && (!strcmp(str + 16, ".dxil") || !strcmp(str + 16, ".dxbc"))) {
+            uint64_t v = 0;
+            unsigned k;
+            for (k = 0; k < 16; k++) {
+               char c = str[k];
+               unsigned d;
+               if (c >= '0' && c <= '9')
+                  d = c - '0';
+               else if (c >= 'a' && c <= 'f')
+                  d = c - 'a' + 10;
+               else if (c >= 'A' && c <= 'F')
+                  d = c - 'A' + 10;
+               else
+                  break;
+               v = (v << 4) | d;
+            }
+            if (k == 16)
+               return v;
+         }
+      }
+      i += len;
+   }
+   return 0;
+}
+
+uint64_t
+tu_stage_dxil_hash(const VkPipelineShaderStageCreateInfo *stage)
+{
+   if (!stage)
+      return 0;
+   VK_FROM_HANDLE(vk_shader_module, module, stage->module);
+   if (module)
+      return tu_spirv_dxil_hash((const uint32_t *) module->data, module->size);
+   const VkShaderModuleCreateInfo *mci =
+      vk_find_struct_const(stage->pNext, SHADER_MODULE_CREATE_INFO);
+   if (mci)
+      return tu_spirv_dxil_hash(mci->pCode, mci->codeSize);
+   return 0;
+}
+
+void
+tu_vrs_note_depthless_pass(void)
+{
+   p_atomic_inc(&vrs_stat_ps[VRS_PS_DEPTHLESS_PASS]);
+}
+
+/* tu_shader::vrs_ps_class encoding (0 = not classified yet). */
+#define VRS_PS_CLS_UNLISTED 1u
+#define VRS_PS_CLS_ALLOW    2u
+#define VRS_PS_CLS_DENY     3u
+#define VRS_PS_CLS_MASK     3u
+#define VRS_PS_CLS_CAP_SHIFT 2  /* allow: coarsest level 0..2 */
+#define VRS_PS_CLS_UNHASHED (1u << 4)
+
+static uint8_t
+tu_vrs_ps_classify(struct tu_shader *fs)
+{
+   uint8_t c = fs->vrs_ps_class;
+   if (c)
+      return c;
+   uint64_t h = fs->fs.dxil_hash;
+   uint8_t cap = 2;
+   if (tu_vrs_ps_denied(h))
+      c = VRS_PS_CLS_DENY;
+   else if (h && tu_vrs_ps_match(&vrs_cfg.ps_allow, h, &cap))
+      c = VRS_PS_CLS_ALLOW | (cap << VRS_PS_CLS_CAP_SHIFT);
+   else
+      c = VRS_PS_CLS_UNLISTED;
+   if (!h)
+      c |= VRS_PS_CLS_UNHASHED;
+   fs->vrs_ps_class = c;
+   if (vrs_cfg.ps_log &&
+       ((c & VRS_PS_CLS_MASK) != VRS_PS_CLS_UNLISTED || vrs_cfg.ps_log >= 2)) {
+      static const char *const names[4] = { "?", "unlisted", "allow", "deny" };
+      unsigned r = 1u << ((c >> VRS_PS_CLS_CAP_SHIFT) & 3);
+      mesa_logi("tu-vrs-ps: fs hash=%016" PRIx64 " class=%s%s cap=%ux%u bin=%.12s",
+                h, names[c & VRS_PS_CLS_MASK],
+                (c & VRS_PS_CLS_UNHASHED) ? "(unhashed)" : "",
+                (c & VRS_PS_CLS_MASK) == VRS_PS_CLS_ALLOW ? r : 1u,
+                (c & VRS_PS_CLS_MASK) == VRS_PS_CLS_ALLOW ? r : 1u,
+                fs->variant ? fs->variant->blake3_str : "?");
+   }
+   return c;
+}
+
 bool
-tu_vrs_pipeline_fsr(const struct tu_shader *fs, uint32_t samples,
-                    bool feedback_loop,
+tu_vrs_pipeline_fsr(struct tu_shader *fs, uint32_t samples,
+                    bool feedback_loop, enum tu_vrs_pass_scope scope,
                     struct vk_fragment_shading_rate_state *fsr)
 {
    const struct ir3_shader_variant *v = fs ? fs->variant : NULL;
+   /* A list failed to parse: fail closed. */
+   if (vrs_cfg.ps_error) {
+      p_atomic_inc(&vrs_stat_state[2]);
+      return false;
+   }
+   uint8_t cap = 2;
+   if (fs && v) {
+      uint8_t c = tu_vrs_ps_classify(fs);
+      if ((c & VRS_PS_CLS_MASK) == VRS_PS_CLS_DENY) {
+         p_atomic_inc(&vrs_stat_ps[VRS_PS_DENY]);
+         return false;
+      }
+      /* Allow mode: depth-less passes and inherited secondaries always need
+       * an allowlisted FS; with TU_VRS_PS_MODE=strict (default) so do depth
+       * passes.
+       */
+      if (vrs_cfg.ps_allow.set &&
+          (scope != TU_VRS_SCOPE_DEPTH || vrs_cfg.ps_strict)) {
+         if ((c & VRS_PS_CLS_MASK) != VRS_PS_CLS_ALLOW) {
+            p_atomic_inc(&vrs_stat_ps[(c & VRS_PS_CLS_UNHASHED) ?
+                                      VRS_PS_UNHASHED : VRS_PS_UNLISTED]);
+            return false;
+         }
+         cap = (c >> VRS_PS_CLS_CAP_SHIFT) & 3;
+         p_atomic_inc(&vrs_stat_ps[VRS_PS_ALLOW]);
+         if (cap == 0) {
+            p_atomic_inc(&vrs_stat_ps[VRS_PS_CAPPED]);
+            return false;
+         }
+      }
+   } else if (vrs_cfg.ps_allow.set) {
+      p_atomic_inc(&vrs_stat_ps[VRS_PS_UNHASHED]);
+      return false;
+   }
    /* Side effects, depth/stencil/sample-mask export, sample-rate shading,
     * framebuffer/input-attachment reads and feedback loops: never coarse.
     */
@@ -1345,12 +1768,17 @@ tu_vrs_pipeline_fsr(const struct tu_shader *fs, uint32_t samples,
       p_atomic_inc(&vrs_stat_state[3]);
       return false;
    }
-   if (v->has_kill) {
-      /* Alpha-tested/masked: cap at 2x2 (MIN with a >=2x2 pipeline rate). */
+   if (v->has_kill || cap == 1) {
+      /* Alpha-tested/masked, or an allowlist entry capped at 2x2: cap at 2x2
+       * (MIN with a >=2x2 pipeline rate).
+       */
       fsr->fragment_size.width = MAX2(fsr->fragment_size.width, 2);
       fsr->fragment_size.height = MAX2(fsr->fragment_size.height, 2);
       fsr->combiner_ops[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MIN_KHR;
-      p_atomic_inc(&vrs_stat_state[1]);
+      if (v->has_kill)
+         p_atomic_inc(&vrs_stat_state[1]);
+      else
+         p_atomic_inc(&vrs_stat_ps[VRS_PS_CAPPED]);
    } else {
       /* App/material coarse rates still win. */
       fsr->combiner_ops[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR;

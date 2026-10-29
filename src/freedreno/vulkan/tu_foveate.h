@@ -191,11 +191,32 @@ void tu_vrs_note_pass(enum tu_vrs_pass_kind kind);
 struct tu_shader;
 struct vk_fragment_shading_rate_state;
 
+/* vkd3d-proton names each module with an OpString "<16 hex>.dxil" (the
+ * FNV-1-64 DXIL hash it also uses for VKD3D_SHADER_OVERRIDE). Returns that
+ * hash, or 0 when the SPIR-V is unavailable (module identifier) or unnamed.
+ */
+uint64_t tu_spirv_dxil_hash(const uint32_t *words, size_t size);
+uint64_t tu_stage_dxil_hash(const VkPipelineShaderStageCreateInfo *stage);
+
+/* TU_VRS_PS_ALLOW set (and parsed): fragment-shader allowlist mode. Passes
+ * without a depth attachment can then get the gaze map (render area on
+ * TU_VRS_DIMS or TU_VRS_PS_DIMS); only allowlisted draws shade coarse there.
+ */
+bool tu_vrs_ps_allow_mode(void);
+bool tu_vrs_ps_dims_ok(uint32_t w, uint32_t h);
+void tu_vrs_note_depthless_pass(void);
+
+enum tu_vrs_pass_scope {
+   TU_VRS_SCOPE_DEPTH,     /* eligible pass with depth (pre-existing rule) */
+   TU_VRS_SCOPE_DEPTHLESS, /* eligible only through the PS allowlist */
+   TU_VRS_SCOPE_INHERITED, /* secondary continuing a pass begun elsewhere */
+};
+
 /* Per-pipeline (bound FS + feedback-loop state) decision. Returns true and
  * rewrites *fsr when attachment FSR should be enabled for the draw.
  */
-bool tu_vrs_pipeline_fsr(const struct tu_shader *fs, uint32_t samples,
-                         bool feedback_loop,
+bool tu_vrs_pipeline_fsr(struct tu_shader *fs, uint32_t samples,
+                         bool feedback_loop, enum tu_vrs_pass_scope scope,
                          struct vk_fragment_shading_rate_state *fsr);
 
 #endif

@@ -4346,6 +4346,9 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
                 cmd->vk.dynamic_graphics_state.ms.rasterization_samples,
                 cmd->state.pipeline_feedback_loops ||
                    cmd->vk.dynamic_graphics_state.feedback_loops,
+                cmd->state.vrs.inherited ? TU_VRS_SCOPE_INHERITED :
+                cmd->state.vrs.pass_depthless ? TU_VRS_SCOPE_DEPTHLESS :
+                                                TU_VRS_SCOPE_DEPTH,
                 &vrs_fsr))
             att = true;
          DRAW_STATE_COND(fragment_shading_rate,

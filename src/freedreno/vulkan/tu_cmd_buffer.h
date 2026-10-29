@@ -688,6 +688,10 @@ struct tu_cmd_state
    struct {
       /* The current pass, begun in this command buffer, gets the gaze map. */
       bool pass_eligible;
+      /* ...and it has no depth attachment: eligible only through
+       * TU_VRS_PS_ALLOW, so only allowlisted draws shade coarse.
+       */
+      bool pass_depthless;
       /* Secondary continuing a pass begun elsewhere: dimensions unknown, the
        * primary's quality buffer decides (gaze map or flat).
        */

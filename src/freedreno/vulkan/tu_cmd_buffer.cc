@@ -7467,8 +7467,11 @@ tu7_emit_vrs_quality_buffer(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
                }
             }
          }
-         if (iova)
+         if (iova) {
             kind = TU_VRS_PASS_GAZE;
+            if (cmd->state.vrs.pass_depthless)
+               tu_vrs_note_depthless_pass();
+         }
       }
    }
 
@@ -7742,8 +7745,10 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
    tu_set_render_area(cmd, &pRenderPassBegin->renderArea,
                       pRenderPassBegin->pNext);
    cmd->state.fdm_per_layer = pass->has_layered_fdm;
-   if (unlikely(tu_vrs_enabled()))
+   if (unlikely(tu_vrs_enabled())) {
       cmd->state.vrs.pass_eligible = false;
+      cmd->state.vrs.pass_depthless = false;
+   }
 
    if (pass->attachment_count > 0) {
       VK_MULTIALLOC(ma);
@@ -7864,11 +7869,15 @@ tu_emit_rendering_attachment_locations(struct tu_cmd_buffer *cmd)
  * TU_VRS_DIMS allowlist, at least one colour attachment and a depth
  * attachment all of one size, single view/layer, no FDM, no MSRTSS, single
  * subpass. Input attachments and feedback loops are vetoed per draw.
+ * With TU_VRS_PS_ALLOW, a pass without depth also qualifies (render area on
+ * TU_VRS_DIMS or TU_VRS_PS_DIMS, colour attachments of one size covering
+ * it); *depthless is then set and only allowlisted draws shade coarse.
  */
 static bool
 tu_vrs_rendering_eligible(struct tu_cmd_buffer *cmd,
-                          const VkRenderingInfo *info)
+                          const VkRenderingInfo *info, bool *depthless)
 {
+   *depthless = false;
    const struct tu_subpass *subpass = &cmd->dynamic_subpasses[0];
    if (subpass->fsr_attachment != VK_ATTACHMENT_UNUSED)
       return false;
@@ -7882,10 +7891,35 @@ tu_vrs_rendering_eligible(struct tu_cmd_buffer *cmd,
       return false;
    uint32_t w = info->renderArea.offset.x + info->renderArea.extent.width;
    uint32_t h = info->renderArea.offset.y + info->renderArea.extent.height;
-   if (!tu_vrs_dims_ok(w, h))
-      return false;
    const VkRenderingAttachmentInfo *d = info->pDepthAttachment;
-   if (!d || d->imageView == VK_NULL_HANDLE)
+   if (!d || d->imageView == VK_NULL_HANDLE) {
+      if (!tu_vrs_ps_allow_mode() || !tu_vrs_ps_dims_ok(w, h))
+         return false;
+      const VkRenderingAttachmentInfo *s = info->pStencilAttachment;
+      if (s && s->imageView != VK_NULL_HANDLE)
+         return false;
+      bool color = false;
+      uint32_t cw = 0, ch = 0;
+      for (uint32_t i = 0; i < info->colorAttachmentCount; i++) {
+         VkImageView handle = info->pColorAttachments[i].imageView;
+         if (handle == VK_NULL_HANDLE)
+            continue;
+         VK_FROM_HANDLE(tu_image_view, cview, handle);
+         if (!color) {
+            cw = cview->vk.extent.width;
+            ch = cview->vk.extent.height;
+         } else if (cview->vk.extent.width != cw ||
+                    cview->vk.extent.height != ch) {
+            return false;
+         }
+         color = true;
+      }
+      if (!color || cw < w || ch < h)
+         return false;
+      *depthless = true;
+      return true;
+   }
+   if (!tu_vrs_dims_ok(w, h))
       return false;
    VK_FROM_HANDLE(tu_image_view, dview, d->imageView);
    uint32_t dw = dview->vk.extent.width, dh = dview->vk.extent.height;
@@ -8057,7 +8091,8 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
    if (unlikely(tu_vrs_enabled()) &&
        !(pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT))
       cmd->state.vrs.pass_eligible =
-         tu_vrs_rendering_eligible(cmd, pRenderingInfo);
+         tu_vrs_rendering_eligible(cmd, pRenderingInfo,
+                                   &cmd->state.vrs.pass_depthless);
 
    tu_choose_gmem_layout(cmd);
 

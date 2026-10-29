@@ -4254,6 +4254,8 @@ tu_shader_create(struct tu_device *dev,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    shader->per_layer_viewport = info->per_layer_viewport;
+   if (nir->info.stage == MESA_SHADER_FRAGMENT)
+      shader->fs.dxil_hash = info->dxil_hash;
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
        key->fdm_per_layer) {
@@ -4583,6 +4585,11 @@ tu_compile_shaders(struct tu_device *device,
          result = VK_ERROR_OUT_OF_HOST_MEMORY;
          goto fail;
       }
+      /* Always recorded (not only under TU_VRS) so a cached FS carries its
+       * hash whatever the environment was when it was compiled.
+       */
+      if (stage == MESA_SHADER_FRAGMENT)
+         info[stage].dxil_hash = tu_stage_dxil_hash(stage_info);
 
       stage_feedbacks[stage].flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT;
       stage_feedbacks[stage].duration += os_time_get_nano() - stage_start;

@@ -86,6 +86,12 @@ struct tu_shader
     */
    bool ubo_witness_speculated;
 
+   /* TU_VRS_PS_ALLOW/DENY: lazily computed class of this FS's DXIL hash
+    * (0 = not yet classified). Deterministic per shader, so a benign race
+    * writes the same value. Not serialized.
+    */
+   uint8_t vrs_ps_class;
+
    /* The dynamic buffer descriptor size for descriptor sets that we know
     * about. This is used when linking to piece together the sizes and from
     * there calculate the offsets. It's -1 if we don't know because the
@@ -129,6 +135,11 @@ struct tu_shader
           * dynamic rendering.
           */
          bool read_only_input_attachments;
+
+         /* vkd3d-proton DXIL hash from the module's "<16 hex>.dxil" OpString
+          * (0 = none). Serialized with the rest of fs; used only by TU_VRS.
+          */
+         uint64_t dxil_hash;
       } fs;
    };
 };
@@ -167,6 +178,7 @@ struct tu_shader_key {
  */
 struct tu_shader_info {
    bool per_layer_viewport;
+   uint64_t dxil_hash; /* FS only, see tu_shader::fs.dxil_hash */
 };
 
 extern const struct vk_pipeline_cache_object_ops tu_shader_ops;
