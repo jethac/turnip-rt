@@ -19,6 +19,8 @@ struct tu_trace_pc_set {
    uint8_t phys[TU_TRACE_PC_MAX_PHYS];
    const struct fd_perfcntr_group *group[TU_TRACE_PC_MAX_PHYS];
    const struct fd_perfcntr_countable *countable[TU_TRACE_PC_MAX_PHYS];
+   bool optional[TU_TRACE_PC_MAX_PHYS];
+   int32_t w_cycles, w_ao, w_preempt;
    struct tu_cs_entry select_cs;
    bool built;
 };
@@ -35,6 +37,9 @@ struct tu_trace_pc {
    bool rotate_submits;
    uint64_t traced_submits;
    bool raw;
+   bool sel_check;
+   uint32_t witness;
+   uint64_t fmin_hz, fmax_hz;
    struct tu_cs cs;
 
    /* JSON printer state, touched only from the u_trace queue thread. */
@@ -42,6 +47,10 @@ struct tu_trace_pc {
    char stack_op[TU_TRACE_PC_MAX_DEPTH][40];
    bool stack_valid[TU_TRACE_PC_MAX_DEPTH];
    uint64_t stack_val[TU_TRACE_PC_MAX_DEPTH][TU_TRACE_PC_MAX_PHYS];
+   uint32_t stack_sel[TU_TRACE_PC_MAX_DEPTH][TU_TRACE_PC_MAX_PHYS];
+   uint64_t stack_ts[TU_TRACE_PC_MAX_DEPTH];
+   uint64_t tally[3];
+   uint64_t tally_reason[8];
 };
 
 /* Bytes of one u_trace timestamp slot: 8 when the knob is off. */

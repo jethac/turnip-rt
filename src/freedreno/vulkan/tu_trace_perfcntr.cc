@@ -4,6 +4,7 @@
  */
 
 #include "tu_trace_perfcntr.h"
+#include "tu_trace_perfcntr_pair.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -60,11 +61,29 @@ static const struct tu_trace_pc_preset presets[] = {
      "SP:SP_PIXELS,SP:SP_ANY_EU_WORKING_VS_STAGE" },
 };
 
+enum {
+   TU_PC_W_CYCLES = 1u << 0,
+   TU_PC_W_AO = 1u << 1,
+   TU_PC_W_PREEMPT = 1u << 2,
+   TU_PC_W_SEL = 1u << 3,
+};
+
+static uint32_t
+sel_offset(const struct tu_trace_pc *pc)
+{
+   return sizeof(uint64_t) * (1 + pc->phys_count);
+}
+
 uint32_t
 tu_trace_pc_slot_bytes(const struct tu_device *device)
 {
-   return sizeof(uint64_t) +
-          (device->trace_pc ? device->trace_pc->phys_count * sizeof(uint64_t) : 0);
+   const struct tu_trace_pc *pc = device->trace_pc;
+   if (!pc)
+      return sizeof(uint64_t);
+   uint32_t bytes = sel_offset(pc);
+   if (pc->sel_check)
+      bytes += align(pc->phys_count * sizeof(uint32_t), sizeof(uint64_t));
+   return bytes;
 }
 
 static const struct fd_perfcntr_countable *
@@ -143,7 +162,74 @@ parse_set(struct tu_device *device, struct tu_trace_pc_set *set,
       }
    }
    free(dup);
+   set->w_cycles = set->w_ao = set->w_preempt = -1;
    return ok && set->count;
+}
+
+static int32_t
+find_in_set(const struct tu_trace_pc_set *set, const struct fd_perfcntr_group *group,
+            const struct fd_perfcntr_countable *countable)
+{
+   for (uint32_t i = 0; i < set->count; i++) {
+      if (set->group[i] == group && set->countable[i] == countable)
+         return i;
+   }
+   return -1;
+}
+
+static int32_t
+add_witness(struct tu_device *device, struct tu_trace_pc_set *set,
+            const char *group_name, const char *countable_name)
+{
+   const struct fd_perfcntr_group *group =
+      fd_perfcntrs_group(&device->physical_device->dev_id, group_name);
+   const struct fd_perfcntr_countable *countable =
+      group ? find_countable(group, countable_name) : NULL;
+   if (!countable)
+      return -1;
+   int32_t i = find_in_set(set, group, countable);
+   if (i >= 0 || set->count == TU_TRACE_PC_MAX_PHYS)
+      return i;
+   set->group[set->count] = group;
+   set->countable[set->count] = countable;
+   set->optional[set->count] = true;
+   return set->count++;
+}
+
+static void
+drop_from_set(struct tu_trace_pc_set *set, uint32_t i)
+{
+   for (uint32_t j = i; j + 1 < set->count; j++) {
+      set->group[j] = set->group[j + 1];
+      set->countable[j] = set->countable[j + 1];
+      set->optional[j] = set->optional[j + 1];
+      set->phys[j] = set->phys[j + 1];
+   }
+   set->count--;
+   int32_t *w[] = { &set->w_cycles, &set->w_ao, &set->w_preempt };
+   for (unsigned k = 0; k < ARRAY_SIZE(w); k++) {
+      if (*w[k] == (int32_t) i)
+         *w[k] = -1;
+      else if (*w[k] > (int32_t) i)
+         (*w[k])--;
+   }
+}
+
+static uint32_t
+parse_witness(const char *text)
+{
+   if (!text || !*text)
+      return TU_PC_W_CYCLES | TU_PC_W_AO | TU_PC_W_PREEMPT | TU_PC_W_SEL;
+   uint32_t w = 0;
+   if (strstr(text, "ac"))
+      w |= TU_PC_W_CYCLES;
+   if (strstr(text, "ao"))
+      w |= TU_PC_W_AO;
+   if (strstr(text, "preempt"))
+      w |= TU_PC_W_PREEMPT;
+   if (strstr(text, "sel"))
+      w |= TU_PC_W_SEL;
+   return w;
 }
 
 static void
@@ -217,6 +303,10 @@ tu_trace_pc_init(struct tu_device *device)
       pc->rotate_frames = (uint32_t) CLAMP(v, 1, 1000000);
    }
    pc->raw = debug_get_bool_option("TU_TRACE_PERFCNTRS_RAW", false);
+   pc->witness = parse_witness(os_get_option("TU_TRACE_PERFCNTRS_WITNESS"));
+   pc->sel_check = pc->witness & TU_PC_W_SEL;
+   pc->fmin_hz = 1000000ull * debug_get_num_option("TU_TRACE_PERFCNTRS_FMIN_MHZ", 200);
+   pc->fmax_hz = 1000000ull * debug_get_num_option("TU_TRACE_PERFCNTRS_FMAX_MHZ", 1200);
 
    char *dup = strdup(knob);
    bool ok = dup != NULL;
@@ -228,7 +318,14 @@ tu_trace_pc_init(struct tu_device *device)
          ok = false;
          break;
       }
-      ok = parse_set(device, &pc->sets[pc->set_count], text, pc->set_count);
+      struct tu_trace_pc_set *set = &pc->sets[pc->set_count];
+      ok = parse_set(device, set, text, pc->set_count);
+      if (ok && (pc->witness & TU_PC_W_CYCLES))
+         set->w_cycles = add_witness(device, set, "RBBM", "RBBM_ALWAYS_COUNT");
+      if (ok && (pc->witness & TU_PC_W_AO))
+         set->w_ao = add_witness(device, set, "RBBM", "RBBM_ALWAYS_ON");
+      if (ok && (pc->witness & TU_PC_W_PREEMPT))
+         set->w_preempt = add_witness(device, set, "CP", "CP_NUM_PREEMPTIONS");
       pc->set_count++;
    }
    free(dup);
@@ -257,6 +354,13 @@ tu_trace_pc_init(struct tu_device *device)
             }
             const struct fd_perfcntr_counter *counter =
                fd_perfcntr_reserve(device->perfcntrs, set->group[i], NULL);
+            if (!counter && set->optional[i]) {
+               mesa_logw("TU_TRACE_PERFCNTRS: no free %s counter for witness %s; "
+                         "dropped from set %s", set->group[i]->name,
+                         set->countable[i]->name, set->name);
+               set->phys[i] = 0xff;
+               continue;
+            }
             if (!counter) {
                mesa_loge("TU_TRACE_PERFCNTRS: no free %s counter (set %s needs %u)",
                          set->group[i]->name, set->name, rank + 1);
@@ -268,6 +372,10 @@ tu_trace_pc_init(struct tu_device *device)
             pc->phys_count++;
          }
          set->phys[i] = p;
+      }
+      for (uint32_t i = set->count; ok && i-- > 0;) {
+         if (set->phys[i] == 0xff)
+            drop_from_set(set, i);
       }
    }
 
@@ -286,10 +394,12 @@ tu_trace_pc_init(struct tu_device *device)
    device->trace_pc = pc;
 
    mesa_logi("TU_TRACE_PERFCNTRS config sets=%u phys=%u slot_bytes=%u rotate=%u%s "
-             "raw=%u kernel_reservation=%u",
+             "raw=%u kernel_reservation=%u witness=0x%x sel_check=%u "
+             "fmin_mhz=%" PRIu64 " fmax_mhz=%" PRIu64,
              pc->set_count, pc->phys_count, tu_trace_pc_slot_bytes(device),
              pc->rotate_frames, pc->rotate_submits ? "_submits" : "_frames", pc->raw,
-             fd_perfcntr_has_reservation(device->perfcntrs));
+             fd_perfcntr_has_reservation(device->perfcntrs), pc->witness,
+             pc->sel_check, pc->fmin_hz / 1000000, pc->fmax_hz / 1000000);
    for (uint32_t p = 0; p < pc->phys_count; p++) {
       const struct fd_perfcntr_group *g = pc->phys_group[p];
       mesa_logi("TU_TRACE_PERFCNTRS phys=%u group=%s counter=%u select=0x%x lo=0x%x",
@@ -302,6 +412,8 @@ tu_trace_pc_init(struct tu_device *device)
          mesa_logi("TU_TRACE_PERFCNTRS set=%u name=%s phys=%u %s:%s selector=%u",
                    s, set->name, set->phys[i], set->group[i]->name,
                    set->countable[i]->name, set->countable[i]->selector);
+      mesa_logi("TU_TRACE_PERFCNTRS set=%u witness cycles=%d always_on=%d preempt=%d",
+                s, set->w_cycles, set->w_ao, set->w_preempt);
    }
 
    return VK_SUCCESS;
@@ -320,6 +432,15 @@ tu_trace_pc_finish(struct tu_device *device)
    struct tu_trace_pc *pc = device->trace_pc;
    if (!pc)
       return;
+   if (pc->tally[0] + pc->tally[1] + pc->tally[2]) {
+      mesa_logi("TU_TRACE_PERFCNTRS pairs ok=%" PRIu64 " ok_unproven=%" PRIu64
+                " clobbered=%" PRIu64 " (reset=%" PRIu64 " ts=%" PRIu64
+                " clock_low=%" PRIu64 " clock_high=%" PRIu64 " select=%" PRIu64
+                " preempted=%" PRIu64 ")",
+                pc->tally[0], pc->tally[1], pc->tally[2], pc->tally_reason[0],
+                pc->tally_reason[1], pc->tally_reason[2], pc->tally_reason[3],
+                pc->tally_reason[4], pc->tally_reason[5]);
+   }
    release_phys(device, pc);
    tu_cs_finish(&pc->cs);
    vk_free(&device->vk.alloc, pc);
@@ -355,6 +476,14 @@ tu_trace_pc_emit_snapshot(struct tu_device *device, struct tu_cs *cs,
                      CP_REG_TO_MEM_0_IS_64B);
       tu_cs_emit_qw(cs, slot_iova + sizeof(uint64_t) * (1 + p));
    }
+   if (pc->sel_check) {
+      for (uint32_t p = 0; p < pc->phys_count; p++) {
+         tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
+         tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(pc->phys_counter[p]->select_reg) |
+                        CP_REG_TO_MEM_0_CNT(1));
+         tu_cs_emit_qw(cs, slot_iova + sel_offset(pc) + sizeof(uint32_t) * p);
+      }
+   }
 }
 
 static const char *
@@ -364,13 +493,103 @@ short_name(const struct fd_perfcntr_countable *c)
 }
 
 static void
-print_values(FILE *out, const struct tu_trace_pc_set *set, const uint64_t *a,
-             const uint64_t *b)
+print_values(FILE *out, const struct tu_trace_pc_set *set, const uint64_t *v)
 {
    for (uint32_t i = 0; i < set->count; i++) {
-      uint64_t v = b ? b[set->phys[i]] - a[set->phys[i]] : a[set->phys[i]];
-      fprintf(out, "%s\"%s:%s\": %" PRId64, i ? ", " : "", set->group[i]->name,
-              short_name(set->countable[i]), (int64_t) v);
+      fprintf(out, "%s\"%s:%s\": %" PRIu64, i ? ", " : "", set->group[i]->name,
+              short_name(set->countable[i]), v[i]);
+   }
+}
+
+static void
+print_end(FILE *out, struct tu_trace_pc *pc, const struct tu_trace_pc_set *set,
+          uint32_t d, const uint64_t *slot, bool valid)
+{
+   const uint64_t *vals = slot + 1;
+   const uint32_t *sels = (const uint32_t *) (vals + pc->phys_count);
+   uint64_t b[TU_TRACE_PC_MAX_PHYS], e[TU_TRACE_PC_MAX_PHYS], delta[TU_TRACE_PC_MAX_PHYS];
+   uint32_t se[TU_TRACE_PC_MAX_PHYS], sb[TU_TRACE_PC_MAX_PHYS], sn[TU_TRACE_PC_MAX_PHYS];
+   for (uint32_t i = 0; i < set->count; i++) {
+      b[i] = pc->stack_val[d][set->phys[i]];
+      e[i] = vals[set->phys[i]];
+      se[i] = set->countable[i]->selector;
+      sb[i] = pc->stack_sel[d][set->phys[i]];
+      sn[i] = pc->sel_check ? sels[set->phys[i]] : 0;
+   }
+   const struct tu_pc_pair_params params = {
+      .width = 64,
+      .tick_hz = 19200000,
+      .fmin_hz = pc->fmin_hz,
+      .fmax_hz = pc->fmax_hz,
+      .slack_ticks = 40, /* ~2 us */
+   };
+   const struct tu_pc_pair_in in = {
+      .n = set->count,
+      .begin = b,
+      .end = e,
+      .ts_begin = pc->stack_ts[d],
+      .ts_end = slot[0],
+      .ts_valid = valid,
+      .cycles_idx = set->w_cycles,
+      .preempt_idx = set->w_preempt,
+      .sel_expect = pc->sel_check ? se : NULL,
+      .sel_begin = pc->sel_check ? sb : NULL,
+      .sel_end = pc->sel_check ? sn : NULL,
+   };
+   struct tu_pc_pair_out r;
+   enum tu_pc_pair_class cls = tu_pc_classify_pair(&params, &in, delta, &r);
+   pc->tally[cls]++;
+   for (unsigned k = 0; k < TU_PC_REASON_COUNT; k++)
+      pc->tally_reason[k] += !!(r.reasons & (1u << k));
+
+   fprintf(out, ", \"pair\": \"%s\"", tu_pc_pair_class_name(cls));
+   if (r.reasons) {
+      fprintf(out, ", \"reasons\": [");
+      for (unsigned k = 0, n = 0; k < TU_PC_REASON_COUNT; k++) {
+         if (r.reasons & (1u << k))
+            fprintf(out, "%s\"%s\"", n++ ? ", " : "", tu_pc_reason_name(k));
+      }
+      fprintf(out, "]");
+   }
+   if (r.reasons & TU_PC_REASON_SELECT) {
+      fprintf(out, ", \"sel_bad\": {");
+      for (uint32_t i = 0, n = 0; i < set->count; i++) {
+         if (sb[i] != se[i] || sn[i] != se[i])
+            fprintf(out, "%s\"%s:%s\": [%u, %u, %u]", n++ ? ", " : "",
+                    set->group[i]->name, short_name(set->countable[i]), se[i], sb[i], sn[i]);
+      }
+      fprintf(out, "}");
+   }
+   fprintf(out, ", \"witness\": {\"dt_ticks\": %" PRIu64 ", \"zap_excluded\": %s",
+           r.dt_ticks, r.zap_excluded ? "true" : "false");
+   if (set->w_cycles >= 0) {
+      fprintf(out, ", \"cycles_begin\": %" PRIu64, b[set->w_cycles]);
+      if (r.dt_ticks && !(r.reasons & TU_PC_REASON_RESET))
+         fprintf(out, ", \"mhz\": %.3f",
+                 (double) r.cycles * 19.2 / (double) r.dt_ticks);
+   }
+   if (set->w_ao >= 0 && !(r.reasons & TU_PC_REASON_RESET))
+      fprintf(out, ", \"always_on\": %" PRIu64, delta[set->w_ao]);
+   fprintf(out, "}");
+   if (r.wrapped_mask) {
+      fprintf(out, ", \"wrapped\": [");
+      for (uint32_t i = 0, n = 0; i < set->count && i < 64; i++) {
+         if (r.wrapped_mask & (1ull << i))
+            fprintf(out, "%s\"%s:%s\"", n++ ? ", " : "", set->group[i]->name,
+                    short_name(set->countable[i]));
+      }
+      fprintf(out, "]");
+   }
+   if (cls != TU_PC_PAIR_CLOBBERED) {
+      fprintf(out, ", \"delta\": {");
+      print_values(out, set, delta);
+      fprintf(out, "}");
+   } else if (pc->raw) {
+      fprintf(out, ", \"raw_begin\": {");
+      print_values(out, set, b);
+      fprintf(out, "}, \"raw_end\": {");
+      print_values(out, set, e);
+      fprintf(out, "}");
    }
 }
 
@@ -403,15 +622,22 @@ json_event_extra(struct u_trace_context *utctx, FILE *out, const char *tp_name,
       if (pc->depth < TU_TRACE_PC_MAX_DEPTH) {
          snprintf(pc->stack_op[pc->depth], sizeof(pc->stack_op[0]), "%s", op);
          pc->stack_valid[pc->depth] = valid;
+         pc->stack_ts[pc->depth] = slot[0];
          memcpy(pc->stack_val[pc->depth], vals, pc->phys_count * sizeof(uint64_t));
+         if (pc->sel_check)
+            memcpy(pc->stack_sel[pc->depth], vals + pc->phys_count,
+                   pc->phys_count * sizeof(uint32_t));
       }
       pc->depth++;
    }
 
    fprintf(out, ",\n\"perfcntrs\": {\"set\": \"%s\"", set->name);
    if (pc->raw) {
+      uint64_t v[TU_TRACE_PC_MAX_PHYS];
+      for (uint32_t i = 0; i < set->count; i++)
+         v[i] = vals[set->phys[i]];
       fprintf(out, ", \"raw_valid\": %s, \"raw\": {", valid ? "true" : "false");
-      print_values(out, set, vals, NULL);
+      print_values(out, set, v);
       fprintf(out, "}");
    }
    if (end) {
@@ -427,9 +653,7 @@ json_event_extra(struct u_trace_context *utctx, FILE *out, const char *tp_name,
          } else if (!valid || !pc->stack_valid[pc->depth]) {
             fprintf(out, ", \"pair\": \"unwritten\"");
          } else {
-            fprintf(out, ", \"pair\": \"ok\", \"delta\": {");
-            print_values(out, set, pc->stack_val[pc->depth], vals);
-            fprintf(out, "}");
+            print_end(out, pc, set, pc->depth, slot, valid);
          }
       }
    }

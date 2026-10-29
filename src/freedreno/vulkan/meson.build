@@ -250,6 +250,18 @@ if with_symbols_check
   )
 endif
 
+if with_tests
+  test(
+    'tu_trace_perfcntr_pair',
+    executable(
+      'tu_trace_perfcntr_pair_test',
+      'tests/tu_trace_perfcntr_pair_test.c',
+      build_by_default : false,
+    ),
+    suite : ['freedreno'],
+  )
+endif
+
 icd_file_name = libname_prefix + 'vulkan_freedreno.' + libname_suffix
 
 freedreno_icd = custom_target(
