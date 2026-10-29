@@ -663,6 +663,16 @@ struct ir3_shader_options {
 
    bool no_early_preamble;
 
+   /* TU_LOOP_UBO_HOIST: move loop-invariant, non-speculative ldc to the loop
+    * preheader (ir3_nir_hoist_loop_ubo); 0 = off, else the per-loop budget
+    * of hoisted dwords.
+    */
+   uint8_t loop_ubo_hoist;
+   /* TU_F16_QUANT_FOLD: f2f16(fquantize2f16(a)) -> f2f16_rtne(a)
+    * (ir3_nir_fold_quant_f16).
+    */
+   bool quant_f16_fold;
+
    uint8_t target_full_regs;
 
    bool rt_part;
@@ -787,6 +797,12 @@ struct ir3_shader_variant {
 
    /* Whether early preamble is enabled. */
    bool early_preamble;
+
+   /* Logging only: loads moved by ir3_nir_hoist_loop_ubo and conversions
+    * folded by ir3_nir_fold_quant_f16 (0 unless the option is set).
+    */
+   uint16_t loop_ubo_hoisted;
+   uint16_t quant_f16_folded;
 
    bool rt_blob_live_fail;
 

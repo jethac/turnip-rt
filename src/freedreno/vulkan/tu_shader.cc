@@ -1568,6 +1568,33 @@ can_speculate_resource(nir_def *def,
    return *can_speculate_descriptor && !bind_layout->partially_bound;
 }
 
+/* TU_LOOP_UBO_HOIST: unset/0 = off; 1 = default budget of 8 hoisted dwords
+ * per loop; N (2..255) = budget of N dwords.
+ */
+unsigned
+tu_loop_ubo_hoist_budget(void)
+{
+   static const unsigned budget = [] {
+      uint64_t v = debug_get_num_option("TU_LOOP_UBO_HOIST", 0);
+      return v == 0 ? 0u : v == 1 ? 8u : (unsigned) MIN2(v, 255);
+   }();
+   return budget;
+}
+
+bool
+tu_quant_f16_fold_enabled(void)
+{
+   static const bool enabled = debug_get_bool_option("TU_F16_QUANT_FOLD", false);
+   return enabled;
+}
+
+bool
+tu_ubo_witness_fs_enabled(void)
+{
+   static const bool enabled = debug_get_bool_option("TU_UBO_WITNESS_FS", false);
+   return enabled;
+}
+
 static bool
 tu_ubo_witness_speculate_enabled(void)
 {
@@ -1675,7 +1702,49 @@ has_ubo_witness(const struct lower_instr_params *params,
    return false;
 }
 
-/* TU_UBO_WITNESS_SPECULATE (opt-in, compute only, never ray tracing).
+#define TU_UBO_WITNESS_MAX_KILLS 256
+
+static bool
+is_fs_kill_intrinsic(const nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+   case nir_intrinsic_terminate:
+   case nir_intrinsic_terminate_if:
+   case nir_intrinsic_demote:
+   case nir_intrinsic_demote_if:
+   case nir_intrinsic_demote_samples:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* TU_UBO_WITNESS_FS: whether "witness" executes before every terminate or
+ * demote in the shader, i.e. it dominates each of them (same block: earlier
+ * in program order). An invocation that executes a kill has then already
+ * executed the witness as a non-helper. Demote is treated like terminate:
+ * whether a helper invocation's read is a dynamic use is not relied on.
+ */
+static bool
+witness_precedes_kills(const nir_instr *witness, nir_instr *const *kills,
+                       unsigned num_kills)
+{
+   for (unsigned i = 0; i < num_kills; i++) {
+      const nir_instr *k = kills[i];
+      if (k->block == witness->block) {
+         if (k->index <= witness->index)
+            return false;
+      } else if (!nir_block_dominates(witness->block, k->block)) {
+         return false;
+      }
+   }
+   return true;
+}
+
+/* TU_UBO_WITNESS_SPECULATE (opt-in, compute, plus fragment shaders with
+ * TU_UBO_WITNESS_FS; never ray tracing).
  *
  * A push-descriptor UBO binding in a descriptor-buffer layout is treated as
  * partially bound, so its contents only need to be valid if the access is
@@ -1689,17 +1758,46 @@ has_ubo_witness(const struct lower_instr_params *params,
  * disabled for such shaders (see no_early_preamble), because it can run with
  * zero invocations. Out-of-range offsets remain bounds-checked by the UBO
  * descriptor size, as for every other speculated descriptor access.
+ *
+ * Fragment shaders (TU_UBO_WITNESS_FS) additionally require the witness to
+ * execute before every terminate/demote (witness_precedes_kills), so an
+ * invocation cannot leave or become a helper without having accessed it.
  */
 static void
 collect_ubo_witnesses(nir_shader *shader, struct lower_instr_params *params)
 {
    params->num_ubo_witnesses = 0;
-   if (!tu_ubo_witness_speculate_enabled() ||
-       shader->info.stage != MESA_SHADER_COMPUTE || params->ray_tracing)
+   if (!tu_ubo_witness_speculate_enabled() || params->ray_tracing)
+      return;
+
+   /* Fragment shaders only with TU_UBO_WITNESS_FS (default off). A fragment
+    * wave always holds at least one non-helper invocation (every launched
+    * quad covers a sample), so with no kill ahead of the witness, any wave
+    * that runs the (non-early) preamble implies a dynamic witness access.
+    */
+   const bool fs = shader->info.stage == MESA_SHADER_FRAGMENT;
+   if (shader->info.stage != MESA_SHADER_COMPUTE &&
+       !(fs && tu_ubo_witness_fs_enabled()))
       return;
 
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    nir_metadata_require(impl, nir_metadata_block_index | nir_metadata_dominance);
+
+   nir_instr *kills[TU_UBO_WITNESS_MAX_KILLS];
+   unsigned num_kills = 0;
+   if (fs) {
+      nir_index_instrs(impl);
+      nir_foreach_block (block, impl) {
+         nir_foreach_instr (instr, block) {
+            if (!is_fs_kill_intrinsic(instr))
+               continue;
+            /* Too many kills to check: no witnesses (conservative). */
+            if (num_kills == TU_UBO_WITNESS_MAX_KILLS)
+               return;
+            kills[num_kills++] = instr;
+         }
+      }
+   }
 
    /* NIR does not compute dominance for the end block itself, so require
     * the witness block to dominate every reachable predecessor of it. With
@@ -1739,6 +1837,11 @@ collect_ubo_witnesses(nir_shader *shader, struct lower_instr_params *params)
              has_ubo_witness(params, &w) ||
              params->num_ubo_witnesses == TU_UBO_WITNESS_MAX)
             continue;
+
+         if (fs && !witness_precedes_kills(instr, kills, num_kills)) {
+            params->shader->ubo_witness_kill_rejected++;
+            continue;
+         }
          params->ubo_witnesses[params->num_ubo_witnesses++] = w;
       }
    }
@@ -1778,6 +1881,7 @@ set_speculate_intrinsic(nir_intrinsic_instr *intrin,
           has_ubo_witness(params, &w)) {
          can_speculate = true;
          params->shader->ubo_witness_speculated = true;
+         params->shader->ubo_witness_promoted++;
       }
    }
 
@@ -4329,6 +4433,8 @@ tu_shader_create(struct tu_device *dev,
       .const_allocs = const_allocs,
       .nir_options = nir_options,
       .no_early_preamble = shader->ubo_witness_speculated,
+      .loop_ubo_hoist = (uint8_t) tu_loop_ubo_hoist_budget(),
+      .quant_f16_fold = tu_quant_f16_fold_enabled(),
       .rt_part = rt && rt->part,
       .rt_scalar_pvtmem = rt && debug_get_bool_option("TU_RT_LINK_PERWAVE", false),
       .rt_blobs = rt ? rt->blobs : NULL,
@@ -4395,10 +4501,25 @@ tu_shader_create(struct tu_device *dev,
                 shader->variant->blake3_str,
                 shader->variant->cs.force_linear_dispatch ? "linear" : "tiled",
                 shader->variant->info.double_threadsize ? 128 : 64);
+   if (log_hashes && shader->variant &&
+       (shader->variant->loop_ubo_hoisted || shader->variant->quant_f16_folded))
+      mesa_logi("tu-ir3-opt: bin=%.12s stage=%s loop_ubo_hoisted=%u "
+                "quant_f16_folded=%u", shader->variant->blake3_str,
+                _mesa_shader_stage_to_abbrev(shader->variant->type),
+                shader->variant->loop_ubo_hoisted,
+                shader->variant->quant_f16_folded);
    if (log_hashes && shader->variant && shader->ubo_witness_speculated)
       mesa_logi("tu-ubo-witness: bin=%.12s witnessed push-UBO speculation, "
-                "early_preamble=%d", shader->variant->blake3_str,
-                shader->variant->early_preamble);
+                "early_preamble=%d stage=%s promoted=%u kill_rejected=%u",
+                shader->variant->blake3_str, shader->variant->early_preamble,
+                _mesa_shader_stage_to_abbrev(shader->variant->type),
+                shader->ubo_witness_promoted,
+                shader->ubo_witness_kill_rejected);
+   else if (log_hashes && shader->variant && shader->ubo_witness_kill_rejected)
+      mesa_logi("tu-ubo-witness: bin=%.12s no witness: stage=%s "
+                "kill_rejected=%u", shader->variant->blake3_str,
+                _mesa_shader_stage_to_abbrev(shader->variant->type),
+                shader->ubo_witness_kill_rejected);
 
    if (ir3_exceeds_safe_constlen(shader->variant)) {
       struct ir3_shader_key safe_constlen_key = *ir3_key;

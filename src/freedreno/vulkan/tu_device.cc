@@ -145,6 +145,15 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
    if (tu_gaze_block_enabled())
       _mesa_blake3_update(&ctx, "TU_GAZE_BLOCK", 13);
    /* Only when non-default, so the default cache UUID is unchanged. */
+   if (tu_loop_ubo_hoist_budget()) {
+      const uint32_t budget = tu_loop_ubo_hoist_budget();
+      _mesa_blake3_update(&ctx, "TU_LOOP_UBO_HOIST", 17);
+      _mesa_blake3_update(&ctx, &budget, sizeof(budget));
+   }
+   if (tu_quant_f16_fold_enabled())
+      _mesa_blake3_update(&ctx, "TU_F16_QUANT_FOLD", 17);
+   if (tu_ubo_witness_fs_enabled())
+      _mesa_blake3_update(&ctx, "TU_UBO_WITNESS_FS", 17);
    const char *sg32 = tu_sg32_uuid_string();
    if (sg32)
       _mesa_blake3_update(&ctx, sg32, strlen(sg32));

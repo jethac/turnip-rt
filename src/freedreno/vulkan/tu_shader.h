@@ -85,6 +85,12 @@ struct tu_shader
     * speculation to at least one UBO load; forces a non-early preamble.
     */
    bool ubo_witness_speculated;
+   /* Number of load_ubo granted speculation by a witness (logging only). */
+   uint16_t ubo_witness_promoted;
+   /* Witness candidates rejected because a terminate/demote may precede
+    * them (TU_UBO_WITNESS_FS; logging only).
+    */
+   uint16_t ubo_witness_kill_rejected;
 
    /* TU_VRS_PS_ALLOW/DENY: lazily computed class of this FS's DXIL hash
     * (0 = not yet classified). Deterministic per shader, so a benign race
@@ -341,5 +347,10 @@ tu_destroy_empty_shaders(struct tu_device *device);
 void
 tu_shader_destroy(struct tu_device *dev,
                   struct tu_shader *shader);
+
+/* Opt-in compiler knobs (default off; added to the cache UUID only when set). */
+unsigned tu_loop_ubo_hoist_budget(void);
+bool tu_quant_f16_fold_enabled(void);
+bool tu_ubo_witness_fs_enabled(void);
 
 #endif /* TU_SHADER_H */

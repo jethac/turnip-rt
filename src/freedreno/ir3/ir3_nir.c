@@ -1507,6 +1507,221 @@ ir3_nir_localize_consts(nir_shader *nir)
    return progress;
 }
 
+/* TU_LOOP_UBO_HOIST (ir3_shader_options::loop_ubo_hoist, default off).
+ *
+ * Non-speculative loop-invariant code motion restricted to UBO loads that are
+ * still load_ubo after UBO-range pushing and preamble lowering, i.e. loads
+ * that become ldc. A load is moved to the end of the loop's predecessor block
+ * only when
+ *  - its block dominates the block after the loop, so every invocation that
+ *    leaves the loop has executed it at least once (the same, non-speculative
+ *    criterion nir_opt_licm uses without a filter);
+ *  - the loop has a back edge, no continue construct, and no terminate,
+ *    terminate_if, return or halt anywhere inside it;
+ *  - both sources are defined before the loop, or are load_const /
+ *    bindless_resource_ir3 instructions in the loop whose own sources are,
+ *    which are then moved too.
+ * UBO contents cannot change during a draw/dispatch and load_ubo reorders
+ * freely, so the hoisted load returns the value every iteration would have
+ * read. Nested loops are processed inner first, so a load can move out of
+ * several levels. Nothing else (ALU, other loads) moves.
+ */
+static bool
+hoist_src_available(nir_def *def, nir_block *pre, unsigned depth);
+
+static bool
+hoist_def_movable(nir_def *def, nir_block *pre, unsigned depth)
+{
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_load_const)
+      return true;
+   if (depth > 0 && instr->type == nir_instr_type_intrinsic &&
+       nir_instr_as_intrinsic(instr)->intrinsic ==
+          nir_intrinsic_bindless_resource_ir3)
+      return hoist_src_available(nir_instr_as_intrinsic(instr)->src[0].ssa,
+                                 pre, depth - 1);
+   return false;
+}
+
+static bool
+hoist_src_available(nir_def *def, nir_block *pre, unsigned depth)
+{
+   if (nir_def_block(def)->index <= pre->index)
+      return true;
+   return hoist_def_movable(def, pre, depth);
+}
+
+static void
+hoist_move_def(nir_def *def, nir_block *pre)
+{
+   if (nir_def_block(def)->index <= pre->index)
+      return;
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_intrinsic)
+      hoist_move_def(nir_instr_as_intrinsic(instr)->src[0].ssa, pre);
+   nir_instr_remove(instr);
+   nir_instr_insert_after_block(pre, instr);
+}
+
+static bool
+loop_ubo_hoist_safe_loop(nir_loop *loop)
+{
+   if (!nir_loop_has_back_edge(loop) || nir_loop_has_continue_construct(loop))
+      return false;
+   nir_foreach_block_in_cf_node (block, &loop->cf_node) {
+      if (nir_block_ends_in_return_or_halt(block))
+         return false;
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (op == nir_intrinsic_terminate || op == nir_intrinsic_terminate_if)
+            return false;
+      }
+   }
+   return true;
+}
+
+struct hoist_loop_ubo_state {
+   unsigned count;
+   unsigned budget; /* max hoisted dwords per loop */
+};
+
+static bool hoist_loop_ubo_cf_list(struct exec_list *list,
+                                   struct hoist_loop_ubo_state *st);
+
+static bool
+hoist_loop_ubo_loop(nir_loop *loop, struct hoist_loop_ubo_state *st)
+{
+   bool progress = hoist_loop_ubo_cf_list(&loop->body, st);
+   unsigned used = 0;
+
+   if (!loop_ubo_hoist_safe_loop(loop))
+      return progress;
+
+   nir_block *pre = nir_loop_predecessor_block(loop);
+   nir_block *succ = nir_loop_successor_block(loop);
+
+   nir_foreach_block_in_cf_node (block, &loop->cf_node) {
+      if (!nir_block_dominates(block, succ))
+         continue;
+      nir_foreach_instr_safe (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_ubo)
+            continue;
+         if (!hoist_src_available(intr->src[0].ssa, pre, 1) ||
+             !hoist_src_available(intr->src[1].ssa, pre, 0))
+            continue;
+         /* Each hoisted value stays live across the whole loop; bound the
+          * added pressure (uniform ldc results normally sit in the small
+          * shared register file).
+          */
+         unsigned dwords = intr->def.num_components *
+                           DIV_ROUND_UP(intr->def.bit_size, 32);
+         if (used + dwords > st->budget)
+            continue;
+         used += dwords;
+         hoist_move_def(intr->src[0].ssa, pre);
+         hoist_move_def(intr->src[1].ssa, pre);
+         nir_instr_remove(instr);
+         nir_instr_insert_after_block(pre, instr);
+         st->count++;
+         progress = true;
+      }
+   }
+   return progress;
+}
+
+static bool
+hoist_loop_ubo_cf_list(struct exec_list *list, struct hoist_loop_ubo_state *st)
+{
+   bool progress = false;
+   foreach_list_typed (nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= hoist_loop_ubo_cf_list(&nif->then_list, st);
+         progress |= hoist_loop_ubo_cf_list(&nif->else_list, st);
+         break;
+      }
+      case nir_cf_node_loop:
+         progress |= hoist_loop_ubo_loop(nir_cf_node_as_loop(node), st);
+         break;
+      default:
+         break;
+      }
+   }
+   return progress;
+}
+
+static bool
+ir3_nir_hoist_loop_ubo(nir_shader *s, struct ir3_shader_variant *so)
+{
+   bool progress = false;
+   struct hoist_loop_ubo_state st = {
+      .budget = so->shader_options.loop_ubo_hoist,
+   };
+   nir_foreach_function_impl (impl, s) {
+      /* Block indices stay valid: only instructions move, no CF changes. */
+      nir_metadata_require(impl, nir_metadata_block_index |
+                                 nir_metadata_dominance);
+      progress |= nir_progress(hoist_loop_ubo_cf_list(&impl->body, &st),
+                               impl, nir_metadata_control_flow);
+   }
+   so->loop_ubo_hoisted = st.count;
+   return progress;
+}
+
+/* TU_F16_QUANT_FOLD (ir3_shader_options::quant_f16_fold, default off).
+ *
+ * ir3 emits fquantize2f16(a) as cov.f16f32(cov.f32f16.rtne(a)) (see
+ * emit_alu). An f2f16* of that result is cov.f32f16(cov.f16f32(h)) with
+ * h = cov.f32f16.rtne(a): an f16 -> f32 -> f16 round trip, the identity on
+ * every f16 value (rounding mode irrelevant, the value is representable),
+ * provided cov does not flush f16 denormals (the same assumption Turnip's
+ * DenormPreserve 16 support makes for conversions, which it never widens).
+ * NaN stays NaN, payload not guaranteed (as for both the SPIR-V quantize and
+ * f2f16). So f2f16{,_rtne,_rtz}(fquantize2f16(a)) is rewritten to
+ * f2f16_rtne(a), the instruction ir3 already emits for h. This is only valid
+ * for ir3's lowering, not for NIR's constant-folding definition of
+ * fquantize2f16 (which flushes), so it runs after constant folding of the
+ * source is done and must stay an ir3-only pass.
+ */
+static bool
+fold_quant_f16(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_f2f16 && alu->op != nir_op_f2f16_rtne &&
+       alu->op != nir_op_f2f16_rtz)
+      return false;
+   nir_instr *qi = nir_def_instr(alu->src[0].src.ssa);
+   if (qi->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *q = nir_instr_as_alu(qi);
+   if (q->op != nir_op_fquantize2f16 || q->def.bit_size != 32)
+      return false;
+
+   uint8_t swizzle[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < NIR_MAX_VEC_COMPONENTS; i++)
+      swizzle[i] = q->src[0].swizzle[alu->src[0].swizzle[i]];
+   alu->op = nir_op_f2f16_rtne;
+   nir_src_rewrite(&alu->src[0].src, q->src[0].src.ssa);
+   memcpy(alu->src[0].swizzle, swizzle, sizeof(swizzle));
+   (*(unsigned *)data)++;
+   return true;
+}
+
+static bool
+ir3_nir_fold_quant_f16(nir_shader *s, struct ir3_shader_variant *so)
+{
+   unsigned count = 0;
+   bool progress = nir_shader_alu_pass(s, fold_quant_f16,
+                                       nir_metadata_control_flow, &count);
+   so->quant_f16_folded = count;
+   return progress;
+}
+
 void
 ir3_nir_lower_variant(struct ir3_shader_variant *so,
                       const struct ir3_shader_nir_options *options,
@@ -1710,6 +1925,9 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
 
    progress |= OPT(s, ir3_nir_lower_preamble, so);
 
+   if (so->shader_options.loop_ubo_hoist)
+      progress |= OPT(s, ir3_nir_hoist_loop_ubo, so);
+
    progress |= OPT(s, nir_lower_amul, ir3_glsl_type_size);
 
    /* UBO offset lowering has to come after we've decided what will
@@ -1742,6 +1960,10 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
     * produce fnegs, and if so then we need to keep running to squash
     * fneg(fneg(a)).
     */
+   if (so->shader_options.quant_f16_fold &&
+       OPT(s, ir3_nir_fold_quant_f16, so))
+      ir3_optimize_loop(so->compiler, &optimize_options, s);
+
    bool more_late_algebraic = true;
    while (more_late_algebraic) {
       more_late_algebraic = OPT(s, nir_opt_algebraic_late);
