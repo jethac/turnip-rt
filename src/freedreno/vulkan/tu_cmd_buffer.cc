@@ -10497,6 +10497,64 @@ tu_tune_chicken_bits_2(const struct tu_physical_device *phys_dev,
    return false;
 }
 
+static bool
+tu_cs_isz_batch_bin_allowed(const struct tu_device *dev,
+                            const struct ir3_shader_variant *v)
+{
+   if (dev->cs_isz_batch_nbins == 0)
+      return true;
+   for (uint32_t i = 0; i < dev->cs_isz_batch_nbins; i++) {
+      const char *b = dev->cs_isz_batch_bins[i];
+      if (!strncmp(v->blake3_str, b, strlen(b)))
+         return true;
+   }
+   return false;
+}
+
+/* TU_CS_ISZ_BATCH.  The CS_ISZ workaround writes SP_PS_INSTR_SIZE before a
+ * big compute dispatch and, with TU_CS_ISZ_RESTORE, waits for idle and
+ * restores it right after.  That WFI serialises back-to-back dispatches the
+ * API leaves unordered (e.g. SkyTrace's 4 tile-list dispatches, between which
+ * vkd3d records no barrier).  When the very next thing recorded into this
+ * command stream is another dispatch of the same binary, the register would
+ * be set back to the same instrlen, so the restore in between is retracted
+ * (the stream pointer is moved back over it).  "Nothing else was recorded" is
+ * proven by the stream pointer, IB entry, BO and conditional-execution state
+ * being exactly where the restore left them; anything else emitted in between
+ * (barrier flushes are lazy and are emitted after this point by the next
+ * dispatch, so they are kept) keeps the restore.  The restore after the last
+ * dispatch of a run is never retracted.
+ */
+static void
+tu_cs_isz_batch_retract(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                        const struct ir3_shader_variant *v, bool isz)
+{
+   auto *p = &cmd->state.isz_batch;
+   const struct ir3_shader_variant *prev = p->variant;
+   p->variant = NULL;
+   if (!prev || !isz)
+      return;
+
+   if (prev->instrlen != v->instrlen ||
+       memcmp(prev->blake3_str, v->blake3_str, sizeof(v->blake3_str)) ||
+       cs->status != VK_SUCCESS || cs->cur != p->end ||
+       cs->start != p->cs_start || cs->entry_count != p->entry_count ||
+       cs->writeable != p->writeable ||
+       cs->cond_stack_depth != p->cond_depth || p->start < cs->start ||
+       p->start > p->end)
+      return;
+
+   cs->cur = p->start;
+
+   if (unlikely(cmd->device->cs_isz_batch_log)) {
+      static uint64_t retracted;
+      uint64_t n = p_atomic_inc_return(&retracted);
+      if (util_is_power_of_two_nonzero64(n))
+         mesa_logi("tu-isz-batch: retracted=%" PRIu64 " bin=%.12s instrlen=0x%x",
+                   n, v->blake3_str, v->instrlen);
+   }
+}
+
 template <chip CHIP>
 static void
 tu_dispatch(struct tu_cmd_buffer *cmd,
@@ -10523,6 +10581,12 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    }
 
    emit_instrlen_workaround &= cmd->device->cs_isz_wa;
+
+   /* Must run before anything else is emitted for this dispatch. */
+   if (unlikely(cmd->device->cs_isz_batch))
+      tu_cs_isz_batch_retract(cmd, cs, shader->variant,
+                              emit_instrlen_workaround &&
+                              cmd->device->cs_isz_restore);
 
    /* We don't use draw states for dispatches, so the bound pipeline
     * could be overwritten by reg stomping in a renderpass or blit.
@@ -10809,11 +10873,32 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
       tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
 
       if (cmd->device->cs_isz_restore) {
+         uint32_t *rs_start = cs->cur;
+         uint32_t *rs_cs_start = cs->start;
+         uint32_t rs_entries = cs->entry_count;
+
          tu_cs_emit_wfi(cs);
          for (unsigned ctx = 0; ctx < 4; ctx++) {
             tu_cs_emit_regs(cs,
                             A6XX_SP_PS_INSTR_SIZE(cmd->device->cs_isz_restore));
             tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
+         }
+
+         /* Only a restore that sits contiguously in the current IB entry can
+          * be retracted later.
+          */
+         if (unlikely(cmd->device->cs_isz_batch) &&
+             cs->status == VK_SUCCESS && cs->start == rs_cs_start &&
+             cs->entry_count == rs_entries && rs_start >= cs->start &&
+             tu_cs_isz_batch_bin_allowed(cmd->device, shader->variant)) {
+            auto *p = &cmd->state.isz_batch;
+            p->variant = shader->variant;
+            p->start = rs_start;
+            p->end = cs->cur;
+            p->cs_start = cs->start;
+            p->entry_count = cs->entry_count;
+            p->cond_depth = cs->cond_stack_depth;
+            p->writeable = cs->writeable;
          }
       }
    }

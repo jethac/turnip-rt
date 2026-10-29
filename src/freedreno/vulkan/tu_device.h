@@ -378,6 +378,15 @@ struct tu_device
 
    bool cs_isz_wa;
    uint32_t cs_isz_restore;
+   /* TU_CS_ISZ_BATCH (default off): retract the CS_ISZ restore between two
+    * back-to-back dispatches of the same CS binary (see tu_dispatch()).
+    * cs_isz_batch_bins holds up to 16 allowed 12-hex-digit bin prefixes;
+    * cs_isz_batch_nbins == 0 means every CS_ISZ binary is allowed.
+    */
+   bool cs_isz_batch;
+   bool cs_isz_batch_log;
+   uint32_t cs_isz_batch_nbins;
+   char cs_isz_batch_bins[16][13];
    /* Mapped, never-allocated bytes kept at the end of every
     * pipeline_suballoc BO and of global_bo (TU_PIPELINE_TAIL_PAD).
     */
