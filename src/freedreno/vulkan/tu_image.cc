@@ -320,9 +320,140 @@ static enum fdl_ubwc_3d_mips
 tu_ubwc_3d_mips(void)
 {
    static int value = -1;
-   if (value < 0)
-      value = CLAMP(debug_get_num_option("TU_UBWC_3D", 0), 0, 2);
+   if (value < 0) {
+      int64_t v = debug_get_num_option("TU_UBWC_3D", 0);
+      /* Mode 2 (level-major flag layout) failed its GPU unit test (12 data
+       * mismatches); only mode 1 (layer-major) passed. Fail closed.
+       */
+      if (v == 2)
+         mesa_loge("TU_UBWC_3D=2 (level-major) is not validated; using 0");
+      value = (v == 1) ? 1 : 0;
+   }
    return (enum fdl_ubwc_3d_mips) value;
+}
+
+/* TU_UBWC_FORCE: opt-in UBWC for images whose creator asked for no
+ * compression (VK_IMAGE_COMPRESSION_DISABLED_EXT) or made them fully
+ * mutable without a format list.  vkd3d-proton does both for every
+ * D3D12 resource without RTV/DSV flags, which leaves all sampled and
+ * UAV-only textures (including mipmapped 3D cloud volumes) uncompressed.
+ *
+ * Tokens (comma/space separated):
+ *   3d, 2d          image types the override may apply to
+ *   sampled         images without STORAGE and without attachment usage
+ *   storage         images with STORAGE usage and without attachment usage
+ *   attach          images with color attachment usage
+ *   all             3d,2d,sampled,storage,attach
+ *   log             one tu-ubwc-force line per eligible-type image
+ *   8bpp            also allow 8bpp single-plane formats (R8) on GPUs whose
+ *                   device table lacks has_8bpp_ubwc (all a7xx)
+ * A type token and a class token are both required to force anything.
+ * Unknown tokens disable the override entirely (fail closed).
+ * Hard UBWC constraints (ubwc_possible(), linear tiling, swaps, sparse,
+ * DRM modifiers, depth/stencil, block-texel views) are never overridden.
+ * Mipmapped 3D images additionally need TU_UBWC_3D=1.
+ */
+enum tu_ubwc_force_flags {
+   TU_UBWC_FORCE_3D      = 1 << 0,
+   TU_UBWC_FORCE_2D      = 1 << 1,
+   TU_UBWC_FORCE_SAMPLED = 1 << 2,
+   TU_UBWC_FORCE_STORAGE = 1 << 3,
+   TU_UBWC_FORCE_ATTACH  = 1 << 4,
+   TU_UBWC_FORCE_LOG     = 1 << 5,
+   TU_UBWC_FORCE_8BPP    = 1 << 6,
+};
+
+static uint32_t
+tu_ubwc_force_flags(void)
+{
+   static int value = -1;
+   if (value >= 0)
+      return value;
+
+   const char *env = os_get_option("TU_UBWC_FORCE");
+   uint32_t flags = 0;
+   if (env && *env) {
+      char buf[256];
+      snprintf(buf, sizeof(buf), "%s", env);
+      char *save = NULL;
+      for (char *tok = strtok_r(buf, ", ;\t", &save); tok;
+           tok = strtok_r(NULL, ", ;\t", &save)) {
+         if (!strcmp(tok, "3d"))
+            flags |= TU_UBWC_FORCE_3D;
+         else if (!strcmp(tok, "2d"))
+            flags |= TU_UBWC_FORCE_2D;
+         else if (!strcmp(tok, "sampled"))
+            flags |= TU_UBWC_FORCE_SAMPLED;
+         else if (!strcmp(tok, "storage"))
+            flags |= TU_UBWC_FORCE_STORAGE;
+         else if (!strcmp(tok, "attach"))
+            flags |= TU_UBWC_FORCE_ATTACH;
+         else if (!strcmp(tok, "all"))
+            flags |= TU_UBWC_FORCE_3D | TU_UBWC_FORCE_2D |
+                     TU_UBWC_FORCE_SAMPLED | TU_UBWC_FORCE_STORAGE |
+                     TU_UBWC_FORCE_ATTACH;
+         else if (!strcmp(tok, "log"))
+            flags |= TU_UBWC_FORCE_LOG;
+         else if (!strcmp(tok, "8bpp"))
+            flags |= TU_UBWC_FORCE_8BPP;
+         else {
+            mesa_loge("TU_UBWC_FORCE: unknown token '%s'; override disabled",
+                      tok);
+            flags = 0;
+            break;
+         }
+      }
+      mesa_logi("tu-ubwc-force: flags=0x%x (%s) ubwc_3d=%d", flags, env,
+                (int) tu_ubwc_3d_mips());
+   }
+   value = flags;
+   return flags;
+}
+
+/* Whether TU_UBWC_FORCE applies to this image (before hard constraints). */
+static bool
+tu_ubwc_force_applies(const struct tu_device *device UNUSED,
+                      const VkImageCreateInfo *info)
+{
+   uint32_t flags = tu_ubwc_force_flags();
+   if (!(flags & (TU_UBWC_FORCE_3D | TU_UBWC_FORCE_2D)))
+      return false;
+
+   if (info->imageType == VK_IMAGE_TYPE_3D) {
+      if (!(flags & TU_UBWC_FORCE_3D))
+         return false;
+   } else if (info->imageType == VK_IMAGE_TYPE_2D) {
+      if (!(flags & TU_UBWC_FORCE_2D))
+         return false;
+   } else {
+      return false;
+   }
+
+   if (info->tiling != VK_IMAGE_TILING_OPTIMAL)
+      return false;
+   if (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                      VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                      VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT))
+      return false;
+   if (vk_format_is_depth_or_stencil(info->format) ||
+       vk_format_is_compressed(info->format) ||
+       vk_format_get_plane_count(info->format) != 1)
+      return false;
+   if (info->usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
+                      VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT |
+                      VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR))
+      return false;
+
+   uint32_t cls;
+   if (info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
+      cls = TU_UBWC_FORCE_ATTACH;
+   else if (info->usage & VK_IMAGE_USAGE_STORAGE_BIT)
+      cls = TU_UBWC_FORCE_STORAGE;
+   else
+      cls = TU_UBWC_FORCE_SAMPLED;
+   return (flags & cls) != 0;
 }
 
 static bool
@@ -559,6 +690,9 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
 
    bool ubwc_enabled = true;
    bool force_linear_tile = false;
+   /* TU_UBWC_FORCE (default off): see tu_ubwc_force_flags(). */
+   const bool ubwc_forced = tu_ubwc_force_applies(device, pCreateInfo);
+   bool ubwc_force_used = false;
    bool is_mutable = false;
    /* Force to either use tiled layout or linear for all mip layers. */
    bool force_disable_linear_fallback = false;
@@ -603,11 +737,20 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       force_linear_tile = true;
    }
 
+   /* TU_UBWC_FORCE=...,8bpp: treat 8bpp single-plane formats as
+    * UBWC-capable for forced images. a6xx sets has_8bpp_ubwc; the a7xx
+    * device tables leave it unset, and whether a7xx decodes 8bpp UBWC
+    * correctly is checked by the native ubwc_force test, not assumed.
+    */
+   struct fd_dev_info ubwc_info = *device->physical_device->info;
+   if (ubwc_forced && (tu_ubwc_force_flags() & TU_UBWC_FORCE_8BPP))
+      ubwc_info.props.has_8bpp_ubwc = true;
+
    if (force_linear_tile ||
        !ubwc_possible(device, image->vk.format, pCreateInfo->imageType,
                       pCreateInfo->flags, pCreateInfo->usage,
                       image->vk.stencil_usage,
-                      device->physical_device->info, pCreateInfo->samples,
+                      &ubwc_info, pCreateInfo->samples,
                       pCreateInfo->mipLevels, device->use_z24uint_s8uint))
       ubwc_enabled = false;
 
@@ -678,8 +821,25 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
             }
          } else {
             is_mutable = true;
-            if (!format_list_ubwc_possible(device, fmt_list, pCreateInfo))
-               ubwc_enabled = false;
+            if (!format_list_ubwc_possible(device, fmt_list, pCreateInfo)) {
+               /* With TU_UBWC_FORCE, a missing format list is treated as
+                * the format's own D3D cast family: on GPUs where every
+                * format is UBWC-compatible for reinterpretation
+                * (ubwc_all_formats_compatible), only the base format's own
+                * UBWC eligibility matters, and that was checked above.
+                * An explicit list that contains a non-UBWC format still
+                * disables UBWC.
+                * The only non-UBWC format in a size class is R9G9B9E5
+                * (32bpp), and D3D12 never casts a resource of another
+                * format to it.
+                */
+               if (ubwc_forced && ubwc_enabled &&
+                   (!fmt_list || !fmt_list->viewFormatCount)) {
+                  ubwc_force_used = true;
+               } else {
+                  ubwc_enabled = false;
+               }
+            }
          }
 
          /* If the threshold of the linear mipmap fallback for compressed
@@ -703,7 +863,10 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
    /* VK_EXT_image_compression_control: honor the application's request to
     * disable compression for this image.
     */
-   if (image->vk.compr_flags & VK_IMAGE_COMPRESSION_DISABLED_EXT) {
+   if ((image->vk.compr_flags & VK_IMAGE_COMPRESSION_DISABLED_EXT) &&
+       ubwc_forced && ubwc_enabled) {
+      ubwc_force_used = true;
+   } else if (image->vk.compr_flags & VK_IMAGE_COMPRESSION_DISABLED_EXT) {
       if (ubwc_enabled) {
          perf_debug(device,
                     "Disabling UBWC on %dx%d %s resource due to "
@@ -858,6 +1021,31 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
                 image->layout[0].ubwc, image->layout[0].ubwc_level_major,
                 (unsigned) image->layout[0].tile_mode,
                 image->layout[0].tile_all, image->total_size);
+   }
+
+   if ((tu_ubwc_force_flags() & TU_UBWC_FORCE_LOG) &&
+       ((image->vk.image_type == VK_IMAGE_TYPE_3D &&
+         (tu_ubwc_force_flags() & TU_UBWC_FORCE_3D)) ||
+        (image->vk.image_type == VK_IMAGE_TYPE_2D &&
+         (tu_ubwc_force_flags() & TU_UBWC_FORCE_2D)))) {
+      const VkImageFormatListCreateInfo *log_fmt_list =
+         vk_find_struct_const(pCreateInfo->pNext,
+                              IMAGE_FORMAT_LIST_CREATE_INFO);
+      mesa_logi("tu-ubwc-force: id=%" PRIu64 " type=%dd fmt=%s %ux%ux%u mips=%u "
+                "layers=%u usage=0x%x flags=0x%x compr_disabled=%d "
+                "fmt_list=%u eligible=%d used=%d ubwc=%d mutable=%d "
+                "tile=%u size=%" PRIu64,
+                image->id, (int) image->vk.image_type + 1,
+                util_format_short_name(vk_format_to_pipe_format(image->vk.format)),
+                image->vk.extent.width, image->vk.extent.height,
+                image->vk.extent.depth, image->vk.mip_levels,
+                image->vk.array_layers,
+                (unsigned) image->vk.usage, (unsigned) image->vk.create_flags,
+                !!(image->vk.compr_flags & VK_IMAGE_COMPRESSION_DISABLED_EXT),
+                log_fmt_list ? log_fmt_list->viewFormatCount : 0,
+                ubwc_forced, ubwc_force_used && image->layout[0].ubwc,
+                image->layout[0].ubwc, image->layout[0].is_mutable,
+                (unsigned) image->layout[0].tile_mode, image->total_size);
    }
 
    image->max_tile_w_constraint_fdm = ~0;
