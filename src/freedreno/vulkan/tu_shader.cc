@@ -4383,6 +4383,10 @@ tu_shader_create(struct tu_device *dev,
                 shader->variant->blake3_str,
                 shader->variant->info.instrs_count,
                 shader->variant->constlen);
+   /* TU_VRS_PS_ALLOW/DENY key: which DXIL hash this FS binary carries. */
+   if (log_hashes && shader->variant && src_stage == MESA_SHADER_FRAGMENT)
+      mesa_logi("tu-ps-dxil: bin=%.12s dxil=%016" PRIx64,
+                shader->variant->blake3_str, shader->fs.dxil_hash);
    /* Lane order is observable to subgroup rewrites that assume lane ==
     * LocalInvocationIndex; log it for offline checks.
     */
