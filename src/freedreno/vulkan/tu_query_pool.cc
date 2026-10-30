@@ -2041,10 +2041,10 @@ handle_multiview_queries(struct tu_cmd_buffer *cmd,
                          struct tu_query_pool *pool,
                          uint32_t query)
 {
-   if (!cmd->state.pass || !cmd->state.subpass->multiview_mask)
+   if (!cmd->state.pass || !tu_subpass_view_mask(cmd->state.subpass))
       return;
 
-   unsigned views = util_bitcount(cmd->state.subpass->multiview_mask);
+   unsigned views = util_bitcount(tu_subpass_view_mask(cmd->state.subpass));
    struct tu_cs *cs = &cmd->draw_epilogue_cs;
 
    for (uint32_t i = 1; i < views; i++) {

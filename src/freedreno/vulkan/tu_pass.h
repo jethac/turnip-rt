@@ -92,6 +92,10 @@ struct tu_subpass
 
    uint32_t srgb_cntl;
    uint32_t multiview_mask;
+   /* TU_MULTIVIEW_SAME_LAYER: the app's view mask when every view renders
+    * into layer 0 (multiview_mask is then 0 for all layer derivations).
+    */
+   uint32_t sl_view_mask;
 
    struct tu_subpass_barrier start_barrier;
 };
@@ -167,6 +171,9 @@ struct tu_render_pass
 
    bool warn_fdm_force_disabled;
 
+   /* OR of the subpasses' sl_view_mask (TU_MULTIVIEW_SAME_LAYER). */
+   uint32_t sl_view_mask;
+
    struct tu_subpass_barrier end_barrier;
    struct tu_subpass subpasses[0];
 };
@@ -179,6 +186,16 @@ void tu_setup_dynamic_render_pass(struct tu_cmd_buffer *cmd_buffer,
 
 void tu_setup_dynamic_inheritance(struct tu_cmd_buffer *cmd_buffer,
                                   const VkCommandBufferInheritanceRenderingInfo *info);
+
+/* TU_MULTIVIEW_SAME_LAYER: 0 unset, 1 on, 2 on and sysmem for such passes. */
+int tu_mv_same_layer_mode(void);
+bool tu_mv_same_layer(const struct tu_device *dev);
+
+static inline uint32_t
+tu_subpass_view_mask(const struct tu_subpass *subpass)
+{
+   return subpass->multiview_mask | subpass->sl_view_mask;
+}
 
 uint32_t
 tu_subpass_get_attachment_to_resolve(const struct tu_subpass *subpass, uint32_t index);

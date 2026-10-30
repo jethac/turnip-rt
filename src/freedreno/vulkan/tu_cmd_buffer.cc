@@ -1510,6 +1510,11 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
       return true;
    }
 
+   if (unlikely(cmd->state.pass->sl_view_mask) && tu_mv_same_layer_mode() == 2) {
+      cmd->state.rp.force_render_mode_reason = "TU_MULTIVIEW_SAME_LAYER=sysmem";
+      return true;
+   }
+
    /* can't fit attachments into gmem */
    if (!cmd->state.tiling->possible) {
       cmd->state.rp.force_render_mode_reason = "Can't fit attachments into gmem";

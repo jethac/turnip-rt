@@ -547,6 +547,62 @@ static void update_samples(struct tu_subpass *subpass,
    subpass->samples = samples;
 }
 
+int
+tu_mv_same_layer_mode(void)
+{
+   static int mode = -1;
+   int m = p_atomic_read(&mode);
+   if (m < 0) {
+      const char *e = os_get_option("TU_MULTIVIEW_SAME_LAYER");
+      m = (!e || !*e || !strcmp(e, "0")) ? 0 : !strcmp(e, "sysmem") ? 2 : 1;
+      if (m)
+         mesa_logi("tu-mv-same-layer: on mode=%s", m == 2 ? "sysmem" : "auto");
+      p_atomic_set(&mode, m);
+   }
+   return m;
+}
+
+bool
+tu_mv_same_layer(const struct tu_device *dev)
+{
+   return tu_mv_same_layer_mode() &&
+          dev->physical_device->info->props.has_hw_multiview;
+}
+
+/* Every view of a multiview subpass renders into layer 0, with per-view
+ * viewports (GRAS_SU_CNTL rendertargetindexincr=0, viewportindexincr=1).
+ * Everything that derives layers from the view mask (GMEM layers, array
+ * size, loads/stores/clears/resolves, FDM) sees a single-layer pass.
+ */
+static void
+tu_render_pass_same_layer(struct tu_device *dev, struct tu_render_pass *pass)
+{
+   pass->sl_view_mask = 0;
+   if (!tu_mv_same_layer(dev)) {
+      for (uint32_t i = 0; i < pass->subpass_count; i++)
+         pass->subpasses[i].sl_view_mask = 0;
+      return;
+   }
+   for (uint32_t i = 0; i < pass->subpass_count; i++) {
+      struct tu_subpass *subpass = &pass->subpasses[i];
+      subpass->sl_view_mask = subpass->multiview_mask;
+      subpass->multiview_mask = 0;
+      pass->sl_view_mask |= subpass->sl_view_mask;
+   }
+   if (!pass->sl_view_mask)
+      return;
+   for (uint32_t i = 0; i < pass->attachment_count; i++) {
+      pass->attachments[i].used_views = 0;
+      pass->attachments[i].resolve_views = 0;
+   }
+   if (pass->has_fdm) {
+      mesa_logw_once("tu-mv-same-layer: fragment density map disabled for same-layer multiview passes");
+      pass->has_fdm = false;
+      pass->has_layered_fdm = false;
+      pass->fragment_density_map.attachment = VK_ATTACHMENT_UNUSED;
+   }
+}
+
 static void
 tu_render_pass_calc_views(struct tu_render_pass *pass)
 {
@@ -1389,6 +1445,7 @@ tu_CreateRenderPass2(VkDevice _device,
       }
    }
 
+   tu_render_pass_same_layer(device, pass);
    tu_render_pass_check_ib2_skip(pass);
    tu_render_pass_cond_config(device, pass);
    tu_render_pass_gmem_config(pass, device->physical_device);
@@ -1901,6 +1958,7 @@ tu_setup_dynamic_render_pass(struct tu_cmd_buffer *cmd_buffer,
 
    pass->attachment_count = a;
 
+   tu_render_pass_same_layer(device, pass);
    tu_render_pass_check_ib2_skip(pass);
    tu_render_pass_cond_config(device, pass);
    tu_render_pass_gmem_config(pass, device->physical_device);
@@ -1983,6 +2041,7 @@ tu_setup_dynamic_inheritance(struct tu_cmd_buffer *cmd_buffer,
       subpass->stencil_used = false;
    }
 
+   tu_render_pass_same_layer(cmd_buffer->device, pass);
    tu_render_pass_calc_views(pass);
 }
 

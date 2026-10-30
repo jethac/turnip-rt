@@ -3505,6 +3505,10 @@ tu6_emit_rast(struct tu_cs *cs,
    enum a5xx_line_mode line_mode =
       rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR ?
       BRESENHAM : RECTANGULAR;
+   /* TU_MULTIVIEW_SAME_LAYER: every view stays in layer 0 and selects
+    * viewport/scissor <view index>.
+    */
+   const bool same_layer = multiview && tu_mv_same_layer(cs->device);
    tu_cs_emit_regs(cs,
                    GRAS_SU_CNTL(CHIP,
                      .cull_front = rs->cull_mode & VK_CULL_MODE_FRONT_BIT,
@@ -3514,13 +3518,13 @@ tu6_emit_rast(struct tu_cs *cs,
                      .poly_offset = rs->depth_bias.enable,
                      .line_mode = line_mode,
                      .multiview_enable = multiview,
-                     .rendertargetindexincr = multiview,
-                     .viewportindexincr = multiview && per_view_viewport));
+                     .rendertargetindexincr = multiview && !same_layer,
+                     .viewportindexincr = multiview && (per_view_viewport || same_layer)));
 
    if (CHIP >= A8XX) {
       tu_cs_emit_regs(cs, GRAS_SU_STEREO_CNTL(CHIP,
-         .rendertargetindexincr = multiview,
-         .viewportindexincr = multiview && per_view_viewport,
+         .rendertargetindexincr = multiview && !same_layer,
+         .viewportindexincr = multiview && (per_view_viewport || same_layer),
       ));
    }
 
@@ -4729,7 +4733,7 @@ tu_fill_render_pass_state(struct vk_render_pass_state *rp,
                           const struct tu_render_pass *pass,
                           const struct tu_subpass *subpass)
 {
-   mv->view_mask = subpass->multiview_mask;
+   mv->view_mask = tu_subpass_view_mask(subpass);
    rp->color_attachment_count = subpass->color_count;
 
    const uint32_t a = subpass->depth_stencil_attachment.attachment;
