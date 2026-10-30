@@ -228,6 +228,8 @@ struct tu_pipeline
    void *executables_mem_ctx;
    /* tu_pipeline_executable */
    struct util_dynarray executables;
+
+   struct tu_hotswap_pipe *hotswap;
 };
 
 struct tu_graphics_lib_pipeline {

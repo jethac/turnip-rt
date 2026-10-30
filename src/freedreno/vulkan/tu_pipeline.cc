@@ -29,6 +29,7 @@
 #include "tu_cs.h"
 #include "tu_device.h"
 #include "tu_foveate.h"
+#include "tu_hotswap.h"
 #include "tu_formats.h"
 #include "tu_knl.h"
 #include "tu_lrz.h"
@@ -5003,6 +5004,73 @@ tu_log_failed_stages(const char *kind, VkResult result,
    }
 }
 
+static const VkPipelineCreateFlags2KHR tu_hotswap_strip_flags =
+   VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR |
+   VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR |
+   VK_PIPELINE_CREATE_2_DERIVATIVE_BIT_KHR |
+   VK_PIPELINE_CREATE_2_ALLOW_DERIVATIVES_BIT_KHR |
+   VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR |
+   VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+
+template <chip CHIP>
+struct tu_hotswap_gfx_data {
+   VkDevice device;
+   const VkGraphicsPipelineCreateInfo *ci;
+   VkPipelineCreateFlags2KHR flags;
+   const VkAllocationCallbacks *alloc;
+   uint32_t fs_index;
+};
+
+template <chip CHIP>
+static VkResult
+tu_hotswap_gfx_create(void *data, VkShaderModule module, VkPipeline *out)
+{
+   const struct tu_hotswap_gfx_data<CHIP> *d =
+      (const struct tu_hotswap_gfx_data<CHIP> *) data;
+   VkGraphicsPipelineCreateInfo ci = *d->ci;
+   VkPipelineShaderStageCreateInfo *stages = (VkPipelineShaderStageCreateInfo *)
+      malloc(sizeof(*stages) * ci.stageCount);
+   if (!stages)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   memcpy(stages, ci.pStages, sizeof(*stages) * ci.stageCount);
+   stages[d->fs_index].module = module;
+   ci.pStages = stages;
+   ci.flags &= ~(VkPipelineCreateFlags) tu_hotswap_strip_flags;
+   ci.basePipelineHandle = VK_NULL_HANDLE;
+   ci.basePipelineIndex = -1;
+   VkResult r = tu_graphics_pipeline_create<CHIP>(
+      d->device, VK_NULL_HANDLE, &ci, d->flags & ~tu_hotswap_strip_flags,
+      d->alloc, out);
+   free(stages);
+   return r;
+}
+
+template <chip CHIP>
+static void
+tu_hotswap_graphics(VkDevice device, const VkGraphicsPipelineCreateInfo *ci,
+                    VkPipelineCreateFlags2KHR flags,
+                    const VkAllocationCallbacks *alloc, VkPipeline handle)
+{
+   VK_FROM_HANDLE(tu_device, dev, device);
+   VK_FROM_HANDLE(tu_pipeline, pipeline, handle);
+   VK_FROM_HANDLE(tu_pipeline_layout, layout, ci->layout);
+   if (!pipeline || pipeline->type != TU_PIPELINE_GRAPHICS ||
+       (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR))
+      return;
+   for (uint32_t s = 0; s < ci->stageCount; s++) {
+      if (ci->pStages[s].stage != VK_SHADER_STAGE_FRAGMENT_BIT)
+         continue;
+      int target = tu_hotswap_match(&ci->pStages[s], MESA_SHADER_FRAGMENT);
+      if (target < 0)
+         return;
+      struct tu_hotswap_gfx_data<CHIP> d = { device, ci, flags, alloc, s };
+      tu_hotswap_build(dev, pipeline, target, &ci->pStages[s],
+                       MESA_SHADER_FRAGMENT, layout, ci->pNext, alloc,
+                       tu_hotswap_gfx_create<CHIP>, &d);
+      return;
+   }
+}
+
 template <chip CHIP>
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateGraphicsPipelines(VkDevice device,
@@ -5024,6 +5092,10 @@ tu_CreateGraphicsPipelines(VkDevice device,
          tu_graphics_pipeline_create<CHIP>(device, pipelineCache,
                                            &pCreateInfos[i], flags,
                                            pAllocator, &pPipelines[i]);
+
+      if (unlikely(result == VK_SUCCESS && tu_hotswap_enabled()))
+         tu_hotswap_graphics<CHIP>(device, &pCreateInfos[i], flags,
+                                   pAllocator, pPipelines[i]);
 
       if (result != VK_SUCCESS) {
          tu_log_failed_stages("graphics", result, pCreateInfos[i].pStages,
@@ -5385,6 +5457,47 @@ tu_compute_pipeline_init_nir(struct tu_device *dev,
 }
 
 template <chip CHIP>
+struct tu_hotswap_cs_data {
+   VkDevice device;
+   const VkComputePipelineCreateInfo *ci;
+   VkPipelineCreateFlags2KHR flags;
+   const VkAllocationCallbacks *alloc;
+};
+
+template <chip CHIP>
+static VkResult
+tu_hotswap_cs_create(void *data, VkShaderModule module, VkPipeline *out)
+{
+   const struct tu_hotswap_cs_data<CHIP> *d =
+      (const struct tu_hotswap_cs_data<CHIP> *) data;
+   VkComputePipelineCreateInfo ci = *d->ci;
+   ci.stage.module = module;
+   ci.flags &= ~(VkPipelineCreateFlags) tu_hotswap_strip_flags;
+   ci.basePipelineHandle = VK_NULL_HANDLE;
+   ci.basePipelineIndex = -1;
+   return tu_compute_pipeline_create<CHIP>(d->device, VK_NULL_HANDLE, &ci,
+                                           d->flags & ~tu_hotswap_strip_flags,
+                                           d->alloc, out);
+}
+
+template <chip CHIP>
+static void
+tu_hotswap_compute(VkDevice device, const VkComputePipelineCreateInfo *ci,
+                   VkPipelineCreateFlags2KHR flags,
+                   const VkAllocationCallbacks *alloc, VkPipeline handle)
+{
+   VK_FROM_HANDLE(tu_device, dev, device);
+   VK_FROM_HANDLE(tu_pipeline, pipeline, handle);
+   VK_FROM_HANDLE(tu_pipeline_layout, layout, ci->layout);
+   int target = tu_hotswap_match(&ci->stage, MESA_SHADER_COMPUTE);
+   if (!pipeline || target < 0)
+      return;
+   struct tu_hotswap_cs_data<CHIP> d = { device, ci, flags, alloc };
+   tu_hotswap_build(dev, pipeline, target, &ci->stage, MESA_SHADER_COMPUTE,
+                    layout, ci->pNext, alloc, tu_hotswap_cs_create<CHIP>, &d);
+}
+
+template <chip CHIP>
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateComputePipelines(VkDevice device,
                           VkPipelineCache pipelineCache,
@@ -5405,6 +5518,10 @@ tu_CreateComputePipelines(VkDevice device,
          tu_compute_pipeline_create<CHIP>(device, pipelineCache,
                                           &pCreateInfos[i], flags,
                                           pAllocator, &pPipelines[i]);
+
+      if (unlikely(result == VK_SUCCESS && tu_hotswap_enabled()))
+         tu_hotswap_compute<CHIP>(device, &pCreateInfos[i], flags,
+                                  pAllocator, pPipelines[i]);
       if (result != VK_SUCCESS) {
          tu_log_failed_stages("compute", result, &pCreateInfos[i].stage, 1);
          final_result = result;
@@ -5433,6 +5550,9 @@ tu_DestroyPipeline(VkDevice _device,
 
    if (!_pipeline)
       return;
+
+   if (unlikely(pipeline->hotswap))
+      tu_hotswap_destroy(dev, pipeline, pAllocator);
 
    TU_RMV(resource_destroy, dev, pipeline);
 

@@ -25,6 +25,7 @@
 #include "tu_buffer.h"
 #include "tu_clear_blit.h"
 #include "tu_cs.h"
+#include "tu_hotswap.h"
 #include "tu_event.h"
 #include "tu_free_log.h"
 #include "tu_image.h"
@@ -5986,6 +5987,9 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
+
+   if (unlikely(pipeline->hotswap))
+      pipeline = tu_hotswap_bind(cmd->device, pipeline);
 
    if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
       cmd->state.rt_pipeline = pipeline;
