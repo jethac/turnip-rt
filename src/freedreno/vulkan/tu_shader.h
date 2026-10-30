@@ -86,6 +86,13 @@ struct tu_shader
     */
    bool ubo_witness_speculated;
 
+   /* TU_IR3_TUNE icache token: tu_dispatch() sets
+    * SP_CHICKEN_BITS_2.INDEPENDENT_ICACHE_MISS around this shader's
+    * dispatches. Set from the pipeline key (cache hits included), not
+    * serialized.
+    */
+   bool ir3_tune_icache;
+
    /* TU_VRS_PS_ALLOW/DENY: lazily computed class of this FS's DXIL hash
     * (0 = not yet classified). Deterministic per shader, so a benign race
     * writes the same value. Not serialized.
@@ -171,7 +178,24 @@ struct tu_shader_key {
 
    /* Shader version to force recompilation when TU_BUILD_ID_OVERRIDE is used. */
    uint8_t version;
+
+   /* TU_IR3_TUNE=1 + "turnip.ir3_tune=" module marker (compute only). These
+    * live in the struct's tail padding, so the key size and the hash of an
+    * unmarked pipeline are unchanged; zero means no tuning.
+    *   ir3_tune_regs:  bits 0-5 RA register target (vec4 regs, 0 = none)
+    *   ir3_tune_flags: TU_IR3_TUNE_* bits below
+    */
+   uint8_t ir3_tune_regs;
+   uint8_t ir3_tune_flags;
 };
+
+#define TU_IR3_TUNE_TEXHOIST        (1u << 0) /* hoist tex over preceding ifs */
+#define TU_IR3_TUNE_ICACHE          (1u << 1) /* INDEPENDENT_ICACHE_MISS per dispatch */
+#define TU_IR3_TUNE_LOD_ROUND       (1u << 2) /* round explicit LOD (nearest mip) */
+#define TU_IR3_TUNE_LOD_BIAS_SHIFT  3         /* 2 bits: +0.5 * n explicit LOD */
+#define TU_IR3_TUNE_LOD_BIAS_MASK   (3u << TU_IR3_TUNE_LOD_BIAS_SHIFT)
+#define TU_IR3_TUNE_LOD_SAMP_SHIFT  5         /* 3 bits: sampler heap offset */
+#define TU_IR3_TUNE_LOD_SAMP_MASK   (7u << TU_IR3_TUNE_LOD_SAMP_SHIFT)
 
 /* Information needed for tu_shader creation that is gathered during NIR
  * lowering.

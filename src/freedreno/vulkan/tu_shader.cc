@@ -4329,6 +4329,16 @@ tu_shader_create(struct tu_device *dev,
       .const_allocs = const_allocs,
       .nir_options = nir_options,
       .no_early_preamble = shader->ubo_witness_speculated,
+      .target_full_regs = (uint8_t) (key->ir3_tune_regs & 0x3f),
+      .target_full_regs_cap = (key->ir3_tune_regs & 0x3f) != 0,
+      .tex_hoist = !!(key->ir3_tune_flags & TU_IR3_TUNE_TEXHOIST),
+      .tex_lod_round = !!(key->ir3_tune_flags & TU_IR3_TUNE_LOD_ROUND),
+      .tex_lod_bias_halves = (uint8_t) ((key->ir3_tune_flags &
+                                         TU_IR3_TUNE_LOD_BIAS_MASK) >>
+                                        TU_IR3_TUNE_LOD_BIAS_SHIFT),
+      .tex_lod_samp_off = (uint8_t) ((key->ir3_tune_flags &
+                                      TU_IR3_TUNE_LOD_SAMP_MASK) >>
+                                     TU_IR3_TUNE_LOD_SAMP_SHIFT),
       .rt_part = rt && rt->part,
       .rt_scalar_pvtmem = rt && debug_get_bool_option("TU_RT_LINK_PERWAVE", false),
       .rt_blobs = rt ? rt->blobs : NULL,
@@ -4374,6 +4384,17 @@ tu_shader_create(struct tu_device *dev,
          rt->fixup(variant, rt->fixup_data);
    }
    shader->variant = variant;
+   if (key->ir3_tune_flags & TU_IR3_TUNE_ICACHE)
+      shader->ir3_tune_icache = true;
+
+   if ((key->ir3_tune_regs || key->ir3_tune_flags) && variant)
+      mesa_logi("tu-ir3-tune: bin=%.12s regs_target=%u flags=0x%02x "
+                "regs=%d waves=%u instrs=%u stp=%u ldp=%u tex_hoisted=%u",
+                variant->blake3_str, key->ir3_tune_regs & 0x3f,
+                key->ir3_tune_flags, variant->info.max_reg + 1,
+                variant->info.max_waves, variant->info.instrs_count,
+                variant->info.stp_count, variant->info.ldp_count,
+                variant->tune_tex_hoisted);
 
    static const bool log_hashes =
       debug_get_bool_option("TU_LOG_SHADER_HASHES", false);

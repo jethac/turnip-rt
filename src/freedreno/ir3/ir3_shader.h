@@ -664,6 +664,21 @@ struct ir3_shader_options {
    bool no_early_preamble;
 
    uint8_t target_full_regs;
+   /* target_full_regs only caps the register file (RA limit); it never
+    * raises the footprint of a shader that needs fewer registers.
+    */
+   bool target_full_regs_cap;
+
+   /* Opt-in raymarch tuning (Turnip TU_IR3_TUNE markers):
+    * tex_hoist: move explicit-LOD tex (and their pure slices) above the
+    *   preceding if/else nodes of their block so their latency overlaps.
+    * tex_lod_*: for tex whose bindless sampler index is iadd(x, samp_off),
+    *   round the explicit LOD and/or add bias_halves * 0.5.
+    */
+   bool tex_hoist;
+   bool tex_lod_round;
+   uint8_t tex_lod_bias_halves;
+   uint8_t tex_lod_samp_off; /* used when tex_lod_round or bias > 0 */
 
    bool rt_part;
    bool rt_scalar_pvtmem;
@@ -687,6 +702,9 @@ struct ir3_shader_variant {
 
    /* variant id (for debug) */
    uint32_t id;
+
+   /* shader_options.tex_hoist: samples moved (for logging; not serialized) */
+   uint32_t tune_tex_hoisted;
 
    /* id of the shader the variant came from (for debug) */
    uint32_t shader_id;

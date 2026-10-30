@@ -5187,6 +5187,102 @@ tu_stage_gaze_ubo(const VkPipelineShaderStageCreateInfo *stage,
    return false;
 }
 
+/* TU_IR3_TUNE=1: honour "turnip.ir3_tune=<tok>[,<tok>...]" on compute
+ * modules (no application module carries it; override/hot-swap modules do).
+ * Tokens: regs=N (16..48 vec4 registers: RA target), texhoist, icache,
+ * lod=sK:round | lod=sK:bias=H | lod=sK:round:bias=H (K = sampler heap
+ * offset 0..7, H = half-steps 1..3). Any malformed token drops the marker.
+ */
+static bool
+tu_ir3_tune_enabled(void)
+{
+   static const bool on = debug_get_bool_option("TU_IR3_TUNE", false);
+   return on;
+}
+
+static bool
+tu_parse_ir3_tune(const char *str, uint8_t *regs_out, uint8_t *flags_out)
+{
+   char buf[128];
+   if (strlen(str) >= sizeof(buf))
+      return false;
+   strcpy(buf, str);
+   uint8_t regs = 0, flags = 0;
+   char *save = NULL;
+   for (char *tok = strtok_r(buf, ",", &save); tok;
+        tok = strtok_r(NULL, ",", &save)) {
+      unsigned v, h;
+      char tail;
+      if (sscanf(tok, "regs=%u%c", &v, &tail) == 1 && v >= 16 && v <= 48) {
+         regs = v;
+      } else if (!strcmp(tok, "texhoist")) {
+         flags |= TU_IR3_TUNE_TEXHOIST;
+      } else if (!strcmp(tok, "icache")) {
+         flags |= TU_IR3_TUNE_ICACHE;
+      } else if (!strncmp(tok, "lod=s", 5)) {
+         char *end;
+         unsigned long kk = strtoul(tok + 5, &end, 10);
+         if (end == tok + 5 || kk >= 8)
+            return false;
+         bool round = false;
+         h = 0;
+         while (*end == ':') {
+            end++;
+            if (!strncmp(end, "round", 5) && (end[5] == ':' || !end[5])) {
+               round = true;
+               end += 5;
+            } else if (!strncmp(end, "bias=", 5) && end[5] >= '1' &&
+                       end[5] <= '3' && (end[6] == ':' || !end[6])) {
+               h = end[5] - '0';
+               end += 6;
+            } else {
+               return false;
+            }
+         }
+         if (*end || (!round && !h))
+            return false;
+         flags |= (round ? TU_IR3_TUNE_LOD_ROUND : 0) |
+                  (h << TU_IR3_TUNE_LOD_BIAS_SHIFT) |
+                  ((unsigned) kk << TU_IR3_TUNE_LOD_SAMP_SHIFT);
+      } else {
+         return false;
+      }
+   }
+   *regs_out = regs;
+   *flags_out = flags;
+   return true;
+}
+
+static bool
+tu_stage_ir3_tune(const VkPipelineShaderStageCreateInfo *stage,
+                  uint8_t *regs, uint8_t *flags)
+{
+   static const char prefix[] = "turnip.ir3_tune=";
+   size_t size = 0;
+   const uint32_t *words = tu_stage_spirv_words(stage, &size);
+   if (!words)
+      return false;
+
+   const size_t count = size / 4;
+   for (size_t i = 5; i < count;) {
+      const uint32_t op = words[i] & SpvOpCodeMask;
+      const uint32_t len = words[i] >> SpvWordCountShift;
+      if (!len || len > count - i || op == SpvOpFunction)
+         break;
+      if (op == SpvOpModuleProcessed &&
+          memchr(&words[i + 1], 0, (len - 1) * 4) &&
+          !strncmp((const char *) &words[i + 1], prefix, sizeof(prefix) - 1)) {
+         const char *val = (const char *) &words[i + 1] + sizeof(prefix) - 1;
+         if (tu_parse_ir3_tune(val, regs, flags))
+            return *regs || *flags;
+         mesa_logw("tu-ir3-tune: ignoring malformed marker '%s'", val);
+         return false;
+      }
+      i += len;
+   }
+   return false;
+}
+
 template <chip CHIP>
 static VkResult
 tu_compute_pipeline_create(VkDevice device,
@@ -5274,6 +5370,13 @@ tu_compute_pipeline_create(VkDevice device,
       key.gaze_binding = gaze_binding;
    }
 
+   uint8_t tune_regs = 0, tune_flags = 0;
+   if (tu_ir3_tune_enabled() &&
+       tu_stage_ir3_tune(stage_info, &tune_regs, &tune_flags)) {
+      key.ir3_tune_regs = tune_regs;
+      key.ir3_tune_flags = tune_flags;
+   }
+
    struct vk_pipeline_robustness_state rs;
    vk_pipeline_robustness_state_fill(&dev->vk.robustness_state, &rs, pCreateInfo->pNext, stage_info->pNext);
    tu_shader_key_robustness(&key, &rs);
@@ -5341,6 +5444,12 @@ tu_compute_pipeline_create(VkDevice device,
    }
 
    pipeline->base.active_desc_sets = shader->active_desc_sets;
+
+   /* Idempotent: the shader object is keyed by a hash that includes the
+    * marked module, so every user of it carries the same flag.
+    */
+   if (key.ir3_tune_flags & TU_IR3_TUNE_ICACHE)
+      shader->ir3_tune_icache = true;
 
    v = shader->variant;
 

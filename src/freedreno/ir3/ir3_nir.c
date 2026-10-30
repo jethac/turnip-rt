@@ -1507,6 +1507,381 @@ ir3_nir_localize_consts(nir_shader *nir)
    return progress;
 }
 
+/* --- Opt-in raymarch tuning (shader_options.tex_hoist / tex_lod_*) ---------
+ *
+ * tex_hoist: a march step issues several independent explicit-LOD samples
+ * that are separated by small if/else diamonds (e.g. a rain-only extra tap).
+ * ir3 schedules per block, and a (sy) waits for every outstanding sample, so
+ * each diamond costs a full texture round trip. For a txl/txf whose whole
+ * dependency slice inside its block is pure (ALU, constants, reorderable
+ * loads, other such samples) and whose other sources dominate the if, move
+ * the slice to the end of the block before the if. Nothing is speculated:
+ * the block after an if executes exactly when the block before it does
+ * (same cf list), so the moved instructions run for the same invocations.
+ * Subgroup/derivative/side-effect instructions are never moved.
+ */
+static bool
+tune_movable_intrinsic(nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ubo_vec4:
+   case nir_intrinsic_load_const_ir3:
+   case nir_intrinsic_load_uniform:
+   case nir_intrinsic_load_push_constant:
+   case nir_intrinsic_load_preamble:
+   case nir_intrinsic_bindless_resource_ir3:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+tune_movable_tex(nir_tex_instr *tex)
+{
+   return tex->op == nir_texop_txl || tex->op == nir_texop_txf;
+}
+
+struct tune_slice {
+   nir_block *block;
+   nir_if *nif;                 /* the if being hoisted over */
+   struct util_dynarray instrs; /* nir_instr *, discovery order */
+   struct util_dynarray branch; /* pure ALU moved out of a branch */
+   struct util_dynarray phis;   /* nir_phi_instr * turned into bcsel */
+   struct set *seen;
+   unsigned tex;
+   bool ok;
+};
+
+static bool
+tune_block_in_if(nir_block *b, nir_if *nif)
+{
+   for (nir_cf_node *n = &b->cf_node; n; n = n->parent)
+      if (n == &nif->cf_node)
+         return true;
+   return false;
+}
+
+/* Pure single-branch slice for a phi source: ALU/consts/reorderable loads in
+ * `blk` (a whole then/else list) whose other sources are defined before the
+ * if. Moving it before the if only computes ALU speculatively.
+ */
+static bool tune_branch_slice(struct tune_slice *sl, nir_block *blk,
+                              nir_instr *instr);
+
+struct tune_branch_state {
+   struct tune_slice *sl;
+   nir_block *blk;
+   bool ok;
+};
+
+static bool
+tune_branch_src(nir_src *src, void *data)
+{
+   struct tune_branch_state *st = (struct tune_branch_state *)data;
+   nir_instr *d = nir_def_instr(src->ssa);
+   if (d->block == st->blk)
+      st->ok = tune_branch_slice(st->sl, st->blk, d);
+   else if (tune_block_in_if(d->block, st->sl->nif))
+      st->ok = false;
+   return st->ok;
+}
+
+static bool
+tune_branch_slice(struct tune_slice *sl, nir_block *blk, nir_instr *instr)
+{
+   if (_mesa_set_search(sl->seen, instr))
+      return true;
+   switch (instr->type) {
+   case nir_instr_type_alu:
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      break;
+   case nir_instr_type_intrinsic:
+      if (!tune_movable_intrinsic(nir_instr_as_intrinsic(instr)))
+         return false;
+      break;
+   default:
+      return false;
+   }
+   _mesa_set_add(sl->seen, instr);
+   struct tune_branch_state st = { sl, blk, true };
+   nir_foreach_src(instr, tune_branch_src, &st);
+   bool ok = st.ok;
+   if (ok)
+      util_dynarray_append(&sl->branch, instr);
+   return ok;
+}
+
+static bool
+tune_slice_phi(struct tune_slice *sl, nir_phi_instr *phi)
+{
+   nir_if *nif = sl->nif;
+   if (!nif || phi->instr.block != sl->block ||
+       nir_if_first_then_block(nif) != nir_if_last_then_block(nif) ||
+       nir_if_first_else_block(nif) != nir_if_last_else_block(nif) ||
+       nif->condition.ssa->bit_size != 1)
+      return false;
+   if (_mesa_set_search(sl->seen, &phi->instr))
+      return true;
+   nir_foreach_phi_src(ps, phi) {
+      nir_instr *d = nir_def_instr(ps->src.ssa);
+      if (!tune_block_in_if(d->block, nif))
+         continue;
+      if (d->block != ps->pred || !tune_branch_slice(sl, d->block, d))
+         return false;
+   }
+   _mesa_set_add(sl->seen, &phi->instr);
+   util_dynarray_append(&sl->phis, phi);
+   return true;
+}
+
+static bool tune_slice_add(struct tune_slice *sl, nir_instr *instr);
+
+static bool
+tune_slice_src(nir_src *src, void *data)
+{
+   struct tune_slice *sl = (struct tune_slice *)data;
+   nir_instr *def = nir_def_instr(src->ssa);
+   if (def->block != sl->block)
+      return true; /* defined before the if (or in an outer block) */
+   if (def->type == nir_instr_type_phi) {
+      if (!tune_slice_phi(sl, nir_instr_as_phi(def)))
+         sl->ok = false;
+      return sl->ok;
+   }
+   if (!tune_slice_add(sl, def))
+      sl->ok = false;
+   return sl->ok;
+}
+
+static bool
+tune_slice_add(struct tune_slice *sl, nir_instr *instr)
+{
+   if (_mesa_set_search(sl->seen, instr))
+      return true;
+   switch (instr->type) {
+   case nir_instr_type_alu:
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      break;
+   case nir_instr_type_intrinsic:
+      if (!tune_movable_intrinsic(nir_instr_as_intrinsic(instr))) {
+         if (getenv("IR3_TUNE_DEBUG")) {
+            nir_print_instr(instr, stderr); fprintf(stderr, "  <- reject intrinsic\n");
+         }
+         return false;
+      }
+      break;
+   case nir_instr_type_tex:
+      if (!tune_movable_tex(nir_instr_as_tex(instr))) {
+         if (getenv("IR3_TUNE_DEBUG")) {
+            nir_print_instr(instr, stderr); fprintf(stderr, "  <- reject tex op\n");
+         }
+         return false;
+      }
+      sl->tex++;
+      break;
+   default:
+      if (getenv("IR3_TUNE_DEBUG")) {
+         mesa_logi("tune: reject instr type %d", instr->type);
+         nir_print_instr(instr, stderr); fprintf(stderr, "\n");
+      }
+      return false; /* phis, jumps, stores, ... */
+   }
+   _mesa_set_add(sl->seen, instr);
+   nir_foreach_src(instr, tune_slice_src, sl);
+   if (!sl->ok)
+      return false;
+   util_dynarray_append(&sl->instrs, instr);
+   return true;
+}
+
+static int
+tune_instr_index_cmp(const void *a, const void *b)
+{
+   const nir_instr *ia = *(const nir_instr *const *)a;
+   const nir_instr *ib = *(const nir_instr *const *)b;
+   return ia->index < ib->index ? -1 : ia->index > ib->index;
+}
+
+/* Try to move every eligible tex of the block after `nif` (and its slice)
+ * to the end of the block before it. Returns the number of tex moved.
+ */
+static unsigned
+tune_hoist_over_if(nir_if *nif, unsigned max_tex)
+{
+   nir_cf_node *next = nir_cf_node_next(&nif->cf_node);
+   nir_cf_node *prev = nir_cf_node_prev(&nif->cf_node);
+   if (!next || !prev || next->type != nir_cf_node_block ||
+       prev->type != nir_cf_node_block)
+      return 0;
+   nir_block *after = nir_cf_node_as_block(next);
+   nir_block *before = nir_cf_node_as_block(prev);
+
+   unsigned moved = 0;
+   nir_foreach_instr_safe(instr, after) {
+      if (moved >= max_tex)
+         break;
+      if (instr->type != nir_instr_type_tex ||
+          !tune_movable_tex(nir_instr_as_tex(instr)))
+         continue;
+
+      struct tune_slice sl = { .block = after, .nif = nif, .ok = true };
+      util_dynarray_init(&sl.instrs, NULL);
+      util_dynarray_init(&sl.branch, NULL);
+      util_dynarray_init(&sl.phis, NULL);
+      sl.seen = _mesa_pointer_set_create(NULL);
+      bool ok = tune_slice_add(&sl, instr) && sl.ok;
+      if (ok) {
+         /* 1. pure branch ALU feeding converted phis */
+         unsigned nb = util_dynarray_num_elements(&sl.branch, nir_instr *);
+         nir_instr **br = util_dynarray_begin(&sl.branch);
+         qsort(br, nb, sizeof(*br), tune_instr_index_cmp);
+         for (unsigned i = 0; i < nb; i++)
+            nir_instr_move(nir_after_block(before), br[i]);
+         /* 2. phi -> bcsel(cond, then, else) */
+         util_dynarray_foreach(&sl.phis, nir_phi_instr *, pp) {
+            nir_phi_instr *phi = *pp;
+            nir_def *tv = NULL, *ev = NULL;
+            nir_foreach_phi_src(ps, phi) {
+               if (ps->pred == nir_if_last_then_block(nif))
+                  tv = ps->src.ssa;
+               else
+                  ev = ps->src.ssa;
+            }
+            nir_builder b = nir_builder_at(nir_after_block(before));
+            nir_def *sel = nir_bcsel(&b, nif->condition.ssa, tv, ev);
+            nir_def_rewrite_uses(&phi->def, sel);
+            nir_instr_remove(&phi->instr);
+         }
+         /* 3. the sample slice */
+         unsigned n = util_dynarray_num_elements(&sl.instrs, nir_instr *);
+         nir_instr **arr = util_dynarray_begin(&sl.instrs);
+         qsort(arr, n, sizeof(*arr), tune_instr_index_cmp);
+         for (unsigned i = 0; i < n; i++)
+            nir_instr_move(nir_after_block(before), arr[i]);
+         moved += sl.tex;
+      }
+      util_dynarray_fini(&sl.instrs);
+      util_dynarray_fini(&sl.branch);
+      util_dynarray_fini(&sl.phis);
+      _mesa_set_destroy(sl.seen, NULL);
+   }
+   return moved;
+}
+
+static bool
+tune_hoist_cf_list(struct exec_list *list, unsigned *total)
+{
+   bool progress = false;
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= tune_hoist_cf_list(&nif->then_list, total);
+         progress |= tune_hoist_cf_list(&nif->else_list, total);
+         break;
+      }
+      case nir_cf_node_loop:
+         progress |= tune_hoist_cf_list(&nir_cf_node_as_loop(node)->body,
+                                        total);
+         break;
+      default:
+         break;
+      }
+   }
+   /* Walk the ifs of this list bottom-up so a sample can climb over several
+    * consecutive diamonds: after it lands in the block before an if, that
+    * block is the "after" block of the previous if.
+    */
+   for (unsigned pass = 0; pass < 4; pass++) {
+      bool any = false;
+      foreach_list_typed_reverse(nir_cf_node, node, node, list) {
+         if (node->type != nir_cf_node_if)
+            continue;
+         nir_index_instrs(nir_cf_node_get_function(node));
+         unsigned n = tune_hoist_over_if(nir_cf_node_as_if(node), 8);
+         if (n) {
+            *total += n;
+            any = progress = true;
+         }
+      }
+      if (!any)
+         break;
+   }
+   return progress;
+}
+
+static bool
+ir3_nir_tune_tex_hoist(nir_shader *s, unsigned *total)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, s) {
+      if (tune_hoist_cf_list(&impl->body, total))
+         progress = true;
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
+/* tex_lod: sampler handle = bindless_resource_ir3(iadd(x, K)); K is the
+ * sampler's constant heap offset (vkd3d table base + register).
+ */
+static bool
+tune_tex_samp_off(nir_tex_instr *tex, unsigned *off)
+{
+   int idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle);
+   if (idx < 0)
+      return false;
+   nir_instr *p = nir_def_instr(tex->src[idx].src.ssa);
+   if (p->type != nir_instr_type_intrinsic ||
+       nir_instr_as_intrinsic(p)->intrinsic != nir_intrinsic_bindless_resource_ir3)
+      return false;
+   nir_scalar sc = nir_scalar_resolved(nir_instr_as_intrinsic(p)->src[0].ssa, 0);
+   if (nir_scalar_is_const(sc)) {
+      *off = nir_scalar_as_uint(sc);
+      return true;
+   }
+   if (!nir_scalar_is_alu(sc) || nir_scalar_alu_op(sc) != nir_op_iadd)
+      return false;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar c = nir_scalar_chase_alu_src(sc, i);
+      if (nir_scalar_is_const(c)) {
+         *off = nir_scalar_as_uint(c);
+         return true;
+      }
+   }
+   return false;
+}
+
+static bool
+tune_tex_lod_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   const struct ir3_shader_options *o = (const struct ir3_shader_options *)data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->op != nir_texop_txl)
+      return false;
+   unsigned off;
+   if (!tune_tex_samp_off(tex, &off) || off != o->tex_lod_samp_off)
+      return false;
+   int li = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   if (li < 0)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *lod = tex->src[li].src.ssa;
+   if (o->tex_lod_bias_halves)
+      lod = nir_fadd(b, lod, nir_imm_floatN_t(b, 0.5 * o->tex_lod_bias_halves,
+                                              lod->bit_size));
+   if (o->tex_lod_round)
+      lod = nir_ffloor(b, nir_fadd(b, lod, nir_imm_floatN_t(b, 0.5, lod->bit_size)));
+   nir_src_rewrite(&tex->src[li].src, lod);
+   return true;
+}
+
 void
 ir3_nir_lower_variant(struct ir3_shader_variant *so,
                       const struct ir3_shader_nir_options *options,
@@ -1780,6 +2155,20 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
       OPT(s, nir_opt_copy_prop);
       OPT(s, nir_opt_dce);
       OPT(s, nir_opt_cse);
+   }
+
+   if (so->shader_options.tex_lod_round || so->shader_options.tex_lod_bias_halves) {
+      bool p = false;
+      NIR_PASS(p, s, nir_shader_instructions_pass, tune_tex_lod_instr,
+               nir_metadata_control_flow, (void *)&so->shader_options);
+      if (p)
+         OPT(s, nir_opt_algebraic);
+   }
+
+   if (so->shader_options.tex_hoist) {
+      unsigned hoisted = 0;
+      NIR_PASS(_, s, ir3_nir_tune_tex_hoist, &hoisted);
+      so->tune_tex_hoisted = hoisted;
    }
 
    OPT(s, nir_opt_sink, nir_move_const_undef);

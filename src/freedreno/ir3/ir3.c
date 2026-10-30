@@ -637,7 +637,8 @@ ir3_collect_info(struct ir3_shader_variant *v)
       info->max_reg = MAX2(info->max_reg, min_reg_count - 1);
 
    unsigned target_regs = v->shader_options.target_full_regs;
-   if (target_regs > regs_count && target_regs <= 48 &&
+   if (!v->shader_options.target_full_regs_cap &&
+       target_regs > regs_count && target_regs <= 48 &&
        target_regs * (info->double_threadsize ? 2 : 1) <=
           compiler->reg_size_vec4 &&
        (!ir3_shader_compute(v) || !v->has_barrier ||

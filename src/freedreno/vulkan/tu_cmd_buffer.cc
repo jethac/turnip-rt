@@ -10473,6 +10473,30 @@ tu_emit_compute_driver_params(struct tu_cmd_buffer *cmd,
    }
 }
 
+/* TU_IR3_TUNE "icache": the SP_CHICKEN_BITS_2 value tu_init_hw() writes,
+ * with INDEPENDENT_ICACHE_MISS forced on when `on`. Returns false when the
+ * GPU has no such bit or no magic value for the register.
+ */
+static bool
+tu_tune_chicken_bits_2(const struct tu_physical_device *phys_dev,
+                       bool drirc_on, bool on, uint32_t *value)
+{
+   if (!phys_dev->info->props.has_independent_icache_miss)
+      return false;
+   for (size_t i = 0; i < ARRAY_SIZE(phys_dev->info->magic_raw); i++) {
+      auto magic_reg = phys_dev->info->magic_raw[i];
+      if (!magic_reg.reg)
+         break;
+      if (magic_reg.reg != REG_A7XX_SP_CHICKEN_BITS_2)
+         continue;
+      *value = magic_reg.value;
+      if (drirc_on || on)
+         *value |= A7XX_SP_CHICKEN_BITS_2_INDEPENDENT_ICACHE_MISS;
+      return true;
+   }
+   return false;
+}
+
 template <chip CHIP>
 static void
 tu_dispatch(struct tu_cmd_buffer *cmd,
@@ -10540,6 +10564,23 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
       memcpy(prefix, shader->variant->blake3_str, 8);
       prefix[8] = 0;
       tu_emit_hang_tag<CHIP>(cs, (uint32_t) strtoul(prefix, NULL, 16));
+   }
+
+   uint32_t tune_icache_restore = 0;
+   bool tune_icache = false;
+   if (CHIP == A7XX && unlikely(shader->ir3_tune_icache)) {
+      const bool drirc_on =
+         cmd->device->instance->drirc.perf.independent_icache_miss;
+      uint32_t on_value;
+      if (!drirc_on &&
+          tu_tune_chicken_bits_2(cmd->device->physical_device, drirc_on, true,
+                                 &on_value) &&
+          tu_tune_chicken_bits_2(cmd->device->physical_device, drirc_on,
+                                 false, &tune_icache_restore)) {
+         tune_icache = true;
+         tu_cs_emit_wfi(cs);
+         tu_cs_emit_write_reg(cs, REG_A7XX_SP_CHICKEN_BITS_2, on_value);
+      }
    }
 
    /* note: no reason to have this in a separate IB */
@@ -10758,6 +10799,12 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
     * did. We don't need to reset the register because it will be re-emitted
     * anyway when the next renderpass starts.
     */
+   if (tune_icache) {
+      tu_cs_emit_wfi(cs);
+      tu_cs_emit_write_reg(cs, REG_A7XX_SP_CHICKEN_BITS_2,
+                           tune_icache_restore);
+   }
+
    if (emit_instrlen_workaround) {
       tu_emit_event_write<CHIP>(cmd, cs, FD_LABEL);
 
