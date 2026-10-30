@@ -5018,7 +5018,7 @@ struct tu_hotswap_gfx_data {
    const VkGraphicsPipelineCreateInfo *ci;
    VkPipelineCreateFlags2KHR flags;
    const VkAllocationCallbacks *alloc;
-   uint32_t fs_index;
+   uint32_t stage_index;
 };
 
 template <chip CHIP>
@@ -5033,7 +5033,7 @@ tu_hotswap_gfx_create(void *data, VkShaderModule module, VkPipeline *out)
    if (!stages)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    memcpy(stages, ci.pStages, sizeof(*stages) * ci.stageCount);
-   stages[d->fs_index].module = module;
+   stages[d->stage_index].module = module;
    ci.pStages = stages;
    ci.flags &= ~(VkPipelineCreateFlags) tu_hotswap_strip_flags;
    ci.basePipelineHandle = VK_NULL_HANDLE;
@@ -5046,6 +5046,36 @@ tu_hotswap_gfx_create(void *data, VkShaderModule module, VkPipeline *out)
 }
 
 template <chip CHIP>
+static VkResult
+tu_hotswap_link_create(void *data, unsigned lib_index, VkPipeline lib_variant,
+                       VkPipeline *out)
+{
+   const struct tu_hotswap_gfx_data<CHIP> *d =
+      (const struct tu_hotswap_gfx_data<CHIP> *) data;
+   VkGraphicsPipelineCreateInfo ci = *d->ci;
+   const VkPipelineLibraryCreateInfoKHR *libs =
+      vk_find_struct_const(ci.pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR);
+   VkPipeline handles[MAX_LIBRARIES];
+   if (!libs || libs->libraryCount > MAX_LIBRARIES || lib_index >= libs->libraryCount)
+      return VK_ERROR_UNKNOWN;
+   memcpy(handles, libs->pLibraries, sizeof(VkPipeline) * libs->libraryCount);
+   handles[lib_index] = lib_variant;
+   /* Prepended: tu_graphics_pipeline_create finds the first library
+    * struct in the chain, so the app's own struct is shadowed.
+    */
+   VkPipelineLibraryCreateInfoKHR lci = *libs;
+   lci.pLibraries = handles;
+   lci.pNext = ci.pNext;
+   ci.pNext = &lci;
+   ci.flags &= ~(VkPipelineCreateFlags) tu_hotswap_strip_flags;
+   ci.basePipelineHandle = VK_NULL_HANDLE;
+   ci.basePipelineIndex = -1;
+   return tu_graphics_pipeline_create<CHIP>(
+      d->device, VK_NULL_HANDLE, &ci, d->flags & ~tu_hotswap_strip_flags,
+      d->alloc, out);
+}
+
+template <chip CHIP>
 static void
 tu_hotswap_graphics(VkDevice device, const VkGraphicsPipelineCreateInfo *ci,
                     VkPipelineCreateFlags2KHR flags,
@@ -5054,19 +5084,40 @@ tu_hotswap_graphics(VkDevice device, const VkGraphicsPipelineCreateInfo *ci,
    VK_FROM_HANDLE(tu_device, dev, device);
    VK_FROM_HANDLE(tu_pipeline, pipeline, handle);
    VK_FROM_HANDLE(tu_pipeline_layout, layout, ci->layout);
-   if (!pipeline || pipeline->type != TU_PIPELINE_GRAPHICS ||
-       (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR))
+   bool is_lib = flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR;
+   if (!pipeline ||
+       pipeline->type != (is_lib ? TU_PIPELINE_GRAPHICS_LIB : TU_PIPELINE_GRAPHICS))
       return;
    for (uint32_t s = 0; s < ci->stageCount; s++) {
-      if (ci->pStages[s].stage != VK_SHADER_STAGE_FRAGMENT_BIT)
+      mesa_shader_stage st;
+      if (ci->pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+         st = MESA_SHADER_FRAGMENT;
+      else if (ci->pStages[s].stage == VK_SHADER_STAGE_VERTEX_BIT)
+         st = MESA_SHADER_VERTEX;
+      else
          continue;
-      int target = tu_hotswap_match(&ci->pStages[s], MESA_SHADER_FRAGMENT);
+      int target = tu_hotswap_match(&ci->pStages[s], st);
       if (target < 0)
-         return;
+         continue;
       struct tu_hotswap_gfx_data<CHIP> d = { device, ci, flags, alloc, s };
       tu_hotswap_build(dev, pipeline, target, &ci->pStages[s],
-                       MESA_SHADER_FRAGMENT, layout, ci->pNext, alloc,
+                       st, layout, ci->pNext, alloc,
                        tu_hotswap_gfx_create<CHIP>, &d);
+      return;
+   }
+   if (is_lib)
+      return;
+   const VkPipelineLibraryCreateInfoKHR *libs =
+      vk_find_struct_const(ci->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR);
+   if (!libs)
+      return;
+   for (uint32_t i = 0; i < libs->libraryCount; i++) {
+      VK_FROM_HANDLE(tu_pipeline, lib, libs->pLibraries[i]);
+      if (!lib || !lib->hotswap)
+         continue;
+      struct tu_hotswap_gfx_data<CHIP> d = { device, ci, flags, alloc, i };
+      tu_hotswap_build_linked(dev, pipeline, lib, i, alloc,
+                              tu_hotswap_link_create<CHIP>, &d);
       return;
    }
 }

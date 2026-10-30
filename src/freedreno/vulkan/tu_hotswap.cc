@@ -227,6 +227,8 @@ hs_load_manifest(const char *path)
                t.stage = MESA_SHADER_COMPUTE;
             else if (!strcmp(tok[i], "stage=fs"))
                t.stage = MESA_SHADER_FRAGMENT;
+            else if (!strcmp(tok[i], "stage=vs"))
+               t.stage = MESA_SHADER_VERTEX;
             else if (!strcmp(tok[i], "iface=strict"))
                t.relaxed = false;
             else if (!strcmp(tok[i], "iface=relaxed"))
@@ -411,6 +413,8 @@ tu_hotswap_match(const VkPipelineShaderStageCreateInfo *stage,
       const hs_target &t = hs.targets[i];
       if (t.stage >= 0 && t.stage != (int) st)
          continue;
+      if (st == MESA_SHADER_VERTEX && t.stage != MESA_SHADER_VERTEX)
+         continue;
       if (t.by_src ? src == t.hash : (dxil && dxil == t.hash))
          return (int) i;
    }
@@ -570,7 +574,8 @@ hs_extract(const uint32_t *w, size_t size, const char *entry, mesa_shader_stage 
    hs_spirv s;
    s.w = w;
    s.n = n;
-   uint32_t want_model = st == MESA_SHADER_COMPUTE ? 5 : 4;
+   uint32_t want_model = st == MESA_SHADER_COMPUTE ? 5 :
+                         st == MESA_SHADER_VERTEX ? 0 : 4;
    uint32_t entry_id = 0;
    std::vector<size_t> modes, vars;
    for (size_t i = 5; i < n;) {
@@ -673,7 +678,8 @@ hs_extract(const uint32_t *w, size_t size, const char *entry, mesa_shader_stage 
          r.push = sig;
          continue;
       }
-      if (st == MESA_SHADER_FRAGMENT && (sc == 1 || sc == 3)) {
+      if ((st == MESA_SHADER_FRAGMENT || st == MESA_SHADER_VERTEX) &&
+          (sc == 1 || sc == 3)) {
          bool fl, fc, fbi, fi;
          uint32_t loc = hs_deco(s, id, 30, &fl);
          uint32_t comp = hs_deco(s, id, 31, &fc);
@@ -685,6 +691,8 @@ hs_extract(const uint32_t *w, size_t size, const char *entry, mesa_shader_stage 
          else if (fl)
             key = "loc" + std::to_string(loc) + "c" + std::to_string(fc ? comp : 0) +
                   "i" + std::to_string(fi ? idx : 0);
+         else if (st == MESA_SHADER_VERTEX)
+            key = "block:" + sig;
          else
             key = "block" + std::to_string(id);
          (sc == 1 ? r.in : r.out)[key] = sig;
@@ -776,6 +784,21 @@ hs_check(const hs_iface &b, const hs_iface &a, const struct tu_pipeline_layout *
          return false;
       }
    }
+   if (st == MESA_SHADER_VERTEX) {
+      if (a.out != b.out) {
+         reason = "vertex outputs differ";
+         return false;
+      }
+      for (auto &e : a.in) {
+         auto bi = b.in.find(e.first);
+         if (bi == b.in.end() || bi->second != e.second) {
+            reason = "vertex input not in original: " + e.first;
+            return false;
+         }
+      }
+      if (a.in.size() != b.in.size())
+         exact = false;
+   }
    *mode = exact ? "exact" : (relaxed ? "relaxed" : "subset");
    return true;
 }
@@ -793,7 +816,8 @@ hs_poison(int target, unsigned k)
 static const char *
 hs_stage_name(mesa_shader_stage st)
 {
-   return st == MESA_SHADER_COMPUTE ? "cs" : "fs";
+   return st == MESA_SHADER_COMPUTE ? "cs" :
+          st == MESA_SHADER_VERTEX ? "vs" : "fs";
 }
 
 void
@@ -884,8 +908,12 @@ tu_hotswap_build(struct tu_device *dev, struct tu_pipeline *base, int target,
                         bc->local_size[0], bc->local_size[1], bc->local_size[2]);
                reason = b;
             }
+         } else if (base->type == TU_PIPELINE_GRAPHICS_LIB) {
+            if (vp->type != TU_PIPELINE_GRAPHICS_LIB ||
+                (!vp->shaders[st] && !tu_pipeline_to_graphics_lib(vp)->shaders[st].nir))
+               reason = std::string("variant library has no ") + hs_stage_name(st) + " shader";
          } else if (vp->type != TU_PIPELINE_GRAPHICS || !vp->shaders[st]) {
-            reason = "variant has no fragment shader";
+            reason = std::string("variant has no ") + hs_stage_name(st) + " shader";
          }
          if (!reason.empty()) {
             tu_DestroyPipeline(tu_device_to_handle(dev), var, alloc);
@@ -924,8 +952,81 @@ tu_hotswap_build(struct tu_device *dev, struct tu_pipeline *base, int target,
 
    simple_mtx_lock(&hs_mtx);
    t.pipelines++;
-   mesa_logi("tu-hotswap: armed target=%s pipeline=%p base_bin=%.12s accepted=%u refused=%u",
-             t.label.c_str(), (void *) base, base_bin, accepted, refused);
+   if (base->type == TU_PIPELINE_GRAPHICS_LIB)
+      mesa_logi("tu-hotswap: armed target=%s library=%p stage=%s base_bin=%.12s accepted=%u refused=%u",
+                t.label.c_str(), (void *) base, hs_stage_name(st), base_bin, accepted, refused);
+   else
+      mesa_logi("tu-hotswap: armed target=%s pipeline=%p base_bin=%.12s accepted=%u refused=%u",
+                t.label.c_str(), (void *) base, base_bin, accepted, refused);
+   simple_mtx_unlock(&hs_mtx);
+   base->hotswap = hp;
+}
+
+void
+tu_hotswap_build_linked(struct tu_device *dev, struct tu_pipeline *base,
+                        const struct tu_pipeline *lib, unsigned lib_index,
+                        const VkAllocationCallbacks *alloc,
+                        tu_hotswap_link_cb create, void *data)
+{
+   const struct tu_hotswap_pipe *lp = lib->hotswap;
+   if (!lp || !base || base->hotswap)
+      return;
+   hs_target &t = hs.targets[lp->target];
+   struct tu_hotswap_pipe *hp = (struct tu_hotswap_pipe *)
+      vk_zalloc2(&dev->vk.alloc, alloc, sizeof(*hp), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!hp)
+      return;
+   hp->target = lp->target;
+   hp->dxil = lp->dxil;
+   hp->alias = lp->alias;
+   mesa_shader_stage st = t.stage == MESA_SHADER_VERTEX ? MESA_SHADER_VERTEX :
+                          MESA_SHADER_FRAGMENT;
+   const char *base_bin = base->shaders[st] && base->shaders[st]->variant ?
+                          base->shaders[st]->variant->blake3_str : "none";
+   unsigned accepted = util_bitcount(hp->alias), refused = 0;
+   for (unsigned k = 1; k < HS_MAXV; k++) {
+      if (!lp->variant[k])
+         continue;
+      VkPipeline var = VK_NULL_HANDLE;
+      VkResult r = create(data, lib_index, lp->variant[k], &var);
+      std::string reason;
+      if (r != VK_SUCCESS || !var) {
+         reason = "linked variant creation failed (" + std::to_string((int) r) + ")";
+         var = VK_NULL_HANDLE;
+      } else {
+         VK_FROM_HANDLE(tu_pipeline, vp, var);
+         if (vp->type != TU_PIPELINE_GRAPHICS || !vp->shaders[st]) {
+            reason = std::string("linked variant has no ") + hs_stage_name(st) + " shader";
+            tu_DestroyPipeline(tu_device_to_handle(dev), var, alloc);
+            var = VK_NULL_HANDLE;
+         }
+      }
+      simple_mtx_lock(&hs_mtx);
+      if (var) {
+         VK_FROM_HANDLE(tu_pipeline, vp, var);
+         hp->variant[k] = var;
+         t.accepted[k]++;
+         accepted++;
+         mesa_logi("tu-hotswap: create target=%s stage=%s dxil=%016" PRIx64
+                   " pipeline=%p base_bin=%.12s variant=%u name=%s bin=%.12s iface=linked library=%p",
+                   t.label.c_str(), hs_stage_name(st), hp->dxil, (void *) base,
+                   base_bin, k, t.alt[k].name.c_str(),
+                   vp->shaders[st]->variant ? vp->shaders[st]->variant->blake3_str : "none",
+                   (void *) lib);
+      } else {
+         refused++;
+         hs_poison(lp->target, k);
+         mesa_loge("tu-hotswap: refuse target=%s stage=%s dxil=%016" PRIx64
+                   " pipeline=%p variant=%u name=%s reason=%s",
+                   t.label.c_str(), hs_stage_name(st), hp->dxil, (void *) base, k,
+                   t.alt[k].name.c_str(), reason.c_str());
+      }
+      simple_mtx_unlock(&hs_mtx);
+   }
+   simple_mtx_lock(&hs_mtx);
+   t.pipelines++;
+   mesa_logi("tu-hotswap: armed target=%s pipeline=%p base_bin=%.12s accepted=%u refused=%u linked_from=%p",
+             t.label.c_str(), (void *) base, base_bin, accepted, refused, (void *) lib);
    simple_mtx_unlock(&hs_mtx);
    base->hotswap = hp;
 }
