@@ -756,7 +756,7 @@ Khronos extensions that are not part of any Vulkan version:
   VK_QCOM_fragment_density_map_offset                   DONE (tu)
   VK_QCOM_image_processing                              DONE (tu)
   VK_QCOM_multiview_per_view_render_areas               DONE (tu)
-  VK_QCOM_multiview_per_view_viewports                  DONE (tu)
+  VK_QCOM_multiview_per_view_viewports                  DONE (lvp, tu)
   VK_QCOM_render_pass_shader_resolve                    DONE (tu)
   VK_QCOM_rotated_copy_commands                         DONE (tu)
   VK_VALVE_fragment_density_map_layered                 DONE (tu)

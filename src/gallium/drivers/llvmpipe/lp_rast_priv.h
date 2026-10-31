@@ -178,6 +178,10 @@ lp_rast_get_color_block_pointer(struct lp_rasterizer_task *task,
                            py * task->scene->cbufs[buf].stride;
    uint8_t *color = task->color_tiles[buf] + pixel_offset;
 
+   /* same-layer multiview: the view index does not select a layer */
+   if (task->scene->fb.viewmask_same_layer)
+      view_index = 0;
+
    if (layer || view_index) {
       assert(layer <= task->scene->fb_max_layer);
       color += (layer + view_index) * task->scene->cbufs[buf].layer_stride;
@@ -208,6 +212,9 @@ lp_rast_get_depth_block_pointer(struct lp_rasterizer_task *task,
    unsigned pixel_offset = px * task->scene->zsbuf.format_bytes +
                            py * task->scene->zsbuf.stride;
    uint8_t *depth = task->depth_tile + pixel_offset;
+
+   if (task->scene->fb.viewmask_same_layer)
+      view_index = 0;
 
    if (layer || view_index) {
       depth += (layer + view_index) * task->scene->zsbuf.layer_stride;

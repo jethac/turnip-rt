@@ -43,6 +43,8 @@
 #include "util/os_file.h"
 #include "util/os_memory.h"
 #include "util/os_time.h"
+#include "util/os_misc.h"
+#include "util/log.h"
 #include "util/u_thread.h"
 #include "util/u_atomic.h"
 #include "util/timespec.h"
@@ -338,6 +340,7 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .GOOGLE_hlsl_functionality1            = true,
    .GOOGLE_user_type                      = true,
    .NV_cooperative_matrix2                = true,
+   .QCOM_multiview_per_view_viewports     = true,
 };
 
 static bool
@@ -643,6 +646,9 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
 
       /* VK_EXT_mutable_descriptor_type */
       .mutableDescriptorType = true,
+
+      /* VK_QCOM_multiview_per_view_viewports */
+      .multiviewPerViewViewports = true,
 
       /* VK_EXT_vertex_input_dynamic_state */
       .vertexInputDynamicState = true,
@@ -1976,6 +1982,25 @@ lvp_queue_finish(struct lvp_queue *queue)
    queue->ctx->destroy(queue->ctx);
 }
 
+/* LVP_MULTIVIEW_SAME_LAYER mirrors turnip's TU_MULTIVIEW_SAME_LAYER: unset,
+ * empty or "0" is off; any other value ("1", "sysmem") is on. lavapipe has
+ * no GMEM, so "sysmem" is accepted as a synonym for "1".
+ */
+static bool
+lvp_multiview_same_layer_mode(void)
+{
+   static int mode = -1;
+   int m = p_atomic_read(&mode);
+   if (m < 0) {
+      const char *e = os_get_option("LVP_MULTIVIEW_SAME_LAYER");
+      m = (e && *e && strcmp(e, "0")) ? 1 : 0;
+      if (m)
+         mesa_logi("lvp-mv-same-layer: on (%s)", e);
+      p_atomic_set(&mode, m);
+   }
+   return m;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateDevice(
    VkPhysicalDevice                            physicalDevice,
    const VkDeviceCreateInfo*                   pCreateInfo,
@@ -1999,6 +2024,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateDevice(
       device->queue[i].state = (char *)(device + 1) + state_size * i;
    device->poison_mem = debug_get_bool_option("LVP_POISON_MEMORY", false);
    device->print_cmds = debug_get_bool_option("LVP_CMD_DEBUG", false);
+   device->multiview_same_layer = lvp_multiview_same_layer_mode();
 
    struct vk_device_dispatch_table dispatch_table;
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,

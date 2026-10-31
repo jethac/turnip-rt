@@ -1387,6 +1387,18 @@ LLVMpipe driver environment variables
 
    Currently not available on Windows.
 
+.. envvar:: LVP_MULTIVIEW_SAME_LAYER
+
+   if set to anything other than ``0``, every view of a lavapipe multiview
+   render pass renders into the bound layer of its attachments instead of
+   layer base + view index, and view ``i`` uses viewport and scissor ``i``
+   (as with ``VK_QCOM_multiview_per_view_viewports``, even when that feature
+   is not enabled). Loads, clears, resolves and queries treat such a pass
+   as a single layer, so a query marks one slot, not one per view. This
+   allows a ``viewMask`` wider than the layer count of the attachments,
+   which is not valid Vulkan, and is meant for side-by-side stereo testing. It mirrors
+   turnip's ``TU_MULTIVIEW_SAME_LAYER``; ``sysmem`` is accepted as ``1``.
+
 VMware SVGA driver environment variables
 ----------------------------------------
 

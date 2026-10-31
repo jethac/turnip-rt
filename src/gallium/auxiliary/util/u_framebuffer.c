@@ -79,6 +79,9 @@ util_framebuffer_state_equal(const struct pipe_framebuffer_state *dst,
    if (dst->viewmask != src->viewmask)
       return false;
 
+   if (dst->viewmask_same_layer != src->viewmask_same_layer)
+      return false;
+
    if (dst->pls_enabled != src->pls_enabled)
       return false;
 
@@ -121,6 +124,7 @@ util_copy_framebuffer_state(struct pipe_framebuffer_state *dst,
       dst->downscale_cbufs = src->downscale_cbufs;
 
       dst->viewmask = src->viewmask;
+      dst->viewmask_same_layer = src->viewmask_same_layer;
       pipe_resource_reference(&dst->zsbuf.texture, src->zsbuf.texture);
       dst->zsbuf = src->zsbuf;
       pipe_resource_reference(&dst->resolve, src->resolve);
