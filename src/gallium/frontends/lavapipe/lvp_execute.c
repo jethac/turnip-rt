@@ -2039,7 +2039,7 @@ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
       render_clear_fast(state);
 }
 
-static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
+static void handle_end_rendering_impl(struct vk_cmd_queue_entry *cmd,
                                  struct rendering_state *state)
 {
    if (state->suspending)
@@ -2100,6 +2100,29 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
                                           false);
       }
    }
+}
+
+/* The view mask belongs to the render pass instance: queries and timestamps recorded after
+ * vkCmdEndRendering must use one slot (stale viewmask overran pool->queries[]). */
+static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
+                                 struct rendering_state *state)
+{
+   handle_end_rendering_impl(cmd, state);
+   if (!state->suspending) {
+      state->framebuffer.viewmask = 0;
+      state->framebuffer.viewmask_same_layer = false;
+   }
+}
+
+/* Query slots used by a query/timestamp: N for a layered multiview pass, 1 otherwise. With
+ * LVP_MULTIVIEW_SAME_LAYER both views run in one draw into one layer, so one slot holds the full
+ * result (same contract as the Turnip TU_MULTIVIEW_SAME_LAYER child). */
+static uint32_t
+query_slot_count(const struct rendering_state *state)
+{
+   if (!state->framebuffer.viewmask || state->framebuffer.viewmask_same_layer)
+      return 1;
+   return util_bitcount(state->framebuffer.viewmask);
 }
 
 static void
@@ -3250,7 +3273,7 @@ static void handle_begin_query(struct vk_cmd_queue_entry *cmd,
 
    emit_state(state);
 
-   uint32_t count = util_bitcount(state->framebuffer.viewmask ? state->framebuffer.viewmask : BITFIELD_BIT(0));
+   uint32_t count = query_slot_count(state);
    for (unsigned idx = 0; idx < count; idx++) {
       if (!pool->queries[qcmd->query + idx]) {
          enum pipe_query_type qtype = pool->base_type;
@@ -3287,7 +3310,7 @@ static void handle_begin_query_indexed_ext(struct vk_cmd_queue_entry *cmd,
 
    emit_state(state);
 
-   uint32_t count = util_bitcount(state->framebuffer.viewmask ? state->framebuffer.viewmask : BITFIELD_BIT(0));
+   uint32_t count = query_slot_count(state);
    for (unsigned idx = 0; idx < count; idx++) {
       if (!pool->queries[qcmd->query + idx]) {
          enum pipe_query_type qtype = pool->base_type;
@@ -3337,7 +3360,7 @@ static void handle_write_timestamp2(struct vk_cmd_queue_entry *cmd,
    if (!(qcmd->stage == VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT))
       state->pctx->flush(state->pctx, NULL, 0);
 
-   uint32_t count = util_bitcount(state->framebuffer.viewmask ? state->framebuffer.viewmask : BITFIELD_BIT(0));
+   uint32_t count = query_slot_count(state);
    for (unsigned idx = 0; idx < count; idx++) {
       if (!pool->queries[qcmd->query + idx]) {
          pool->queries[qcmd->query + idx] = state->pctx->create_query(state->pctx, PIPE_QUERY_TIMESTAMP, 0);
