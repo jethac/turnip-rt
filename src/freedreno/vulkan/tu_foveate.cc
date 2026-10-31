@@ -700,6 +700,11 @@ struct tu_vrs_cfg {
    uint32_t ps_log;
    uint32_t ps_dims[TU_VRS_MAX_DIMS][2];
    uint32_t ps_dims_count;
+   /* TU_VRS_APP_COMB=max: an app attachment combiner of MAX or MUL is
+    * treated like KEEP. The pass has no app rate attachment, so the app's
+    * attachment rate is 1x1 and both ops are the identity there.
+    */
+   bool app_comb_max;
 };
 
 static struct tu_vrs_cfg vrs_cfg;
@@ -736,6 +741,12 @@ static uint32_t vrs_stat_pass[TU_VRS_PASS_KINDS];
 static uint32_t vrs_stat_texels[3];
 static uint32_t vrs_stat_maps;
 static uint32_t vrs_stat_state[4]; /* injected, capped(discard), vetoed, app-nontrivial */
+/* App attachment combiner (op1) seen at the app-combiner check, by
+ * VkFragmentShadingRateCombinerOpKHR value 0..4, and how many MAX/MUL draws
+ * were accepted under TU_VRS_APP_COMB=max.
+ */
+static uint32_t vrs_stat_appop[5];
+static uint32_t vrs_stat_appop_accepted;
 /* PS-list decisions: allowlisted, denied, not listed (skipped), no DXIL hash
  * (skipped in allow mode), capped by an allowlist entry; depth-less passes
  * that received the gaze map.
@@ -975,6 +986,13 @@ tu_vrs_ps_init(void)
    }
    tu_vrs_parse_dims_into(os_get_option("TU_VRS_PS_DIMS"), vrs_cfg.ps_dims,
                           &vrs_cfg.ps_dims_count);
+   const char *comb = os_get_option("TU_VRS_APP_COMB");
+   if (comb && !strcmp(comb, "max"))
+      vrs_cfg.app_comb_max = true;
+   else if (comb && *comb && strcmp(comb, "keep"))
+      mesa_loge("tu-vrs: TU_VRS_APP_COMB=%s unknown (keep|max), using keep", comb);
+   if (comb && *comb)
+      mesa_logi("tu-vrs: app_comb=%s", vrs_cfg.app_comb_max ? "max" : "keep");
    vrs_cfg.ps_log = debug_get_num_option("TU_VRS_PS_LOG", 0);
    if (vrs_cfg.ps_error)
       mesa_loge("tu-vrs-ps: list/mode parse error: no draw will shade coarse");
@@ -1353,6 +1371,15 @@ tu_vrs_log_interval(struct tu_vrs_latch *l)
                 l->key, ps[VRS_PS_ALLOW], ps[VRS_PS_DENY], ps[VRS_PS_UNLISTED],
                 ps[VRS_PS_UNHASHED], ps[VRS_PS_CAPPED],
                 ps[VRS_PS_DEPTHLESS_PASS], vrs_cfg.ps_error);
+   }
+   {
+      uint32_t op[5];
+      for (unsigned i = 0; i < 5; i++)
+         op[i] = p_atomic_xchg(&vrs_stat_appop[i], 0);
+      uint32_t acc = p_atomic_xchg(&vrs_stat_appop_accepted, 0);
+      mesa_logi("tu-vrs-app: epoch=%" PRIu64 " op1 replace=%u min=%u max=%u mul=%u accepted=%u app_comb=%s",
+                l->key, op[1], op[2], op[3], op[4], acc,
+                vrs_cfg.app_comb_max ? "max" : "keep");
    }
    l->epochs = l->epochs_active = 0;
    l->age_sum_ns = l->age_max_ns = 0;
@@ -1763,10 +1790,21 @@ tu_vrs_pipeline_fsr(struct tu_shader *fs, uint32_t samples,
       p_atomic_inc(&vrs_stat_state[2]);
       return false;
    }
-   /* The app's own attachment combiner must be trivial (KEEP). */
-   if (fsr->combiner_ops[1] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR) {
-      p_atomic_inc(&vrs_stat_state[3]);
-      return false;
+   /* The app's own attachment combiner must be trivial (KEEP), or with
+    * TU_VRS_APP_COMB=max an identity op against the absent (1x1) app
+    * attachment: MAX or MUL.
+    */
+   VkFragmentShadingRateCombinerOpKHR op1 = fsr->combiner_ops[1];
+   if (op1 != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR) {
+      if ((unsigned) op1 < 5)
+         p_atomic_inc(&vrs_stat_appop[op1]);
+      if (!vrs_cfg.app_comb_max ||
+          (op1 != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR &&
+           op1 != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MUL_KHR)) {
+         p_atomic_inc(&vrs_stat_state[3]);
+         return false;
+      }
+      p_atomic_inc(&vrs_stat_appop_accepted);
    }
    if (v->has_kill || cap == 1) {
       /* Alpha-tested/masked, or an allowlist entry capped at 2x2: cap at 2x2
