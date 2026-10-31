@@ -2039,8 +2039,8 @@ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
       render_clear_fast(state);
 }
 
-static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
-                                 struct rendering_state *state)
+static void handle_end_rendering_impl(struct vk_cmd_queue_entry *cmd,
+                                      struct rendering_state *state)
 {
    if (state->suspending)
       return;
@@ -2099,6 +2099,19 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
                                           state->render_area.extent.height,
                                           false);
       }
+   }
+}
+
+/* The view mask belongs to the render pass instance: queries and timestamps
+ * recorded after vkCmdEndRendering use one slot, not the stale mask.
+ */
+static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
+                                 struct rendering_state *state)
+{
+   handle_end_rendering_impl(cmd, state);
+   if (!state->suspending) {
+      state->framebuffer.viewmask = 0;
+      state->framebuffer.viewmask_same_layer = false;
    }
 }
 
