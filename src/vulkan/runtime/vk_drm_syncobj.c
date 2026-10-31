@@ -618,6 +618,68 @@ vk_drm_syncobj_transfer_payloads(struct vk_device *device,
    }
 }
 
+VkResult
+vk_drm_syncobj_transfer(struct vk_device *device,
+                        struct vk_sync *dst, uint64_t dst_value,
+                        struct vk_sync *src, uint64_t src_value)
+{
+   int err = device->sync->transfer(device->sync,
+                                    to_drm_syncobj(dst)->syncobj, dst_value,
+                                    to_drm_syncobj(src)->syncobj, src_value, 0);
+   if (err)
+      return VK_ERROR_UNKNOWN;
+
+   return VK_SUCCESS;
+}
+
+VkResult
+vk_drm_syncobj_merge(struct vk_device *device, struct vk_sync *dst,
+                     uint32_t src_count, struct vk_sync *const *srcs)
+{
+   VkResult result = VK_SUCCESS;
+   int merged = -1;
+
+   for (uint32_t i = 0; i < src_count; i++) {
+      assert(!(srcs[i]->flags & VK_SYNC_IS_TIMELINE));
+
+      int fd = -1;
+      result = vk_drm_syncobj_export_sync_file(device, srcs[i], &fd);
+      if (result != VK_SUCCESS)
+         goto fail;
+
+      /* -1 means it's already signaled, so nothing to merge. */
+      if (fd == -1)
+         continue;
+
+      /* Merge even a single source with itself: the kernel's merge is what
+       * flattens chains and arrays.
+       */
+      int ret = sync_merge("vk_drm_syncobj", merged == -1 ? fd : merged, fd);
+      if (ret < 0) {
+         close(fd);
+         result = vk_errorf(device, VK_ERROR_UNKNOWN, "SYNC_IOC_MERGE failed: %m");
+         goto fail;
+      }
+      close(fd);
+      if (merged != -1)
+         close(merged);
+      merged = ret;
+   }
+
+   /* Every source is already signalled: copying any of them is equivalent. */
+   if (merged == -1)
+      return src_count ? vk_drm_syncobj_transfer(device, dst, 0, srcs[0], 0) :
+                         vk_drm_syncobj_signal(device, dst, 0);
+
+   result = vk_drm_syncobj_import_sync_file(device, dst, merged);
+
+fail:
+   if (merged >= 0)
+      close(merged);
+
+   return result;
+}
+
 static bool
 vk_device_has_timeline_syncobj(struct vk_device *device)
 {

@@ -68,6 +68,25 @@ VkResult vk_drm_syncobj_copy_payloads(struct vk_device *device,
                                       uint32_t signal_count,
                                       const struct vk_sync_signal *signals);
 
+/** Copy src's payload at src_value into dst at dst_value
+ *
+ * dst_value 0 means a binary dst (its payload is replaced).  Uses
+ * DRM_IOCTL_SYNCOBJ_TRANSFER without WAIT_FOR_SUBMIT: fails if the source
+ * point has not been submitted yet.
+ */
+VkResult vk_drm_syncobj_transfer(struct vk_device *device,
+                                 struct vk_sync *dst, uint64_t dst_value,
+                                 struct vk_sync *src, uint64_t src_value);
+
+/** Replace binary dst's payload with the merge of the binary srcs' payloads
+ *
+ * Uses sync_file export and SYNC_IOC_MERGE, which (Linux >= 6.0) flattens
+ * fence chains and arrays into their unsignalled leaf fences, so the result
+ * never nests the sources' containers.
+ */
+VkResult vk_drm_syncobj_merge(struct vk_device *device, struct vk_sync *dst,
+                              uint32_t src_count, struct vk_sync *const *srcs);
+
 struct util_sync_provider;
 struct vk_sync_type vk_drm_syncobj_get_type_from_provider(struct util_sync_provider *sync);
 struct vk_sync_type vk_drm_syncobj_get_type(int drm_fd);

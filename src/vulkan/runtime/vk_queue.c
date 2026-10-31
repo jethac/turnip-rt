@@ -24,14 +24,22 @@
 #include "vk_queue.h"
 
 #include "util/perf/cpu_trace.h"
+#include "util/log.h"
+#include "util/os_misc.h"
+#include "util/os_time.h"
 #include "util/u_debug.h"
 #include <inttypes.h>
+#ifdef HAVE_LIBDRM
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include "vk_alloc.h"
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
 #include "vk_common_entrypoints.h"
 #include "vk_device.h"
+#include "vk_drm_syncobj.h"
 #include "vk_fence.h"
 #include "vk_log.h"
 #include "vk_physical_device.h"
@@ -44,6 +52,62 @@
 
 static VkResult
 vk_queue_start_submit_thread(struct vk_queue *queue);
+
+/* Empty-submit elision (vk_queue_enable_empty_submit_elision()).
+ *
+ * A submit with no command buffers and no binds is a pure synchronisation
+ * operation.  Sent to the kernel it still becomes a scheduler job that takes
+ * a ring slot, which can starve real work on kernels with a small per-ring
+ * job limit.  With elision on, such a submit is implemented with syncobj
+ * operations only:
+ *
+ *  - last: a private binary syncobj.  Every submit that reaches the driver
+ *    gets one extra signal of it, so it holds the out-fence of the latest
+ *    kernel job on the queue.  Jobs of one queue complete in order and each
+ *    job waits for the waits carried into it, so that fence covers all
+ *    earlier work and all earlier carried waits.
+ *  - carry[]: private binary syncobjs.  Each elided wait's fence is copied
+ *    there unchanged (the same fence the kernel would have looked up for a
+ *    real job) and added as a wait of the next submit that reaches the
+ *    driver, so later work still runs after it, as with a real job.
+ *  - An elided signal is a copy of "last" when nothing is carried (a plain
+ *    job fence: no nesting).  Otherwise it is a copy of "merged", the
+ *    sync_file merge of last and every carried fence; the kernel flattens a
+ *    merge into its unsignalled leaf fences, which bounds fence nesting when
+ *    queues signal and wait on each other only through elided submits.
+ *  - Neither is ever a dependency of the queue's own jobs (that would make
+ *    each job wait for the previous one to complete).
+ *
+ * Requires that driver_submit() has attached every signal to the kernel
+ * before it returns, which is why elision is a driver opt-in.
+ */
+#define VK_QUEUE_ELIDE_MAX_CARRY 8
+#define VK_QUEUE_ELIDE_CTL_PERIOD_NS (250ull * 1000 * 1000)
+#define VK_QUEUE_ELIDE_LOG_PERIOD_NS (2000ull * 1000 * 1000)
+
+struct vk_queue_elide {
+   struct vk_sync *last;
+   struct vk_sync *merged;
+   bool merged_valid;
+
+   struct vk_sync *carry[VK_QUEUE_ELIDE_MAX_CARRY];
+   uint32_t carry_count;
+
+   bool broken;
+
+   char *ctl_path;
+   bool ctl_on;
+   uint64_t ctl_next_ns;
+
+   bool log;
+   uint64_t log_next_ns;
+
+   struct {
+      uint64_t elided, elided_waits, elided_signals, merges;
+      uint64_t jobs, jobs_with_carry, carried_waits;
+      uint64_t fb_blocked, fb_ctl, fb_carry_full, fb_transfer, fb_other;
+   } n;
+};
 
 VkResult
 vk_queue_init(struct vk_queue *queue, struct vk_device *device,
@@ -153,9 +217,18 @@ vk_queue_submit_alloc(struct vk_queue *queue,
                       uint32_t signal_count,
                       bool is_protected)
 {
+   /* Empty-submit elision: room for the carried waits and the "last" signal
+    * that are appended when this submit reaches the driver.
+    */
+   struct vk_queue *hw_queue = queue->real_queue ? queue->real_queue : queue;
+   const bool elide_reserved = hw_queue->elide != NULL;
+   const uint32_t wait_alloc = wait_count +
+      (elide_reserved ? VK_QUEUE_ELIDE_MAX_CARRY : 0);
+   const uint32_t signal_alloc = signal_count + (elide_reserved ? 1 : 0);
+
    VK_MULTIALLOC(ma);
    VK_MULTIALLOC_DECL(&ma, struct vk_queue_submit, submit, 1);
-   VK_MULTIALLOC_DECL(&ma, struct vk_sync_wait, waits, wait_count);
+   VK_MULTIALLOC_DECL(&ma, struct vk_sync_wait, waits, wait_alloc);
    VK_MULTIALLOC_DECL(&ma, struct vk_command_buffer *, command_buffers,
                       command_buffer_count);
    VK_MULTIALLOC_DECL(&ma, VkSparseBufferMemoryBindInfo, buffer_binds,
@@ -168,8 +241,8 @@ vk_queue_submit_alloc(struct vk_queue *queue,
                       bind_entries, bind_entry_count);
    VK_MULTIALLOC_DECL(&ma, VkSparseImageMemoryBind, image_bind_entries,
                       image_bind_entry_count);
-   VK_MULTIALLOC_DECL(&ma, struct vk_sync_signal, signals, signal_count);
-   VK_MULTIALLOC_DECL(&ma, struct vk_sync *, wait_temps, wait_count);
+   VK_MULTIALLOC_DECL(&ma, struct vk_sync_signal, signals, signal_alloc);
+   VK_MULTIALLOC_DECL(&ma, struct vk_sync *, wait_temps, wait_alloc);
 
    struct vk_sync_timeline_point **wait_points = NULL, **signal_points = NULL;
    if (queue->base.device->timeline_mode == VK_DEVICE_TIMELINE_MODE_EMULATED) {
@@ -196,6 +269,7 @@ vk_queue_submit_alloc(struct vk_queue *queue,
    submit->_wait_points    = wait_points;
    submit->_signal_points  = signal_points;
    submit->is_protected    = is_protected;
+   submit->_elide_reserved = elide_reserved;
 
    return submit;
 }
@@ -271,6 +345,8 @@ vk_queue_submit_add_semaphore_wait(struct vk_queue *queue,
    struct vk_sync *sync;
    if (semaphore->temporary) {
       assert(semaphore->type == VK_SEMAPHORE_TYPE_BINARY);
+      /* An imported payload: never elide (be conservative with interop). */
+      submit->_elide_blocked = true;
       sync = submit->_wait_temps[submit->wait_count] = semaphore->temporary;
       semaphore->temporary = NULL;
    } else {
@@ -282,6 +358,9 @@ vk_queue_submit_add_semaphore_wait(struct vk_queue *queue,
 
       sync = &semaphore->permanent;
    }
+
+   if (sync->flags & (VK_SYNC_IS_SHAREABLE | VK_SYNC_IS_SHARED))
+      submit->_elide_blocked = true;
 
    uint64_t wait_value = semaphore->type == VK_SEMAPHORE_TYPE_TIMELINE ?
                          wait_info->value : 0;
@@ -303,6 +382,9 @@ vk_queue_submit_add_semaphore_signal(struct vk_queue *queue,
    VK_FROM_HANDLE(vk_semaphore, semaphore, signal_info->semaphore);
 
    struct vk_sync *sync = vk_semaphore_get_active_sync(semaphore);
+   if (semaphore->temporary ||
+       (sync->flags & (VK_SYNC_IS_SHAREABLE | VK_SYNC_IS_SHARED)))
+      submit->_elide_blocked = true;
    uint64_t signal_value = signal_info->value;
    if (semaphore->type == VK_SEMAPHORE_TYPE_TIMELINE) {
       if (signal_value == 0) {
@@ -330,6 +412,9 @@ vk_queue_submit_add_sync_signal(struct vk_queue *queue,
                                 struct vk_sync *sync,
                                 uint64_t signal_value)
 {
+   if (sync->flags & (VK_SYNC_IS_SHAREABLE | VK_SYNC_IS_SHARED))
+      submit->_elide_blocked = true;
+
    submit->signals[submit->signal_count++] = (struct vk_sync_signal) {
       .sync = sync,
       .stage_mask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -342,6 +427,10 @@ vk_queue_submit_add_fence_signal(struct vk_queue *queue,
                                  struct vk_queue_submit *submit,
                                  struct vk_fence *fence)
 {
+   /* A temporarily imported payload: never elide. */
+   if (fence->temporary != NULL)
+      submit->_elide_blocked = true;
+
    vk_queue_submit_add_sync_signal(queue, submit,
                                    vk_fence_get_active_sync(fence), 0);
 }
@@ -522,6 +611,7 @@ vk_queue_submits_merge(struct vk_queue *queue,
 
    merged->_has_binary_permanent_semaphore_wait =
       first->_has_binary_permanent_semaphore_wait;
+   merged->_elide_blocked = first->_elide_blocked || second->_elide_blocked;
 
    typed_memcpy(merged->_wait_temps, first->_wait_temps, first->wait_count);
    typed_memcpy(&merged->_wait_temps[first->wait_count], second->_wait_temps, second->wait_count);
@@ -577,6 +667,365 @@ vk_queue_drain(struct vk_queue *queue)
    mtx_unlock(&queue->submit.mutex);
 
    return result;
+}
+
+#ifdef HAVE_LIBDRM
+static void
+vk_queue_elide_log(struct vk_queue *queue, const char *what)
+{
+   struct vk_queue_elide *e = queue->elide;
+
+   mesa_logi("vk-empty-submit-elide %s queue=%p family=%u index=%u "
+             "elided=%" PRIu64 " elided_waits=%" PRIu64
+             " elided_signals=%" PRIu64 " merges=%" PRIu64 " jobs=%" PRIu64
+             " jobs_with_carry=%" PRIu64 " carried_waits=%" PRIu64
+             " fb_blocked=%" PRIu64 " fb_ctl=%" PRIu64
+             " fb_carry_full=%" PRIu64 " fb_transfer=%" PRIu64
+             " fb_other=%" PRIu64 " carry=%u ctl=%d broken=%d",
+             what, queue, queue->queue_family_index, queue->index_in_family,
+             e->n.elided, e->n.elided_waits, e->n.elided_signals, e->n.merges,
+             e->n.jobs, e->n.jobs_with_carry, e->n.carried_waits,
+             e->n.fb_blocked, e->n.fb_ctl, e->n.fb_carry_full,
+             e->n.fb_transfer, e->n.fb_other, e->carry_count, e->ctl_on,
+             e->broken);
+}
+
+static void
+vk_queue_elide_log_periodic(struct vk_queue *queue)
+{
+   struct vk_queue_elide *e = queue->elide;
+
+   if (e->log) {
+      uint64_t now = os_time_get_nano();
+      if (now >= e->log_next_ns) {
+         e->log_next_ns = now + VK_QUEUE_ELIDE_LOG_PERIOD_NS;
+         vk_queue_elide_log(queue, "periodic");
+      }
+   }
+}
+
+static bool
+vk_queue_elide_ctl(struct vk_queue *queue)
+{
+   struct vk_queue_elide *e = queue->elide;
+
+   if (e->ctl_path == NULL)
+      return true;
+
+   uint64_t now = os_time_get_nano();
+   if (now < e->ctl_next_ns)
+      return e->ctl_on;
+   e->ctl_next_ns = now + VK_QUEUE_ELIDE_CTL_PERIOD_NS;
+
+   /* Fail closed: unreadable or anything but '1' means no eliding. */
+   bool on = false;
+   int fd = open(e->ctl_path, O_RDONLY | O_CLOEXEC);
+   if (fd >= 0) {
+      char c = 0;
+      on = read(fd, &c, 1) == 1 && c == '1';
+      close(fd);
+   }
+   if (on != e->ctl_on) {
+      e->ctl_on = on;
+      if (e->log)
+         vk_queue_elide_log(queue, on ? "ctl_on" : "ctl_off");
+   }
+   return on;
+}
+
+/* Returns VK_SUCCESS when the submit was fully implemented without a job,
+ * VK_NOT_READY when it must go to the driver instead (nothing observable has
+ * happened yet, except possibly extra carried waits, which are harmless), or
+ * an error.  Called with the queue's submits serialised.
+ */
+static VkResult
+vk_queue_elide_try(struct vk_queue *queue, struct vk_queue_submit *submit)
+{
+   struct vk_queue_elide *e = queue->elide;
+   struct vk_device *device = queue->base.device;
+   VkResult result;
+
+   if (submit->command_buffer_count != 0 || vk_queue_submit_has_bind(submit) ||
+       submit->is_protected)
+      return VK_NOT_READY;
+
+   if (submit->_elide_blocked) {
+      e->n.fb_blocked++;
+      return VK_NOT_READY;
+   }
+
+   if (!vk_queue_elide_ctl(queue)) {
+      e->n.fb_ctl++;
+      return VK_NOT_READY;
+   }
+
+   if (submit->wait_count > VK_QUEUE_ELIDE_MAX_CARRY - e->carry_count) {
+      e->n.fb_carry_full++;
+      return VK_NOT_READY;
+   }
+
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      if (!vk_sync_type_is_drm_syncobj(submit->waits[i].sync->type)) {
+         e->n.fb_other++;
+         return VK_NOT_READY;
+      }
+   }
+   for (uint32_t i = 0; i < submit->signal_count; i++) {
+      if (!vk_sync_type_is_drm_syncobj(submit->signals[i].sync->type)) {
+         e->n.fb_other++;
+         return VK_NOT_READY;
+      }
+   }
+
+   /* Report a device loss the runtime already knows about, as a real submit
+    * would.  No status query here: a kernel-side context ban is reported by
+    * the next submit that reaches the driver, or by the next wait.
+    */
+   if (vk_device_is_lost(device))
+      return VK_ERROR_DEVICE_LOST;
+
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      const struct vk_sync_wait *w = &submit->waits[i];
+      const uint64_t point = (w->sync->flags & VK_SYNC_IS_TIMELINE) ?
+                             w->wait_value : 0;
+
+      /* No WAIT_FOR_SUBMIT: the runtime has already waited for every wait
+       * to be pending.  If one is not, fail and let the driver handle the
+       * submit as usual.
+       */
+      result = vk_drm_syncobj_transfer(device, e->carry[e->carry_count], 0,
+                                       w->sync, point);
+      if (result != VK_SUCCESS) {
+         e->n.fb_transfer++;
+         return VK_NOT_READY;
+      }
+      e->carry_count++;
+      e->merged_valid = false;
+   }
+
+   if (submit->signal_count > 0) {
+      struct vk_sync *src = e->last;
+      if (e->carry_count > 0) {
+         if (!e->merged_valid) {
+            struct vk_sync *srcs[VK_QUEUE_ELIDE_MAX_CARRY + 1];
+            srcs[0] = e->last;
+            for (uint32_t i = 0; i < e->carry_count; i++)
+               srcs[i + 1] = e->carry[i];
+            result = vk_drm_syncobj_merge(device, e->merged,
+                                          e->carry_count + 1, srcs);
+            if (result != VK_SUCCESS)
+               return vk_queue_set_lost(queue, "empty-submit elision: merge failed");
+            e->merged_valid = true;
+            e->n.merges++;
+         }
+         src = e->merged;
+      }
+
+      for (uint32_t i = 0; i < submit->signal_count; i++) {
+         const struct vk_sync_signal *s = &submit->signals[i];
+         const uint64_t point = (s->sync->flags & VK_SYNC_IS_TIMELINE) ?
+                                s->signal_value : 0;
+
+         result = vk_drm_syncobj_transfer(device, s->sync, point, src, 0);
+         if (result != VK_SUCCESS)
+            return vk_queue_set_lost(queue, "empty-submit elision: signal transfer failed");
+      }
+   }
+
+   e->n.elided++;
+   e->n.elided_waits += submit->wait_count;
+   e->n.elided_signals += submit->signal_count;
+   return VK_SUCCESS;
+}
+
+static VkResult
+vk_queue_elide_driver_submit(struct vk_queue *queue,
+                             struct vk_queue_submit *submit)
+{
+   struct vk_queue_elide *e = queue->elide;
+   struct vk_device *device = queue->base.device;
+
+   if (unlikely(!submit->_elide_reserved)) {
+      /* Allocated before elision was enabled: "last" would miss this job.
+       * Cannot happen when the driver enables elision at queue init.
+       */
+      if (!e->broken)
+         mesa_loge("vk-empty-submit-elide: unreserved submit; elision "
+                   "disabled on queue %p", queue);
+      e->broken = true;
+      return queue->driver_submit(queue, submit);
+   }
+
+   if (!e->broken) {
+      VkResult result = vk_queue_elide_try(queue, submit);
+      if (result != VK_NOT_READY) {
+         vk_queue_elide_log_periodic(queue);
+         return result;
+      }
+   }
+
+   /* Real job: append the carried waits and the "last" signal. */
+   const uint32_t wait_count = submit->wait_count;
+   const uint32_t signal_count = submit->signal_count;
+   const uint32_t carried = e->carry_count;
+
+   for (uint32_t i = 0; i < carried; i++) {
+      submit->waits[submit->wait_count++] = (struct vk_sync_wait) {
+         .sync = e->carry[i],
+         .stage_mask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .wait_value = 0,
+      };
+   }
+   submit->signals[submit->signal_count++] = (struct vk_sync_signal) {
+      .sync = e->last,
+      .stage_mask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      .signal_value = 0,
+   };
+
+   VkResult result = queue->driver_submit(queue, submit);
+
+   submit->wait_count = wait_count;
+   submit->signal_count = signal_count;
+
+   if (result == VK_SUCCESS) {
+      /* The job now carries those fences; drop our references early. */
+      for (uint32_t i = 0; i < carried; i++)
+         vk_sync_reset(device, e->carry[i]);
+      e->carry_count = 0;
+      e->merged_valid = false;
+      e->n.jobs++;
+      if (carried) {
+         e->n.jobs_with_carry++;
+         e->n.carried_waits += carried;
+      }
+   }
+
+   vk_queue_elide_log_periodic(queue);
+   return result;
+}
+#endif
+
+static inline VkResult
+vk_queue_driver_submit_locked(struct vk_queue *queue,
+                              struct vk_queue_submit *submit)
+{
+#ifdef HAVE_LIBDRM
+   if (unlikely(queue->elide != NULL))
+      return vk_queue_elide_driver_submit(queue, submit);
+#endif
+
+   return queue->driver_submit(queue, submit);
+}
+
+VkResult
+vk_queue_enable_empty_submit_elision(struct vk_queue *queue,
+                                     const char *ctl_path, bool log)
+{
+#ifdef HAVE_LIBDRM
+   struct vk_device *device = queue->base.device;
+
+   if (queue->elide != NULL || vk_queue_is_emulated(queue))
+      return VK_SUCCESS;
+
+   if (device->timeline_mode == VK_DEVICE_TIMELINE_MODE_EMULATED ||
+       device->sync == NULL) {
+      if (log)
+         mesa_logi("vk-empty-submit-elide disabled queue=%p reason=no_native_syncobj", queue);
+      return VK_SUCCESS;
+   }
+
+   const struct vk_sync_type *type = NULL;
+   for (const struct vk_sync_type *const *t =
+        device->physical->supported_sync_types; *t; t++) {
+      if (vk_sync_type_is_drm_syncobj(*t) &&
+          ((*t)->features & VK_SYNC_FEATURE_BINARY)) {
+         type = *t;
+         break;
+      }
+   }
+   if (type == NULL) {
+      if (log)
+         mesa_logi("vk-empty-submit-elide disabled queue=%p reason=no_drm_syncobj_type", queue);
+      return VK_SUCCESS;
+   }
+
+   struct vk_queue_elide *e =
+      vk_zalloc(&device->alloc, sizeof(*e), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (e == NULL)
+      return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   /* Created signalled: before the first job there is nothing to wait for. */
+   VkResult result = vk_sync_create(device, type, 0, 1, &e->last);
+   if (result != VK_SUCCESS)
+      goto fail;
+   result = vk_sync_create(device, type, 0, 1, &e->merged);
+   if (result != VK_SUCCESS)
+      goto fail;
+
+   for (uint32_t i = 0; i < VK_QUEUE_ELIDE_MAX_CARRY; i++) {
+      result = vk_sync_create(device, type, 0, 0, &e->carry[i]);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
+
+   if (ctl_path != NULL && ctl_path[0] != '\0') {
+      e->ctl_path = vk_strdup(&device->alloc, ctl_path,
+                              VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+      if (e->ctl_path == NULL) {
+         result = vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+         goto fail;
+      }
+   }
+   e->ctl_on = e->ctl_path == NULL;
+   e->log = log;
+   queue->elide = e;
+
+   if (log) {
+      mesa_logi("vk-empty-submit-elide enabled queue=%p family=%u index=%u "
+                "max_carry=%u ctl=%s submit_mode=%d timeline_mode=%d",
+                queue, queue->queue_family_index, queue->index_in_family,
+                VK_QUEUE_ELIDE_MAX_CARRY, e->ctl_path ? e->ctl_path : "-",
+                device->submit_mode, device->timeline_mode);
+   }
+   return VK_SUCCESS;
+
+fail:
+   for (uint32_t i = 0; i < VK_QUEUE_ELIDE_MAX_CARRY; i++) {
+      if (e->carry[i])
+         vk_sync_destroy(device, e->carry[i]);
+   }
+   if (e->merged)
+      vk_sync_destroy(device, e->merged);
+   if (e->last)
+      vk_sync_destroy(device, e->last);
+   vk_free(&device->alloc, e);
+   return result;
+#else
+   return VK_SUCCESS;
+#endif
+}
+
+static void
+vk_queue_elide_finish(struct vk_queue *queue)
+{
+#ifdef HAVE_LIBDRM
+   struct vk_queue_elide *e = queue->elide;
+   struct vk_device *device = queue->base.device;
+
+   if (e == NULL)
+      return;
+
+   if (e->log)
+      vk_queue_elide_log(queue, "queue_destroy");
+
+   for (uint32_t i = 0; i < VK_QUEUE_ELIDE_MAX_CARRY; i++)
+      vk_sync_destroy(device, e->carry[i]);
+   vk_sync_destroy(device, e->merged);
+   vk_sync_destroy(device, e->last);
+   vk_free(&device->alloc, e->ctl_path);
+   vk_free(&device->alloc, e);
+   queue->elide = NULL;
+#endif
 }
 
 static VkResult
@@ -644,11 +1093,11 @@ vk_queue_submit_final(struct vk_queue *queue,
       struct vk_queue *real_queue = queue->real_queue;
 
       simple_mtx_lock(&real_queue->lock);
-      result = real_queue->driver_submit(real_queue, submit);
+      result = vk_queue_driver_submit_locked(real_queue, submit);
       simple_mtx_unlock(&real_queue->lock);
    } else {
       vk_queue_lock(queue);
-      result = queue->driver_submit(queue, submit);
+      result = vk_queue_driver_submit_locked(queue, submit);
       vk_queue_unlock(queue);
    }
 
@@ -1246,6 +1695,8 @@ vk_queue_finish(struct vk_queue *queue)
    }
 #endif
 
+   vk_queue_elide_finish(queue);
+
    cnd_destroy(&queue->submit.pop);
    cnd_destroy(&queue->submit.push);
    mtx_destroy(&queue->submit.mutex);
@@ -1272,6 +1723,9 @@ vk_queue_set_emulated(struct vk_queue *emulated, struct vk_queue *real)
     */
    real->real_queue = real;
    emulated->real_queue = real;
+
+   /* An alias submits through the real queue; its own state is unused. */
+   vk_queue_elide_finish(emulated);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

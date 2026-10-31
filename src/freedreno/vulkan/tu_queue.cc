@@ -861,6 +861,22 @@ tu_queue_init(struct tu_device *device,
                                "submitqueue create failed");
    }
 
+   /* Opt-in: submits without command buffers or binds never become kernel
+    * jobs (common runtime, see vk_queue_enable_empty_submit_elision()).
+    * Unset: nothing changes.
+    */
+   if (type == TU_QUEUE_GFX &&
+       debug_get_bool_option("TU_EMPTY_SUBMIT_ELIDE", false)) {
+      result = vk_queue_enable_empty_submit_elision(
+         &queue->vk, os_get_option("TU_EMPTY_SUBMIT_ELIDE_CTL"),
+         debug_get_bool_option("TU_EMPTY_SUBMIT_ELIDE_LOG", false));
+      if (result != VK_SUCCESS) {
+         tu_drm_submitqueue_close(device, queue);
+         vk_queue_finish(&queue->vk);
+         return result;
+      }
+   }
+
    return VK_SUCCESS;
 }
 

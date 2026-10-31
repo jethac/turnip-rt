@@ -41,6 +41,7 @@ struct vk_sync;
 struct vk_sync_wait;
 struct vk_sync_signal;
 struct vk_sync_timeline_point;
+struct vk_queue_elide;
 
 struct vk_queue {
    struct vk_object_base base;
@@ -180,6 +181,13 @@ struct vk_queue {
     * driver_submit, serialized via real_queue->lock.
     */
    struct vk_queue *real_queue;
+
+   /** Opt-in empty-submit elision state (NULL = disabled, stock behaviour).
+    *
+    * See vk_queue_enable_empty_submit_elision().  Only meaningful on a real
+    * (non-emulated) queue; emulated aliases use their real queue's state.
+    */
+   struct vk_queue_elide *elide;
 };
 
 VK_DEFINE_HANDLE_CASTS(vk_queue, base, VkQueue, VK_OBJECT_TYPE_QUEUE)
@@ -209,6 +217,32 @@ vk_queue_finish(struct vk_queue *queue);
  */
 void
 vk_queue_set_emulated(struct vk_queue *emulated, struct vk_queue *real);
+
+/** Opt in to empty-submit elision on this queue.
+ *
+ * Requires DRM syncobjs (vk_drm_syncobj) and native (non-emulated)
+ * timelines, and a driver_submit() that attaches every signal to the kernel
+ * before it returns.  When enabled, a submit with no command buffers and no
+ * sparse binds never reaches driver_submit():
+ *
+ *  - its waits are copied (DRM_IOCTL_SYNCOBJ_TRANSFER, exact fence) into
+ *    private binary syncobjs and added as waits of the next submit that does
+ *    reach the driver;
+ *  - each of its signals receives the fence of the queue's latest kernel job
+ *    (every submit that reaches the driver gets one extra signal for this),
+ *    or, when waits are being carried, the sync_file merge of that fence and
+ *    the carried fences.  It never fires before earlier work on the queue.
+ *
+ * Submits touching an exportable, exported or imported semaphore or fence
+ * (VK_SYNC_IS_SHAREABLE / VK_SYNC_IS_SHARED / temporary payload) are never
+ * elided.  Must be called before the first submit.  ctl_path (optional): a
+ * file whose first byte '1' enables eliding; anything else, or an unreadable
+ * file, disables it (re-read at most every 250 ms).  log: print counters.
+ * Returns VK_SUCCESS without enabling when unsupported.
+ */
+VkResult
+vk_queue_enable_empty_submit_elision(struct vk_queue *queue,
+                                     const char *ctl_path, bool log);
 
 /** Returns true if this queue is an emulated alias (not the real queue) */
 static inline bool
@@ -300,6 +334,12 @@ struct vk_queue_submit {
    struct vk_sync_timeline_point **_wait_points;
    struct vk_sync_timeline_point **_signal_points;
    bool is_protected;
+
+   /* Empty-submit elision: never elide (an external, exportable or imported
+    * sync is involved) / spare wait and signal slots were allocated.
+    */
+   bool _elide_blocked;
+   bool _elide_reserved;
 };
 
 static inline bool
