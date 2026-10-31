@@ -2041,13 +2041,30 @@ handle_multiview_queries(struct tu_cmd_buffer *cmd,
                          struct tu_query_pool *pool,
                          uint32_t query)
 {
-   if (!cmd->state.pass || !tu_subpass_view_mask(cmd->state.subpass))
+   /* TU_MULTIVIEW_SAME_LAYER passes (multiview_mask == 0, sl_view_mask
+    * != 0) use ONE slot. Such a pass is already outside the Vulkan
+    * contract (single-layer attachments with a multi-bit viewMask), so the
+    * N-slot rule above does not bind it; the knob defines its own query
+    * contract instead. Both views execute in one draw into one layer, so
+    * the first slot already holds the full (summed) result, which is the
+    * D3D12 single-slot semantic its only client (vkd3d SPS tier 2, D3D12
+    * heap index == Vulkan slot) expects. Marking query+1..N-1 would clobber
+    * the next D3D12 heap entry and, at the last slot, write past the pool
+    * BO (QV60 T3T2b CP fault). Caveat: an app that reserves N slots and
+    * waits on query+1..N-1 never sees them available in this mode. Only
+    * real layered multiview marks N slots.
+    */
+   if (!cmd->state.pass || !cmd->state.subpass->multiview_mask)
       return;
 
-   unsigned views = util_bitcount(tu_subpass_view_mask(cmd->state.subpass));
+   unsigned views = util_bitcount(cmd->state.subpass->multiview_mask);
    struct tu_cs *cs = &cmd->draw_epilogue_cs;
 
    for (uint32_t i = 1; i < views; i++) {
+      /* Defensive: an app violating VUID-vkCmdWriteTimestamp2-query-03865 /
+       * vkCmdBeginQuery-query-00808 must not make the CP fault. */
+      if (query + i >= pool->size)
+         break;
       tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
       tu_cs_emit_qw(cs, query_available_iova(pool, query + i));
       tu_cs_emit_qw(cs, 0x1);
