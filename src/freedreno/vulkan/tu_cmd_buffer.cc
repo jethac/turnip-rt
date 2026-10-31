@@ -6866,6 +6866,8 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
    for (uint32_t i = 0; i < commandBufferCount; i++) {
       VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
 
+      cmd->state.ac8_waits_events |= secondary->state.ac8_waits_events;
+
       if (FD_RD_DUMP(ENABLE)) {
          struct tu_cmd_buffer **slot = (struct tu_cmd_buffer **)
             util_dynarray_grow(&cmd->rd_secondaries, struct tu_cmd_buffer *, 1);

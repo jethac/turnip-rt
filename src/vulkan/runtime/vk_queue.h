@@ -37,6 +37,37 @@ extern "C" {
 
 struct vk_command_buffer;
 struct vk_queue_submit;
+struct vk_queue;
+
+/** AC8 opt-in submit coalescing (Turnip TU_SUBMIT_COALESCE).
+ *
+ * Installed by a driver on a real (non-emulated) queue that runs the
+ * threaded submit path. NULL (the default) leaves every path unchanged.
+ * When set, the submit thread may hand several consecutive queued submits
+ * to submit_group(), which must execute them as one kernel submission in
+ * order. Only the first submit's waits are passed; every later member's
+ * waits were checked to be complete or signalled by an earlier member.
+ * Signals of every member are kept, in order; they complete when the
+ * whole group completes (later than separate submits would, never earlier).
+ */
+struct vk_queue_ac8_coalesce_ops {
+   /** Maximum submits per group (>= 2 to have any effect). */
+   uint32_t max_group;
+   /** Whether this submit may be a member of a group (head = first member). */
+   bool (*candidate)(struct vk_queue *queue,
+                     const struct vk_queue_submit *submit, bool head);
+   /** Called without locks when the head is a candidate, before the group
+    * is collected. May block for a bounded time (backlog throttle).
+    */
+   void (*hold)(struct vk_queue *queue);
+   /** Submit n >= 2 members as one kernel job. Same locking as
+    * driver_submit.
+    */
+   VkResult (*submit_group)(struct vk_queue *queue,
+                            struct vk_queue_submit **group, uint32_t n,
+                            uint32_t dropped_internal,
+                            uint32_t dropped_complete);
+};
 struct vk_sync;
 struct vk_sync_wait;
 struct vk_sync_signal;
@@ -180,6 +211,9 @@ struct vk_queue {
     * driver_submit, serialized via real_queue->lock.
     */
    struct vk_queue *real_queue;
+
+   /** AC8 opt-in submit coalescing, see vk_queue_ac8_coalesce_ops. */
+   const struct vk_queue_ac8_coalesce_ops *ac8_coalesce;
 };
 
 VK_DEFINE_HANDLE_CASTS(vk_queue, base, VkQueue, VK_OBJECT_TYPE_QUEUE)
@@ -191,6 +225,10 @@ vk_queue_init(struct vk_queue *queue, struct vk_device *device,
 
 void
 vk_queue_finish(struct vk_queue *queue);
+
+/** AC8: drain the threaded submit list (no-op unless threaded). */
+VkResult
+vk_queue_ac8_drain(struct vk_queue *queue);
 
 /** Mark a queue as an emulated alias of another queue.
  *

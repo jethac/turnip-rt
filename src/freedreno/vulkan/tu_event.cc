@@ -149,6 +149,8 @@ tu_CmdWaitEvents2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    struct tu_cs *cs = cmd->state.pass ? &cmd->draw_cs : &cmd->cs;
 
+   cmd->state.ac8_waits_events = true;
+
    for (uint32_t i = 0; i < eventCount; i++) {
       VK_FROM_HANDLE(tu_event, event, pEvents[i]);
 

@@ -732,6 +732,202 @@ done:
    return result;
 }
 
+/* AC8: lets a driver drain a coalescing queue's submit thread before it tears
+ * down device state that queue submission uses.
+ */
+VkResult
+vk_queue_ac8_drain(struct vk_queue *queue)
+{
+   if (queue->submit.mode != VK_QUEUE_SUBMIT_MODE_THREADED)
+      return VK_SUCCESS;
+   return vk_queue_drain(queue);
+}
+
+/* AC8 opt-in submit coalescing (vk_queue::ac8_coalesce). Not reached when
+ * ac8_coalesce is NULL.
+ */
+#define VK_QUEUE_AC8_MAX_GROUP 64
+
+/* A later member's wait may be dropped only if it cannot add a dependency
+ * the group does not already have: either an earlier member of the group
+ * signals the same sync object (at a value that satisfies the wait, for a
+ * timeline), so in-order execution inside one kernel job plus the driver's
+ * barrier between members provides it; or the wait is already complete.
+ */
+static bool
+vk_queue_ac8_wait_droppable(struct vk_queue *queue,
+                            struct vk_queue_submit **group, uint32_t n,
+                            const struct vk_sync_wait *wait,
+                            uint32_t *internal, uint32_t *complete)
+{
+   if (wait->sync == NULL)
+      return true;
+
+   const bool timeline = wait->sync->flags & VK_SYNC_IS_TIMELINE;
+   for (uint32_t m = 0; m < n; m++) {
+      for (uint32_t i = 0; i < group[m]->signal_count; i++) {
+         const struct vk_sync_signal *sig = &group[m]->signals[i];
+         if (sig->sync == wait->sync &&
+             (!timeline || sig->signal_value >= wait->wait_value)) {
+            (*internal)++;
+            return true;
+         }
+      }
+   }
+
+   if (vk_sync_wait(queue->base.device, wait->sync, wait->wait_value,
+                    VK_SYNC_WAIT_COMPLETE, 0) == VK_SUCCESS) {
+      (*complete)++;
+      return true;
+   }
+   return false;
+}
+
+static bool
+vk_queue_ac8_member_ok(struct vk_queue *queue,
+                       const struct vk_queue_submit *submit, bool head)
+{
+   return submit->_wait_points == NULL && submit->_signal_points == NULL &&
+          !vk_queue_submit_has_bind(submit) &&
+          queue->ac8_coalesce->candidate(queue, submit, head);
+}
+
+/* Copy of the per-submit unwrap and compaction in vk_queue_submit_final(),
+ * for a group member. Members never carry timeline points (checked by
+ * vk_queue_ac8_member_ok), so this only drops trivial waits.
+ */
+static VkResult
+vk_queue_ac8_unwrap(struct vk_queue *queue, struct vk_queue_submit *submit)
+{
+   VkResult result = VK_SUCCESS;
+   uint32_t wait_count = 0;
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      struct vk_sync_timeline_point *wait_point;
+      VkResult r = vk_sync_wait_unwrap(queue->base.device,
+                                       &submit->waits[i], &wait_point);
+      assert(wait_point == NULL);
+      if (unlikely(r != VK_SUCCESS))
+         result = r;
+
+      if (submit->waits[i].sync == NULL) {
+         if (submit->_wait_temps[i] != NULL)
+            vk_sync_destroy(queue->base.device, submit->_wait_temps[i]);
+         continue;
+      }
+
+      if (wait_count < i) {
+         submit->waits[wait_count] = submit->waits[i];
+         submit->_wait_temps[wait_count] = submit->_wait_temps[i];
+      }
+      wait_count++;
+   }
+   submit->wait_count = wait_count;
+
+   for (uint32_t i = 0; i < submit->signal_count; i++) {
+      struct vk_sync_timeline_point *signal_point;
+      VkResult r = vk_sync_signal_unwrap(queue->base.device,
+                                         &submit->signals[i], &signal_point);
+      assert(signal_point == NULL);
+      if (unlikely(r != VK_SUCCESS))
+         result = r;
+   }
+   return result;
+}
+
+/* Called with submit.mutex held and head = first queued submit. Returns
+ * true if the queue was lost (mutex released), false otherwise (mutex held).
+ */
+static bool
+vk_queue_ac8_coalesce_step(struct vk_queue *queue,
+                           struct vk_queue_submit *head)
+{
+   const struct vk_queue_ac8_coalesce_ops *ops = queue->ac8_coalesce;
+   struct vk_queue_submit *group[VK_QUEUE_AC8_MAX_GROUP];
+   uint32_t n = 1, dropped_internal = 0, dropped_complete = 0;
+   VkResult result;
+
+   group[0] = head;
+   const uint32_t max_group = MIN2(ops->max_group, VK_QUEUE_AC8_MAX_GROUP);
+   const bool candidate = max_group > 1 && vk_queue_ac8_member_ok(queue, head, true);
+
+   mtx_unlock(&queue->submit.mutex);
+
+   result = vk_sync_wait_many(queue->base.device,
+                              head->wait_count, head->waits,
+                              VK_SYNC_WAIT_PENDING, UINT64_MAX);
+   if (unlikely(result != VK_SUCCESS)) {
+      vk_queue_set_lost(queue, "Wait for time points failed");
+      return true;
+   }
+
+   if (candidate) {
+      ops->hold(queue);
+
+      /* Members stay in the list (only this thread removes entries), so
+       * they remain valid after the lock is dropped again.
+       */
+      mtx_lock(&queue->submit.mutex);
+      struct list_head *l = head->link.next;
+      while (n < max_group && l != &queue->submit.submits) {
+         struct vk_queue_submit *s =
+            list_entry(l, struct vk_queue_submit, link);
+         if (!vk_queue_ac8_member_ok(queue, s, false))
+            break;
+         uint32_t di = dropped_internal, dc = dropped_complete;
+         bool ok = true;
+         for (uint32_t i = 0; ok && i < s->wait_count; i++)
+            ok = vk_queue_ac8_wait_droppable(queue, group, n, &s->waits[i],
+                                             &di, &dc);
+         if (!ok)
+            break;
+         dropped_internal = di;
+         dropped_complete = dc;
+         group[n++] = s;
+         l = l->next;
+      }
+      mtx_unlock(&queue->submit.mutex);
+   }
+
+   if (n == 1) {
+      result = vk_queue_submit_final(queue, head);
+   } else {
+      result = VK_SUCCESS;
+      for (uint32_t m = 0; m < n && result == VK_SUCCESS; m++)
+         result = vk_queue_ac8_unwrap(queue, group[m]);
+      if (unlikely(result != VK_SUCCESS)) {
+         vk_queue_set_lost(queue, "Failed to unwrap sync");
+         return true;
+      }
+      if (queue->real_queue) {
+         struct vk_queue *real_queue = queue->real_queue;
+         simple_mtx_lock(&real_queue->lock);
+         result = ops->submit_group(real_queue, group, n,
+                                    dropped_internal, dropped_complete);
+         simple_mtx_unlock(&real_queue->lock);
+      } else {
+         vk_queue_lock(queue);
+         result = ops->submit_group(queue, group, n,
+                                    dropped_internal, dropped_complete);
+         vk_queue_unlock(queue);
+      }
+   }
+   if (unlikely(result != VK_SUCCESS)) {
+      vk_queue_set_lost(queue, "queue::driver_submit failed");
+      return true;
+   }
+
+   for (uint32_t m = 0; m < n; m++)
+      vk_queue_submit_cleanup(queue, group[m]);
+
+   mtx_lock(&queue->submit.mutex);
+   for (uint32_t m = 0; m < n; m++) {
+      list_del(&group[m]->link);
+      vk_queue_submit_free(queue, group[m]);
+   }
+   cnd_broadcast(&queue->submit.pop);
+   return false;
+}
+
 static int
 vk_queue_submit_thread_func(void *_data)
 {
@@ -754,6 +950,12 @@ vk_queue_submit_thread_func(void *_data)
       struct vk_queue_submit *submit =
          list_first_entry(&queue->submit.submits,
                           struct vk_queue_submit, link);
+
+      if (queue->ac8_coalesce) {
+         if (vk_queue_ac8_coalesce_step(queue, submit))
+            return 1;
+         continue;
+      }
 
       /* Drop the lock while we wait */
       mtx_unlock(&queue->submit.mutex);

@@ -20,9 +20,12 @@
 #include "tu_image.h"
 #include "tu_knl.h"
 #include "tu_free_log.h"
+#include "tu_tracepoints.h"
 
 #include "util/set.h"
 #include "util/u_debug.h"
+#include "util/os_misc.h"
+#include "util/os_time.h"
 
 static int
 tu_get_submitqueue_priority(const struct tu_physical_device *pdevice,
@@ -811,6 +814,380 @@ fail_create_submit:
    return result;
 }
 
+/* AC8 TU_SUBMIT_COALESCE (opt-in; unset or "0" = off, every path unchanged).
+ *
+ * msm lets at most num_hw_submissions (8) jobs per ring be in the ring
+ * buffer; the next job is pushed only after a completion IRQ frees a
+ * credit. A run of near-empty submissions fills that window with ~10 us of
+ * work and the GPU idles for the IRQ -> scheduler round trip (~0.5-1 ms).
+ * With the knob on, the queue's submit thread waits (bounded) while the
+ * queue already has TU_SUBMIT_COALESCE_BACKLOG kernel jobs outstanding,
+ * then submits a run of consecutive small submits as ONE kernel job: their
+ * command buffers in order, a full barrier between members, the first
+ * member's waits, and every member's signals. A later member's wait is
+ * dropped only if an earlier member signals it or it is already complete
+ * (vk_queue.c); otherwise the run ends there. Signals of earlier members
+ * complete with the whole job (later, never earlier).
+ * Knobs: TU_SUBMIT_COALESCE_{BACKLOG,MAX,TINY_DW,HOLD_MAX_US,LOG,CTL};
+ * TU_SUBMIT_COALESCE_TEST_HOLD_US is a test aid (sleep before grouping).
+ */
+static struct {
+   bool enabled;
+   int backlog;
+   uint32_t max_group;
+   uint32_t tiny_dw;
+   uint64_t hold_max_ns;
+   uint32_t test_hold_us;
+   bool log;
+   const char *ctl;          /* TU_SUBMIT_COALESCE_CTL: runtime switch file */
+} tu_ac8_opt;
+
+/* Runtime switch (TU_SUBMIT_COALESCE_CTL=<file>): only a first byte '1'
+ * folds; anything else, or an unreadable file, keeps every submit separate
+ * (fail closed). Re-read at most every 250 ms. The submit thread stays
+ * threaded either way, so off windows differ from the knob unset only by
+ * the submit thread hop.
+ */
+static void tu_ac8_log(struct tu_queue *queue, const char *event);
+
+static int tu_ac8_ctl_state = -1;
+static uint64_t tu_ac8_ctl_next_ns;
+
+static bool
+tu_ac8_ctl_on(struct tu_queue *queue)
+{
+   if (!tu_ac8_opt.ctl)
+      return true;
+   uint64_t now = os_time_get_nano();
+   int state = p_atomic_read(&tu_ac8_ctl_state);
+   if (state >= 0 && now < p_atomic_read(&tu_ac8_ctl_next_ns))
+      return state == 1;
+   p_atomic_set(&tu_ac8_ctl_next_ns, now + 250000000ull);
+   char c = 0;
+   FILE *f = fopen(tu_ac8_opt.ctl, "r");
+   if (f) {
+      if (fread(&c, 1, 1, f) != 1)
+         c = 0;
+      fclose(f);
+   }
+   int next = c == '1';
+   if (p_atomic_xchg(&tu_ac8_ctl_state, next) != next)
+      tu_ac8_log(queue, next ? "ctl_on" : (f ? "ctl_off" : "ctl_open_failed"));
+   return next;
+}
+
+static void tu_ac8_once_init(void);
+static once_flag tu_ac8_once = ONCE_FLAG_INIT;
+
+static void
+tu_ac8_parse_options(void)
+{
+   call_once(&tu_ac8_once, tu_ac8_once_init);
+}
+
+static void
+tu_ac8_log(struct tu_queue *queue, const char *event)
+{
+   mesa_logi("tu-submit-coalesce event=%s family=%u index=%u msm=%u groups=%" PRIu64
+             " members=%" PRIu64 " saved=%" PRIu64 " barriers=%" PRIu64 " dropped_internal=%" PRIu64
+             " dropped_complete=%" PRIu64 " holds=%" PRIu64 " hold_ms=%.3f"
+             " hold_timeouts=%" PRIu64,
+             event, queue->vk.queue_family_index, queue->vk.index_in_family,
+             queue->msm_queue_id, queue->ac8.groups, queue->ac8.members,
+             queue->ac8.members - queue->ac8.groups, queue->ac8.barriers,
+             queue->ac8.dropped_internal, queue->ac8.dropped_complete,
+             queue->ac8.holds, queue->ac8.hold_ns / 1e6,
+             queue->ac8.hold_timeouts);
+}
+
+static bool
+tu_ac8_candidate(struct vk_queue *_queue, const struct vk_queue_submit *submit,
+                 bool head)
+{
+   struct tu_queue *queue = list_entry(_queue, struct tu_queue, vk);
+   struct tu_device *device = queue->device;
+
+   if (!device->ac8_coalesce_barrier || submit->is_protected ||
+       device->perfcntrs_pass_cs_entries)
+      return false;
+   if (head && !tu_ac8_ctl_on(queue))
+      return false;
+
+   uint64_t dwords = 0;
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      struct tu_cmd_buffer *cmd =
+         container_of(submit->command_buffers[i], struct tu_cmd_buffer, vk);
+      if (cmd->state.suspend_resume != SR_NONE)
+         return false;
+      /* Traced command buffers keep their own submission (u_trace data is
+       * per submission); with TU_GPU_TRACE_GATE closed none have points.
+       */
+      if (u_trace_has_points(&cmd->trace))
+         return false;
+      if (!head && cmd->state.ac8_waits_events)
+         return false;
+      for (uint32_t e = 0; e < cmd->cs.entry_count; e++)
+         dwords += cmd->cs.entries[e].size / 4;
+      if (dwords > tu_ac8_opt.tiny_dw)
+         return false;
+   }
+   return true;
+}
+
+static void
+tu_ac8_hold(struct vk_queue *_queue)
+{
+   struct tu_queue *queue = list_entry(_queue, struct tu_queue, vk);
+
+   if (tu_ac8_opt.test_hold_us)
+      os_time_sleep(tu_ac8_opt.test_hold_us);
+
+   int last = p_atomic_read(&queue->fence);
+   if (last <= 0 || tu_ac8_opt.backlog <= 0)
+      return;
+   int target = last - tu_ac8_opt.backlog + 1;
+   if (target <= 0)
+      return;
+
+   int64_t t0 = os_time_get_nano();
+   VkResult r = tu_queue_wait_fence(queue, target, tu_ac8_opt.hold_max_ns);
+   queue->ac8.holds++;
+   queue->ac8.hold_ns += os_time_get_nano() - t0;
+   if (r == VK_TIMEOUT)
+      queue->ac8.hold_timeouts++;
+}
+
+static VkResult
+tu_ac8_submit_group(struct vk_queue *_queue, struct vk_queue_submit **group,
+                    uint32_t n, uint32_t dropped_internal,
+                    uint32_t dropped_complete)
+{
+   struct tu_queue *queue = list_entry(_queue, struct tu_queue, vk);
+   struct tu_device *device = queue->device;
+
+   uint32_t cmd_count = 0, signal_count = 0;
+   for (uint32_t m = 0; m < n; m++) {
+      cmd_count += group[m]->command_buffer_count + 1;
+      signal_count += group[m]->signal_count;
+   }
+
+   struct vk_command_buffer **cmds = (struct vk_command_buffer **)
+      vk_alloc(&device->vk.alloc, MAX2(cmd_count, 1) * sizeof(*cmds), 8,
+               VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+   struct vk_sync_signal *signals = (struct vk_sync_signal *)
+      vk_alloc(&device->vk.alloc, MAX2(signal_count, 1) * sizeof(*signals), 8,
+               VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+   if (!cmds || !signals) {
+      vk_free(&device->vk.alloc, cmds);
+      vk_free(&device->vk.alloc, signals);
+      return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   /* A barrier goes before every member that has command buffers once an
+    * earlier member had some: it stands in for the kernel-submission
+    * boundary (and any dropped same-queue semaphore wait) between them.
+    */
+   uint32_t c = 0, sig = 0, barriers = 0;
+   bool had_cmds = false;
+   for (uint32_t m = 0; m < n; m++) {
+      if (group[m]->command_buffer_count && had_cmds) {
+         cmds[c++] = &device->ac8_coalesce_barrier->vk;
+         barriers++;
+      }
+      for (uint32_t i = 0; i < group[m]->command_buffer_count; i++)
+         cmds[c++] = group[m]->command_buffers[i];
+      had_cmds |= group[m]->command_buffer_count != 0;
+      for (uint32_t i = 0; i < group[m]->signal_count; i++)
+         signals[sig++] = group[m]->signals[i];
+   }
+
+   struct vk_queue_submit merged = *group[0];
+   merged.command_buffers = cmds;
+   merged.command_buffer_count = c;
+   merged.signals = signals;
+   merged.signal_count = sig;
+
+   VkResult result = queue_submit(_queue, &merged);
+
+   vk_free(&device->vk.alloc, cmds);
+   vk_free(&device->vk.alloc, signals);
+
+   if (result == VK_SUCCESS) {
+      queue->ac8.groups++;
+      queue->ac8.members += n;
+      queue->ac8.barriers += barriers;
+      queue->ac8.dropped_internal += dropped_internal;
+      queue->ac8.dropped_complete += dropped_complete;
+      if (tu_ac8_opt.log) {
+         uint64_t now = os_time_get_nano();
+         if (now - queue->ac8.last_log_ns > 2000000000ull) {
+            queue->ac8.last_log_ns = now;
+            tu_ac8_log(queue, "periodic");
+         }
+      }
+   }
+   return result;
+}
+
+static struct vk_queue_ac8_coalesce_ops tu_ac8_ops;
+
+static void
+tu_ac8_once_init(void)
+{
+   const char *e = os_get_option("TU_SUBMIT_COALESCE");
+   tu_ac8_opt.enabled = e && *e && strcmp(e, "0") != 0;
+   tu_ac8_opt.backlog = debug_get_num_option("TU_SUBMIT_COALESCE_BACKLOG", 16);
+   tu_ac8_opt.max_group =
+      CLAMP(debug_get_num_option("TU_SUBMIT_COALESCE_MAX", 32), 1, 64);
+   tu_ac8_opt.tiny_dw = debug_get_num_option("TU_SUBMIT_COALESCE_TINY_DW", 1024);
+   tu_ac8_opt.hold_max_ns =
+      (uint64_t) MAX2(debug_get_num_option("TU_SUBMIT_COALESCE_HOLD_MAX_US", 8000), 0) * 1000;
+   tu_ac8_opt.test_hold_us = debug_get_num_option("TU_SUBMIT_COALESCE_TEST_HOLD_US", 0);
+   tu_ac8_opt.log = debug_get_bool_option("TU_SUBMIT_COALESCE_LOG", false);
+   const char *ctl = os_get_option("TU_SUBMIT_COALESCE_CTL");
+   tu_ac8_opt.ctl = ctl && *ctl ? strdup(ctl) : NULL;
+   tu_ac8_ops = (struct vk_queue_ac8_coalesce_ops) {
+      .max_group = tu_ac8_opt.max_group,
+      .candidate = tu_ac8_candidate,
+      .hold = tu_ac8_hold,
+      .submit_group = tu_ac8_submit_group,
+   };
+}
+
+static void
+tu_ac8_queue_init(struct tu_device *device, struct tu_queue *queue)
+{
+   tu_ac8_parse_options();
+   if (!tu_ac8_opt.enabled || queue->type != TU_QUEUE_GFX ||
+       queue->vk.queue_family_index != 0)
+      return;
+
+   bool threaded = vk_device_supports_threaded_submit(&device->vk);
+   mesa_logi("tu-submit-coalesce enabled family=%u index=%u backlog=%d max=%u "
+             "tiny_dw=%u hold_max_us=%" PRIu64 " test_hold_us=%u threaded=%d ctl=%s",
+             queue->vk.queue_family_index, queue->vk.index_in_family,
+             tu_ac8_opt.backlog, tu_ac8_opt.max_group, tu_ac8_opt.tiny_dw,
+             tu_ac8_opt.hold_max_ns / 1000, tu_ac8_opt.test_hold_us, threaded,
+             tu_ac8_opt.ctl ? tu_ac8_opt.ctl : "none");
+   if (!threaded)
+      return;
+
+   queue->vk.ac8_coalesce = &tu_ac8_ops;
+   if (vk_queue_enable_submit_thread(&queue->vk) != VK_SUCCESS) {
+      queue->vk.ac8_coalesce = NULL;
+      mesa_logi("tu-submit-coalesce disabled: submit thread failed");
+   }
+}
+
+VkResult
+tu_ac8_coalesce_device_init(struct tu_device *device)
+{
+   tu_ac8_parse_options();
+   device->ac8_coalesce_pool = VK_NULL_HANDLE;
+   device->ac8_coalesce_barrier = NULL;
+   if (!tu_ac8_opt.enabled)
+      return VK_SUCCESS;
+
+   const VkCommandPoolCreateInfo pool_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .queueFamilyIndex = 0,
+   };
+   VkResult result =
+      vk_common_CreateCommandPool(tu_device_to_handle(device), &pool_info,
+                                  &device->vk.alloc,
+                                  &device->ac8_coalesce_pool);
+   if (result != VK_SUCCESS)
+      return result;
+
+   const VkCommandBufferAllocateInfo alloc_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = device->ac8_coalesce_pool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+   };
+   VkCommandBuffer vk_buf;
+   result = vk_common_AllocateCommandBuffers(tu_device_to_handle(device),
+                                             &alloc_info, &vk_buf);
+   if (result != VK_SUCCESS)
+      return result;
+
+   const VkCommandBufferBeginInfo begin = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT,
+   };
+   /* The barrier is resubmitted in many jobs at once: record it without
+    * u_trace points (it is outside every app submission's trace).
+    */
+   uint64_t tracepoints = p_atomic_xchg(&tu_gpu_tracepoint, 0);
+   result = tu_BeginCommandBuffer(vk_buf, &begin);
+   if (result != VK_SUCCESS) {
+      p_atomic_set(&tu_gpu_tracepoint, tracepoints);
+      return result;
+   }
+
+   /* Same execution and memory dependency as a semaphore wait with
+    * ALL_COMMANDS whose signal was submitted earlier on this queue.
+    */
+   const VkMemoryBarrier2 mb = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+   };
+   const VkDependencyInfo dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &mb,
+   };
+   tu_CmdPipelineBarrier2(vk_buf, &dep);
+   result = TU_CALLX(device, tu_EndCommandBuffer)(vk_buf);
+   p_atomic_set(&tu_gpu_tracepoint, tracepoints);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd, vk_buf);
+   if (u_trace_has_points(&cmd->trace)) {
+      mesa_logi("tu-submit-coalesce disabled: barrier recorded with trace points");
+      return VK_SUCCESS;
+   }
+   device->ac8_coalesce_barrier = cmd;
+   return VK_SUCCESS;
+}
+
+void
+tu_ac8_coalesce_device_drain(struct tu_device *device)
+{
+   /* Called first in tu_DestroyDevice: device teardown frees RD output,
+    * u_trace, autotune and BOs that queue submission uses before
+    * tu_queue_finish() stops the submit threads, so no coalescing thread may
+    * still have queued work by then.
+    */
+   if (device->ac8_coalesce_pool == VK_NULL_HANDLE)
+      return;
+   for (unsigned i = 0; i < TU_MAX_QUEUE_FAMILIES; i++) {
+      for (int q = 0; q < device->queue_count[i]; q++) {
+         if (device->queues[i][q].vk.ac8_coalesce)
+            vk_queue_ac8_drain(&device->queues[i][q].vk);
+      }
+   }
+}
+
+void
+tu_ac8_coalesce_device_finish(struct tu_device *device)
+{
+   if (device->ac8_coalesce_pool == VK_NULL_HANDLE)
+      return;
+   /* On a lost device the drain may return with a submit thread still
+    * inside queue_submit using the barrier: keep the pool (a leak) then.
+    */
+   if (!vk_device_is_lost_no_report(&device->vk))
+      vk_common_DestroyCommandPool(tu_device_to_handle(device),
+                                   device->ac8_coalesce_pool, &device->vk.alloc);
+   device->ac8_coalesce_pool = VK_NULL_HANDLE;
+   device->ac8_coalesce_barrier = NULL;
+}
+
 VkResult
 tu_queue_init(struct tu_device *device,
               struct tu_queue *queue,
@@ -835,6 +1212,7 @@ tu_queue_init(struct tu_device *device,
    queue->device = device;
    queue->type = type;
    queue->fence = -1;
+   memset(&queue->ac8, 0, sizeof(queue->ac8));
    queue->priority = -1;
    queue->msm_queue_id = 0;
 
@@ -861,6 +1239,8 @@ tu_queue_init(struct tu_device *device,
                                "submitqueue create failed");
    }
 
+   tu_ac8_queue_init(device, queue);
+
    return VK_SUCCESS;
 }
 
@@ -868,6 +1248,8 @@ void
 tu_queue_finish(struct tu_queue *queue)
 {
    bool emulated = vk_queue_is_emulated(&queue->vk);
+   if (queue->vk.ac8_coalesce && tu_ac8_opt.log)
+      tu_ac8_log(queue, "queue_destroy");
    vk_queue_finish(&queue->vk);
    if (!emulated)
       tu_drm_submitqueue_close(queue->device, queue);

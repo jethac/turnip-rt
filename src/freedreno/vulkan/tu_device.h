@@ -487,6 +487,12 @@ struct tu_device
    VkCommandPool dynamic_rendering_pool;
    uint32_t dynamic_rendering_fence;
 
+   /* AC8 TU_SUBMIT_COALESCE: full barrier recorded once, placed between
+    * members of a coalesced kernel submission. NULL when the knob is off.
+    */
+   VkCommandPool ac8_coalesce_pool;
+   struct tu_cmd_buffer *ac8_coalesce_barrier;
+
    /* Condition variable for timeline semaphore to notify waiters when a
     * new submit is executed. */
    pthread_cond_t timeline_cond;

@@ -702,6 +702,13 @@ struct tu_cmd_state
       uint32_t map_w, map_h;
       uint64_t map_iova;
    } vrs;
+
+   /* AC8 TU_SUBMIT_COALESCE: this command buffer (or an executed secondary)
+    * waits on a VkEvent. The event may be set by the host or another queue
+    * only after an earlier submission's signal, so such a command buffer may
+    * head a coalesced group but never follow another member.
+    */
+   bool ac8_waits_events;
 };
 
 struct tu_vis_stream_patchpoint {

@@ -36,6 +36,14 @@ struct tu_queue
    unsigned render_pass_idx;
 
    int fence;           /* timestamp/fence of the last queue submission */
+
+   /* AC8 TU_SUBMIT_COALESCE counters (only touched when the knob is on). */
+   struct {
+      uint64_t groups, members, barriers;
+      uint64_t dropped_internal, dropped_complete;
+      uint64_t holds, hold_ns, hold_timeouts;
+      uint64_t last_log_ns;
+   } ac8;
 };
 VK_DEFINE_HANDLE_CASTS(tu_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
 
@@ -50,5 +58,14 @@ tu_queue_init(struct tu_device *device,
 
 void
 tu_queue_finish(struct tu_queue *queue);
+
+VkResult
+tu_ac8_coalesce_device_init(struct tu_device *device);
+
+void
+tu_ac8_coalesce_device_drain(struct tu_device *device);
+
+void
+tu_ac8_coalesce_device_finish(struct tu_device *device);
 
 #endif

@@ -3539,10 +3539,17 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
 
    device->vis_stream_count = 0;
 
+   result = tu_ac8_coalesce_device_init(device);
+   if (result != VK_SUCCESS) {
+      vk_startup_errorf(device->instance, result, "submit coalesce");
+      goto fail_timeline_cond;
+   }
+
    *pDevice = tu_device_to_handle(device);
    return VK_SUCCESS;
 
 fail_timeline_cond:
+   tu_ac8_coalesce_device_finish(device);
 fail_QCTDD09112208_cmdbuf_start_cs:
 fail_bin_preamble:
 fail_autotune:
@@ -3604,6 +3611,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!device)
       return;
 
+   tu_ac8_coalesce_device_drain(device);
+
    tu_memory_trace_finish(device);
 
    if (FD_RD_DUMP(ENABLE))
@@ -3630,6 +3639,7 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    tu_destroy_empty_shaders(device);
 
+   tu_ac8_coalesce_device_finish(device);
    tu_destroy_dynamic_rendering(device);
 
    vk_meta_device_finish(&device->vk, &device->meta);
