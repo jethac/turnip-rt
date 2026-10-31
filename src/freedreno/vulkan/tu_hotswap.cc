@@ -41,6 +41,8 @@ struct hs_alt {
    std::string name;
    std::string path;
    std::vector<uint32_t> words;
+   uint16_t grid_xdiv;
+   uint32_t grid_gx, grid_gy;
 };
 
 struct hs_target {
@@ -53,6 +55,7 @@ struct hs_target {
    uint32_t poisoned;
    uint64_t binds[HS_MAXV];
    uint64_t fallback;
+   uint64_t gridded;
    uint32_t pipelines;
    uint32_t accepted[HS_MAXV];
    int last_group;
@@ -319,6 +322,65 @@ hs_load_manifest(const char *path)
    return true;
 }
 
+/* TU_HOTSWAP_GRID="<target>.<alt>=xhalf[:GXxGY] ..." (separators: space , ;).
+ * Gives a stage=cs alternative a dispatch-grid rule: while it is bound,
+ * direct vkCmdDispatch(Base) calls with a zero base group run ceil(X/2)
+ * groups in X (only when the recorded dims are GX x GY, if given).  Kept out
+ * of the manifest so manifests stay parseable by older drivers.  Any error
+ * drops every rule (logged); the manifest itself is unaffected. */
+static void
+hs_load_grid(const char *spec)
+{
+   char work[HS_CTL_MAX];
+   snprintf(work, sizeof(work), "%s", spec);
+   unsigned n = 0;
+   std::string bad;
+   for (char *save = NULL, *tok = strtok_r(work, " \t\r\n,;", &save); tok;
+        tok = strtok_r(NULL, " \t\r\n,;", &save)) {
+      char *eq = strchr(tok, '=');
+      char *dot = strchr(tok, '.');
+      if (!eq || !dot || dot > eq) {
+         bad = tok;
+         break;
+      }
+      *eq = 0;
+      *dot = 0;
+      int ti = hs_find_target(tok);
+      hs_alt *a = NULL;
+      if (ti >= 0 && hs.targets[ti].stage == MESA_SHADER_COMPUTE)
+         for (unsigned k = 1; k < HS_MAXV; k++)
+            if (hs.targets[ti].alt[k].defined && hs.targets[ti].alt[k].name == dot + 1)
+               a = &hs.targets[ti].alt[k];
+      unsigned gx = 0, gy = 0;
+      char tail = 0;
+      bool ok = a && !a->same_as && !a->grid_xdiv;
+      if (ok && !strcmp(eq + 1, "xhalf")) {
+         a->grid_xdiv = 2;
+      } else if (ok && sscanf(eq + 1, "xhalf:%ux%u%c", &gx, &gy, &tail) == 2 &&
+                 gx && gy && gx <= 65535 && gy <= 65535) {
+         a->grid_xdiv = 2;
+         a->grid_gx = gx;
+         a->grid_gy = gy;
+      } else {
+         bad = std::string(tok) + "." + (dot + 1) + "=" + (eq + 1) +
+               (ti < 0 ? " (no such target)" :
+                hs.targets[ti].stage != MESA_SHADER_COMPUTE ? " (target not stage=cs)" :
+                !a ? " (no such alt)" : a->same_as ? " (@alias)" :
+                a->grid_xdiv ? " (duplicate)" : " (rule)");
+         break;
+      }
+      n++;
+   }
+   if (!bad.empty()) {
+      for (hs_target &t : hs.targets)
+         for (unsigned k = 1; k < HS_MAXV; k++)
+            t.alt[k].grid_xdiv = 0, t.alt[k].grid_gx = 0, t.alt[k].grid_gy = 0;
+      mesa_loge("tu-hotswap: TU_HOTSWAP_GRID malformed at '%s'; no grid rules", bad.c_str());
+      return;
+   }
+   mesa_logi("tu-hotswap: grid rules=%u", n);
+}
+
 static void
 hs_init_once(void)
 {
@@ -338,6 +400,9 @@ hs_init_once(void)
       return;
    }
    hs.on = true;
+   const char *grid = os_get_option("TU_HOTSWAP_GRID");
+   if (grid && *grid)
+      hs_load_grid(grid);
    unsigned nalt = 0;
    for (const hs_target &t : hs.targets)
       for (unsigned k = 1; k < HS_MAXV; k++)
@@ -355,6 +420,10 @@ hs_init_once(void)
          uint32_t s0, s1;
          memcpy(&s0, h, 4);
          memcpy(&s1, h + 4, 4);
+         if (t.alt[k].grid_xdiv)
+            mesa_logi("tu-hotswap: target=%s alt=%u name=%s grid=xdiv%u when=%ux%u",
+                      t.label.c_str(), k, t.alt[k].name.c_str(), t.alt[k].grid_xdiv,
+                      t.alt[k].grid_gx, t.alt[k].grid_gy);
          mesa_logi("tu-hotswap: target=%s %s=%016" PRIx64 " alt=%u name=%s src=%08x%08x path=%s",
                    t.label.c_str(), t.by_src ? "src" : "dxil", t.hash, k,
                    t.alt[k].name.c_str(), s0, s1,
@@ -1077,6 +1146,9 @@ hs_log_binds(const char *why, uint64_t key)
             o += snprintf(buf + o, sizeof(buf) - o, "%sv%u=%" PRIu64, o ? "," : "", k, c);
       }
       uint64_t fbk = p_atomic_xchg(&t.fallback, 0);
+      uint64_t grd = p_atomic_xchg(&t.gridded, 0);
+      if (grd)
+         snprintf(buf + o, sizeof(buf) - o, " gridded=%" PRIu64, grd);
       mesa_logi("tu-hotswap: binds %s frame=%" PRIu64 " frames=%" PRIu64
                 " target=%s sel=%u pipelines=%u %s fallback=%" PRIu64,
                 why, key, key - hs.switch_key, t.label.c_str(),
@@ -1244,8 +1316,27 @@ hs_key(struct tu_device *dev)
    return p_atomic_read(&dev->vk.current_frame);
 }
 
+void
+tu_hotswap_grid_applied(const struct tu_hotswap_grid *grid)
+{
+   if (grid->target >= 0 && (size_t) grid->target < hs.targets.size())
+      p_atomic_inc(&hs.targets[grid->target].gridded);
+}
+
+static void
+hs_set_grid(struct tu_hotswap_grid *grid, int target, const hs_alt &a)
+{
+   if (!grid || !a.grid_xdiv)
+      return;
+   grid->xdiv = a.grid_xdiv;
+   grid->target = (int16_t) target;
+   grid->gx = a.grid_gx;
+   grid->gy = a.grid_gy;
+}
+
 struct tu_pipeline *
-tu_hotswap_bind(struct tu_device *dev, struct tu_pipeline *base)
+tu_hotswap_bind(struct tu_device *dev, struct tu_pipeline *base,
+                struct tu_hotswap_grid *grid)
 {
    struct tu_hotswap_pipe *hp = base->hotswap;
    uint64_t key = hs_key(dev);
@@ -1262,6 +1353,8 @@ tu_hotswap_bind(struct tu_device *dev, struct tu_pipeline *base)
    unsigned k = p_atomic_read(&hs_sel_atomic[hp->target]);
    if (!k || (hp->alias & (1u << k))) {
       p_atomic_inc(&t.binds[k]);
+      if (k)
+         hs_set_grid(grid, hp->target, t.alt[k]);
       return base;
    }
    if (!hp->variant[k]) {
@@ -1269,6 +1362,7 @@ tu_hotswap_bind(struct tu_device *dev, struct tu_pipeline *base)
       return base;
    }
    p_atomic_inc(&t.binds[k]);
+   hs_set_grid(grid, hp->target, t.alt[k]);
    VK_FROM_HANDLE(tu_pipeline, vp, hp->variant[k]);
    return vp;
 }

@@ -11,6 +11,7 @@
 #define TU_CMD_BUFFER_H
 
 #include "tu_common.h"
+#include "tu_hotswap.h"
 
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
@@ -548,6 +549,8 @@ struct tu_cmd_state
    struct tu_draw_state desc_sets;
    struct tu_draw_state load_state;
    struct tu_draw_state compute_load_state;
+   /* TU_HOTSWAP_GRID rule of the bound compute alternative (xdiv 0: none). */
+   struct tu_hotswap_grid hs_grid;
    struct tu_draw_state prim_order_gmem;
 
    struct tu_draw_state vs_params;

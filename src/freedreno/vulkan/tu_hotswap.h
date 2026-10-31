@@ -10,6 +10,16 @@
 
 #define TU_HOTSWAP_MAX_VARIANTS 32
 
+/* Optional per-alternative dispatch-grid rule (TU_HOTSWAP_GRID "<target>.<alt>=xhalf[:GXxGY]").
+ * xdiv == 0: no rule.  Applied by vkCmdDispatch(Base) to direct dispatches with a
+ * zero base group while the alternative is bound: X groups := ceil(X / xdiv),
+ * only if gx == 0 or the recorded dims equal gx x gy. */
+struct tu_hotswap_grid {
+   uint16_t xdiv;
+   int16_t target;
+   uint32_t gx, gy;
+};
+
 struct tu_hotswap_pipe {
    int target;
    uint64_t dxil;
@@ -42,7 +52,10 @@ void tu_hotswap_build_linked(struct tu_device *dev, struct tu_pipeline *base,
                              tu_hotswap_link_cb create, void *data);
 
 struct tu_pipeline *tu_hotswap_bind(struct tu_device *dev,
-                                    struct tu_pipeline *base);
+                                    struct tu_pipeline *base,
+                                    struct tu_hotswap_grid *grid);
+
+void tu_hotswap_grid_applied(const struct tu_hotswap_grid *grid);
 
 void tu_hotswap_destroy(struct tu_device *dev, struct tu_pipeline *base,
                         const VkAllocationCallbacks *alloc);

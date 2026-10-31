@@ -5993,8 +5993,9 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
 
+   struct tu_hotswap_grid hs_grid = {};
    if (unlikely(pipeline->hotswap))
-      pipeline = tu_hotswap_bind(cmd->device, pipeline);
+      pipeline = tu_hotswap_bind(cmd->device, pipeline, &hs_grid);
 
    if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
       cmd->state.rt_pipeline = pipeline;
@@ -6007,6 +6008,7 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
       tu_cs_emit_state_ib(&cmd->cs,
                           pipeline->shaders[MESA_SHADER_COMPUTE]->state);
       cmd->state.compute_load_state = pipeline->load_state;
+      cmd->state.hs_grid = hs_grid;
       return;
    }
 
@@ -10838,6 +10840,13 @@ tu_CmdDispatchBase(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
    struct tu_dispatch_info info = {};
+
+   if (unlikely(cmd_buffer->state.hs_grid.xdiv) && !base_x && !base_y && !base_z &&
+       (!cmd_buffer->state.hs_grid.gx ||
+        (x == cmd_buffer->state.hs_grid.gx && y == cmd_buffer->state.hs_grid.gy))) {
+      x = DIV_ROUND_UP(x, cmd_buffer->state.hs_grid.xdiv);
+      tu_hotswap_grid_applied(&cmd_buffer->state.hs_grid);
+   }
 
    info.blocks[0] = x;
    info.blocks[1] = y;
