@@ -1807,6 +1807,17 @@ tu_vrs_pipeline_fsr(struct tu_shader *fs, uint32_t samples,
       p_atomic_inc(&vrs_stat_appop_accepted);
    }
    if (v->has_kill || cap == 1) {
+      /* An app rate already >= 2x2 is at or above the cap: keep it, since
+       * MIN with the map would shade finer than the app asked inside the
+       * fovea.
+       */
+      if (fsr->fragment_size.width >= 2 && fsr->fragment_size.height >= 2) {
+         if (v->has_kill)
+            p_atomic_inc(&vrs_stat_state[1]);
+         else
+            p_atomic_inc(&vrs_stat_ps[VRS_PS_CAPPED]);
+         return false;
+      }
       /* Alpha-tested/masked, or an allowlist entry capped at 2x2: cap at 2x2
        * (MIN with a >=2x2 pipeline rate).
        */
