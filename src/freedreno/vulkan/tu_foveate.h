@@ -180,6 +180,8 @@ bool tu_vrs_transl_draw_ok(const struct vk_color_blend_state *cb);
  * pass also swaps the transl radii/cap into *f. Only valid when state != OFF.
  */
 bool tu_vrs_frame_select(struct tu_vrs_frame *f, bool transl);
+/* The transl map is on for the current epoch (gaze usable and transl on). */
+bool tu_vrs_transl_active(struct tu_device *dev);
 
 bool tu_vrs_linear(void);
 

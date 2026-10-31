@@ -7939,7 +7939,11 @@ tu_vrs_rendering_eligible(struct tu_cmd_buffer *cmd,
    }
    bool tr = false;
    if (!tu_vrs_dims_ok(w, h)) {
-      if (!tu_vrs_transl_dims_ok(w, h))
+      /* A transl-class pass is eligible only while the transl map is on
+       * this epoch; otherwise it stays exactly as without the knob (no
+       * per-draw attachment FSR against a flat map).
+       */
+      if (!tu_vrs_transl_dims_ok(w, h) || !tu_vrs_transl_active(cmd->device))
          return false;
       tr = true;
    }

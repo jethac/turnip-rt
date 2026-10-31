@@ -767,8 +767,9 @@ enum { VRS_PS_ALLOW, VRS_PS_DENY, VRS_PS_UNLISTED, VRS_PS_UNHASHED,
        VRS_PS_CAPPED, VRS_PS_DEPTHLESS_PASS, VRS_PS_STATS };
 static uint32_t vrs_stat_ps[VRS_PS_STATS];
 static uint32_t vrs_dumped;
-/* TU_VRS_TRANSL: transl-class passes with the gaze map / flat (off), and
- * draws kept full rate because nothing blends.
+/* TU_VRS_TRANSL: transl-class passes with the gaze map / left ineligible
+ * because the transl map is off, and draws kept full rate because nothing
+ * blends.
  */
 enum { VRS_TR_GAZE, VRS_TR_OFF, VRS_TR_UNBLENDED, VRS_TR_STATS };
 static uint32_t vrs_stat_tr[VRS_TR_STATS];
@@ -1269,6 +1270,19 @@ tu_vrs_transl_draw_ok(const struct vk_color_blend_state *cb)
    }
    p_atomic_inc(&vrs_stat_tr[VRS_TR_UNBLENDED]);
    return false;
+}
+
+bool
+tu_vrs_transl_active(struct tu_device *dev)
+{
+   if (!vrs_cfg.transl_dims_count)
+      return false;
+   struct tu_vrs_frame f;
+   tu_vrs_frame_get(dev, &f);
+   bool on = f.state != TU_VRS_OFF && f.t_on;
+   if (!on)
+      p_atomic_inc(&vrs_stat_tr[VRS_TR_OFF]);
+   return on;
 }
 
 bool
