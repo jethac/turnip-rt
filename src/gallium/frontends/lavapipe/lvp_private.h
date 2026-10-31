@@ -226,6 +226,10 @@ struct lvp_device {
    struct pipe_resource *zero_buffer; /* for zeroed bda */
    bool poison_mem;
    bool print_cmds;
+   /* LVP_MULTIVIEW_SAME_LAYER: every view of a multiview pass renders into
+    * the bound layer and uses viewport/scissor i for view i.
+    */
+   bool multiview_same_layer;
 
    struct lp_texture_handle *null_texture_handle;
    struct lp_texture_handle *null_image_handle;

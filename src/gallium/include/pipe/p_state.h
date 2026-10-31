@@ -452,7 +452,13 @@ struct pipe_framebuffer_state
     */
    bool downscale_cbufs:1;
 
-   uint8_t _pad:6;
+   /**
+    * Multiview with every view rendering into the bound layer instead of
+    * layer base + view index (lavapipe LVP_MULTIVIEW_SAME_LAYER).
+    */
+   bool viewmask_same_layer:1;
+
+   uint8_t _pad:5;
 
    /** used for multiview */
    uint8_t viewmask;

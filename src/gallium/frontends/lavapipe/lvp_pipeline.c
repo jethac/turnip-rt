@@ -910,6 +910,73 @@ copy_shader_sanitized(struct lvp_shader *dst, const struct lvp_shader *src)
    assert(!dst->shader_cso);
 }
 
+/* VK_QCOM_multiview_per_view_viewports (and LVP_MULTIVIEW_SAME_LAYER):
+ * view i uses viewport and scissor i. The last pre-rasterization stage
+ * writes ViewportIndex = ViewIndex; draw and llvmpipe then select the
+ * viewport transform, guard band and scissor through the normal per-vertex
+ * viewport index. Runs on lowered pipeline NIR, where outputs are only
+ * stored by the copies at the end of the shader or before each emit. A
+ * shader that writes ViewportIndex itself keeps its value, as on turnip.
+ */
+static bool
+lvp_lower_per_view_viewport(nir_shader *nir)
+{
+   if (nir->info.outputs_written & VARYING_BIT_VIEWPORT)
+      return false;
+
+   nir_variable *var =
+      nir_create_variable_with_location(nir, nir_var_shader_out,
+                                        VARYING_SLOT_VIEWPORT, glsl_int_type());
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_create(impl);
+
+   if (nir->info.stage == MESA_SHADER_GEOMETRY) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_emit_vertex &&
+                intr->intrinsic != nir_intrinsic_emit_vertex_with_counter)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_store_var(&b, var, nir_load_view_index(&b), 0x1);
+         }
+      }
+   } else {
+      b.cursor = nir_after_impl(impl);
+      nir_store_var(&b, var, nir_load_view_index(&b), 0x1);
+   }
+
+   nir_progress(true, impl, nir_metadata_none);
+   nir_shader_gather_info(nir, impl);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
+   return true;
+}
+
+static void
+lvp_pipeline_lower_per_view_viewport(struct lvp_device *device,
+                                     struct lvp_pipeline *pipeline)
+{
+   const struct vk_multiview_state *mv = pipeline->graphics_state.mv;
+   if (!mv || !mv->view_mask)
+      return;
+   if (!device->vk.enabled_features.multiviewPerViewViewports &&
+       !device->multiview_same_layer)
+      return;
+
+   static const mesa_shader_stage last_stages[] = {
+      MESA_SHADER_GEOMETRY, MESA_SHADER_TESS_EVAL, MESA_SHADER_VERTEX,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(last_stages); i++) {
+      struct lvp_pipeline_nir *pnir = pipeline->shaders[last_stages[i]].pipeline_nir;
+      if (pnir) {
+         lvp_lower_per_view_viewport(pnir->nir);
+         return;
+      }
+   }
+}
+
 static VkResult
 lvp_graphics_pipeline_init(struct lvp_pipeline *pipeline,
                            struct lvp_device *device,
@@ -1003,6 +1070,7 @@ lvp_graphics_pipeline_init(struct lvp_pipeline *pipeline,
                                                    VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |
                                                    VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT));
 
+   bool compiled_pre_raster = false;
    for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
       const VkPipelineShaderStageCreateInfo *sinfo = &pCreateInfo->pStages[i];
       mesa_shader_stage stage = vk_to_mesa_shader_stage(sinfo->stage);
@@ -1013,6 +1081,8 @@ lvp_graphics_pipeline_init(struct lvp_pipeline *pipeline,
          if (!(pipeline->stages & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT))
             continue;
       }
+      if (stage != MESA_SHADER_FRAGMENT)
+         compiled_pre_raster = true;
       result = lvp_shader_compile_to_ir(pipeline, pCreateInfo->pNext, sinfo);
       if (result != VK_SUCCESS)
          goto fail;
@@ -1025,6 +1095,8 @@ lvp_graphics_pipeline_init(struct lvp_pipeline *pipeline,
       default: break;
       }
    }
+   if (compiled_pre_raster)
+      lvp_pipeline_lower_per_view_viewport(device, pipeline);
    if (pCreateInfo->stageCount && pipeline->shaders[MESA_SHADER_TESS_EVAL].pipeline_nir) {
       nir_lower_patch_vertices(pipeline->shaders[MESA_SHADER_TESS_EVAL].pipeline_nir->nir, pipeline->shaders[MESA_SHADER_TESS_CTRL].pipeline_nir->nir->info.tess.tcs_vertices_out, NULL);
    }

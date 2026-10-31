@@ -1522,6 +1522,16 @@ render_needs_clear(struct rendering_state *state)
    return false;
 }
 
+/* The views that select a layer of the attachments: none for a
+ * same-layer multiview pass (LVP_MULTIVIEW_SAME_LAYER), which loads,
+ * clears and resolves as a single-layer pass. Queries keep the real mask.
+ */
+static uint32_t
+layered_viewmask(const struct rendering_state *state)
+{
+   return state->framebuffer.viewmask_same_layer ? 0 : state->framebuffer.viewmask;
+}
+
 static void clear_attachment_layers(struct rendering_state *state,
                                     struct lvp_image_view *imgv,
                                     const VkRect2D *rect,
@@ -1568,8 +1578,8 @@ static void render_clear(struct rendering_state *state)
 
       struct lvp_image_view *imgv = state->color_att[i].imgv;
 
-      if (state->framebuffer.viewmask) {
-         u_foreach_bit(i, state->framebuffer.viewmask)
+      if (layered_viewmask(state)) {
+         u_foreach_bit(i, layered_viewmask(state))
             clear_attachment_layers(state, imgv, &state->render_area,
                                     i, 1, 0, 0, 0, &color_clear_val);
       } else {
@@ -1598,8 +1608,8 @@ static void render_clear(struct rendering_state *state)
    }
 
    if (ds_clear_flags) {
-      if (state->framebuffer.viewmask) {
-         u_foreach_bit(i, state->framebuffer.viewmask)
+      if (layered_viewmask(state)) {
+         u_foreach_bit(i, layered_viewmask(state))
             clear_attachment_layers(state, state->ds_imgv, &state->render_area,
                                     i, 1, ds_clear_flags, dclear_val, sclear_val, NULL);
       } else {
@@ -1630,7 +1640,7 @@ static void render_clear_fast(struct rendering_state *state)
        state->render_area.extent.height != state->framebuffer.height)
       goto slow_clear;
 
-   if (state->framebuffer.viewmask)
+   if (layered_viewmask(state))
       goto slow_clear;
 
    if (state->conditional_rendering.enabled)
@@ -1953,13 +1963,18 @@ handle_begin_rendering(struct vk_cmd_queue_entry *cmd,
    }
 
    state->framebuffer.viewmask = info->viewMask;
+   state->framebuffer.viewmask_same_layer =
+      info->viewMask && state->device->multiview_same_layer;
    state->render_area = info->renderArea;
    state->suspending = suspending;
    state->framebuffer.width = info->renderArea.offset.x +
                               info->renderArea.extent.width;
    state->framebuffer.height = info->renderArea.offset.y +
                                info->renderArea.extent.height;
-   state->framebuffer.layers = info->viewMask ? util_last_bit(info->viewMask) : info->layerCount;
+   if (state->framebuffer.viewmask_same_layer)
+      state->framebuffer.layers = 1;
+   else
+      state->framebuffer.layers = info->viewMask ? util_last_bit(info->viewMask) : info->layerCount;
    assert(info->colorAttachmentCount <= PIPE_MAX_COLOR_BUFS);
    state->framebuffer.nr_cbufs = info->colorAttachmentCount;
 
@@ -2045,8 +2060,8 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
 
    for (unsigned i = 0; i < state->framebuffer.nr_cbufs; i++) {
       if (state->color_att[i].imgv && state->color_att[i].store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE) {
-         if (state->framebuffer.viewmask) {
-            u_foreach_bit(i, state->framebuffer.viewmask)
+         if (layered_viewmask(state)) {
+            u_foreach_bit(i, layered_viewmask(state))
                clear_attachment_layers(state, state->color_att[i].imgv, &state->render_area,
                                        i, 1, 0, 0, 0, &color_clear_val);
          } else {
@@ -2069,8 +2084,8 @@ static void handle_end_rendering(struct vk_cmd_queue_entry *cmd,
    double dclear_val = 0.2389234;
    uint32_t sclear_val = rand() % UINT8_MAX;
    if (ds_clear_flags) {
-      if (state->framebuffer.viewmask) {
-         u_foreach_bit(i, state->framebuffer.viewmask)
+      if (layered_viewmask(state)) {
+         u_foreach_bit(i, layered_viewmask(state))
             clear_attachment_layers(state, state->ds_imgv, &state->render_area,
                                     i, 1, ds_clear_flags, dclear_val, sclear_val, NULL);
       } else {
@@ -3571,8 +3586,8 @@ static void handle_clear_attachments(struct vk_cmd_queue_entry *cmd,
          rect->rect.offset.y = MAX2(rect->rect.offset.y, 0);
          rect->rect.extent.width = MIN2(rect->rect.extent.width, state->framebuffer.width - rect->rect.offset.x);
          rect->rect.extent.height = MIN2(rect->rect.extent.height, state->framebuffer.height - rect->rect.offset.y);
-         if (state->framebuffer.viewmask) {
-            u_foreach_bit(i, state->framebuffer.viewmask)
+         if (layered_viewmask(state)) {
+            u_foreach_bit(i, layered_viewmask(state))
                clear_attachment_layers(state, imgv, &rect->rect,
                                        i, 1,
                                        ds_clear_flags, dclear_val, sclear_val,
