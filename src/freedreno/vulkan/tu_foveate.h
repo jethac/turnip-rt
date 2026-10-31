@@ -162,11 +162,24 @@ struct tu_vrs_frame {
    uint32_t cap;            /* max level: 0=1x1 1=2x2 2=4x4 */
    uint32_t dither;         /* dither band width in rate texels */
    uint32_t flags;          /* gaze flags as published (shm v2), else 0 */
+   bool base_on;            /* TU_VRS_DIMS passes take the map (ctl on) */
+   bool t_on;               /* TU_VRS_TRANSL passes take the map */
+   float t_r0, t_r1;        /* transl radii (same unit as r0/r1) */
+   uint32_t t_cap;          /* transl max level */
 };
 
 bool tu_vrs_enabled(void);
 
 bool tu_vrs_dims_ok(uint32_t w, uint32_t h);
+
+/* TU_VRS_TRANSL: separate-translucency pass class (see tu_foveate.cc). */
+struct vk_color_blend_state;
+bool tu_vrs_transl_dims_ok(uint32_t w, uint32_t h);
+bool tu_vrs_transl_draw_ok(const struct vk_color_blend_state *cb);
+/* Whether a pass of this class takes the gaze map this epoch; for a transl
+ * pass also swaps the transl radii/cap into *f. Only valid when state != OFF.
+ */
+bool tu_vrs_frame_select(struct tu_vrs_frame *f, bool transl);
 
 bool tu_vrs_linear(void);
 

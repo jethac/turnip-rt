@@ -658,6 +658,11 @@ struct tu_vrs_ctl {
    uint32_t max;          /* 1, 2, 4 */
    bool harsh;
    bool parse_error;
+   /* TU_VRS_TRANSL scope (only parsed when TU_VRS_TRANSL is set) */
+   bool t_on;
+   float t_r0_deg, t_r1_deg;  /* <0: base radii */
+   float t_r0_eh, t_r1_eh;    /* <0: base radii */
+   uint32_t t_max;            /* 1, 2, 4 */
 };
 
 /* One TU_VRS_PS_ALLOW/DENY entry: the top <bits> of the 64-bit DXIL hash
@@ -705,6 +710,13 @@ struct tu_vrs_cfg {
     * attachment rate is 1x1 and both ops are the identity there.
     */
    bool app_comb_max;
+   /* TU_VRS_TRANSL: render-area dims of the separate-translucency class.
+    * Depth passes on this list (and not on TU_VRS_DIMS) get the gaze map
+    * with the transl radii; only draws that blend into a written colour
+    * attachment shade coarse there. Unset: no pass is in this class.
+    */
+   uint32_t transl_dims[TU_VRS_MAX_DIMS][2];
+   uint32_t transl_dims_count;
 };
 
 static struct tu_vrs_cfg vrs_cfg;
@@ -755,6 +767,11 @@ enum { VRS_PS_ALLOW, VRS_PS_DENY, VRS_PS_UNLISTED, VRS_PS_UNHASHED,
        VRS_PS_CAPPED, VRS_PS_DEPTHLESS_PASS, VRS_PS_STATS };
 static uint32_t vrs_stat_ps[VRS_PS_STATS];
 static uint32_t vrs_dumped;
+/* TU_VRS_TRANSL: transl-class passes with the gaze map / flat (off), and
+ * draws kept full rate because nothing blends.
+ */
+enum { VRS_TR_GAZE, VRS_TR_OFF, VRS_TR_UNBLENDED, VRS_TR_STATS };
+static uint32_t vrs_stat_tr[VRS_TR_STATS];
 
 static const float tu_vrs_layout_eh[3][2] = {
    { 0.20f, INFINITY }, /* A */
@@ -1030,8 +1047,38 @@ tu_vrs_ps_init(void)
  *   r0eh=<f> r1eh=<f>         radii in eye-heights (fallback)
  *   max=1|2|4                 coarsest rate allowed
  *   harsh | normal            debug: 4x4 straight outside a small fovea
+ * With TU_VRS_TRANSL set (otherwise these are parse errors, as before):
+ *   transl=on|off             gaze map on transl-class passes (independent
+ *                             of on/off, which governs TU_VRS_DIMS passes)
+ *   tr0=<deg> tr1=<deg>       transl radii in degrees
+ *   tr0eh=<f> tr1eh=<f>       transl radii in eye-heights
+ *   tmax=1|2|4                coarsest rate on transl-class passes
  * An unknown token is a parse error and forces the gaze map off.
  */
+static bool
+tu_vrs_parse_transl_token(const char *t, struct tu_vrs_ctl *c)
+{
+   float f;
+   unsigned u;
+   if (!strcmp(t, "transl=on") || !strcmp(t, "transl=1"))
+      c->t_on = true;
+   else if (!strcmp(t, "transl=off") || !strcmp(t, "transl=0"))
+      c->t_on = false;
+   else if (sscanf(t, "tr0=%f", &f) == 1 && f > 0.f)
+      c->t_r0_deg = f;
+   else if (sscanf(t, "tr1=%f", &f) == 1 && f > 0.f)
+      c->t_r1_deg = f;
+   else if (sscanf(t, "tr0eh=%f", &f) == 1 && f > 0.f)
+      c->t_r0_eh = f;
+   else if (sscanf(t, "tr1eh=%f", &f) == 1 && f > 0.f)
+      c->t_r1_eh = f;
+   else if (sscanf(t, "tmax=%u", &u) == 1 && (u == 1 || u == 2 || u == 4))
+      c->t_max = u;
+   else
+      return false;
+   return true;
+}
+
 static void
 tu_vrs_parse_ctl(const char *s, struct tu_vrs_ctl *c)
 {
@@ -1063,6 +1110,8 @@ tu_vrs_parse_ctl(const char *s, struct tu_vrs_ctl *c)
          c->r1_eh = f;
       else if (sscanf(t, "max=%u", &u) == 1 && (u == 1 || u == 2 || u == 4))
          c->max = u;
+      else if (vrs_cfg.transl_dims_count && tu_vrs_parse_transl_token(t, c))
+         ;
       else
          c->parse_error = true;
    }
@@ -1101,6 +1150,21 @@ tu_vrs_init_once(void)
    const char *dbg = os_get_option("TU_VRS_DEBUG");
    e->harsh = dbg && !strcmp(dbg, "harsh");
 
+   const char *transl = os_get_option("TU_VRS_TRANSL");
+   if (transl && *transl) {
+      tu_vrs_parse_dims_into(transl, vrs_cfg.transl_dims,
+                             &vrs_cfg.transl_dims_count);
+      e->t_on = debug_get_bool_option("TU_VRS_TRANSL_ON", true);
+      e->t_r0_deg = env_f("TU_VRS_TRANSL_R0_DEG", -1.f);
+      e->t_r1_deg = env_f("TU_VRS_TRANSL_R1_DEG", -1.f);
+      e->t_r0_eh = env_f("TU_VRS_TRANSL_R0", -1.f);
+      e->t_r1_eh = env_f("TU_VRS_TRANSL_R1", -1.f);
+      uint32_t tmax = debug_get_num_option("TU_VRS_TRANSL_MAX", 2);
+      e->t_max = tmax >= 4 ? 4 : tmax >= 2 ? 2 : 1;
+      if (!vrs_cfg.transl_dims_count)
+         mesa_loge("tu-vrs: TU_VRS_TRANSL='%s' has no WxH entry; transl scope off", transl);
+   }
+
    vrs_cfg.dither = MIN2(debug_get_num_option("TU_VRS_DITHER", 2), 8);
    vrs_cfg.hold_ns = (uint64_t) debug_get_num_option("TU_VRS_HOLD_MS", 300) * 1000000ull;
    vrs_cfg.hyst_ns = (uint64_t) debug_get_num_option("TU_VRS_HYST_MS", 100) * 1000000ull;
@@ -1127,6 +1191,15 @@ tu_vrs_init_once(void)
              cfg.fixed_y, (unsigned) (cfg.stale_ns / 1000000ull), vrs_cfg.require_v2);
    for (uint32_t i = 0; i < vrs_cfg.dims_count; i++)
       mesa_logi("tu-vrs: dims[%u]=%ux%u", i, vrs_cfg.dims[i][0], vrs_cfg.dims[i][1]);
+   if (vrs_cfg.transl_dims_count) {
+      mesa_logi("tu-vrs-transl: on=%d r0_deg=%.2f r1_deg=%.2f r0_eh=%.3f r1_eh=%.3f max=%u (<0: base radii)",
+                e->t_on, e->t_r0_deg, e->t_r1_deg, e->t_r0_eh, e->t_r1_eh, e->t_max);
+      for (uint32_t i = 0; i < vrs_cfg.transl_dims_count; i++)
+         mesa_logi("tu-vrs-transl: dims[%u]=%ux%u%s", i, vrs_cfg.transl_dims[i][0],
+                   vrs_cfg.transl_dims[i][1],
+                   tu_vrs_dims_ok(vrs_cfg.transl_dims[i][0], vrs_cfg.transl_dims[i][1]) ?
+                   " (also on TU_VRS_DIMS: base wins)" : "");
+   }
 }
 
 static void
@@ -1173,6 +1246,47 @@ tu_vrs_dims_ok(uint32_t w, uint32_t h)
    return false;
 }
 
+bool
+tu_vrs_transl_dims_ok(uint32_t w, uint32_t h)
+{
+   for (uint32_t i = 0; i < vrs_cfg.transl_dims_count; i++)
+      if (vrs_cfg.transl_dims[i][0] == w && vrs_cfg.transl_dims[i][1] == h)
+         return true;
+   return false;
+}
+
+/* A transl-class draw shades coarse only if it blends into at least one
+ * written colour attachment (translucent materials); opaque writes in the
+ * same pass class (scene-colour copies, clears) stay full rate.
+ */
+bool
+tu_vrs_transl_draw_ok(const struct vk_color_blend_state *cb)
+{
+   for (uint32_t i = 0; i < cb->attachment_count && i < MESA_VK_MAX_COLOR_ATTACHMENTS; i++) {
+      if ((cb->color_write_enables & (1u << i)) &&
+          cb->attachments[i].blend_enable && cb->attachments[i].write_mask)
+         return true;
+   }
+   p_atomic_inc(&vrs_stat_tr[VRS_TR_UNBLENDED]);
+   return false;
+}
+
+bool
+tu_vrs_frame_select(struct tu_vrs_frame *f, bool transl)
+{
+   if (!transl)
+      return f->base_on;
+   if (!f->t_on) {
+      p_atomic_inc(&vrs_stat_tr[VRS_TR_OFF]);
+      return false;
+   }
+   f->r0 = f->t_r0;
+   f->r1 = f->t_r1;
+   f->cap = f->t_cap;
+   p_atomic_inc(&vrs_stat_tr[VRS_TR_GAZE]);
+   return true;
+}
+
 /* Read the ctl file once per epoch. Missing file: environment defaults. */
 static void
 tu_vrs_read_ctl(struct tu_vrs_latch *l)
@@ -1206,6 +1320,10 @@ tu_vrs_read_ctl(struct tu_vrs_latch *l)
    mesa_logi("tu-vrs: ctl change=%u epoch=%" PRIu64 " present=%d raw='%s' -> on=%d layout=%c r0_deg=%.2f r1_deg=%.2f r0_eh=%.3f r1_eh=%.3f max=%u harsh=%d parse_error=%d",
              l->ctl_changes, l->key, present, raw, c.on, c.layout, c.r0_deg,
              c.r1_deg, c.r0_eh, c.r1_eh, c.max, c.harsh, c.parse_error);
+   if (vrs_cfg.transl_dims_count)
+      mesa_logi("tu-vrs-transl: ctl change=%u -> transl=%d tr0_deg=%.2f tr1_deg=%.2f tr0_eh=%.3f tr1_eh=%.3f tmax=%u",
+                l->ctl_changes, c.t_on, c.t_r0_deg, c.t_r1_deg, c.t_r0_eh,
+                c.t_r1_eh, c.t_max);
 }
 
 struct tu_vrs_sample {
@@ -1372,6 +1490,14 @@ tu_vrs_log_interval(struct tu_vrs_latch *l)
                 ps[VRS_PS_UNHASHED], ps[VRS_PS_CAPPED],
                 ps[VRS_PS_DEPTHLESS_PASS], vrs_cfg.ps_error);
    }
+   if (vrs_cfg.transl_dims_count) {
+      uint32_t tr[VRS_TR_STATS];
+      for (unsigned i = 0; i < VRS_TR_STATS; i++)
+         tr[i] = p_atomic_xchg(&vrs_stat_tr[i], 0);
+      mesa_logi("tu-vrs-transl: epoch=%" PRIu64 " on=%d passes gaze=%u off=%u draws unblended=%u r0=%.3f r1=%.3f cap=%u",
+                l->key, f->t_on, tr[VRS_TR_GAZE], tr[VRS_TR_OFF],
+                tr[VRS_TR_UNBLENDED], f->t_r0, f->t_r1, f->t_cap);
+   }
    {
       uint32_t op[5];
       for (unsigned i = 0; i < 5; i++)
@@ -1418,7 +1544,8 @@ tu_vrs_update(struct tu_vrs_latch *l, uint64_t frame)
    }
 
    bool use = false;
-   if (!c->on || c->parse_error) {
+   bool t_on = vrs_cfg.transl_dims_count && c->t_on;
+   if ((!c->on && !t_on) || c->parse_error) {
       f->reason = c->parse_error ? TU_VRS_R_CTL_PARSE : TU_VRS_R_CTL_OFF;
       l->active = false;
       l->valid_since_ns = 0;
@@ -1505,18 +1632,35 @@ tu_vrs_update(struct tu_vrs_latch *l, uint64_t frame)
       if (f->r1 < f->r0)
          f->r1 = f->r0;
       f->cap = c->max >= 4 ? 2 : c->max >= 2 ? 1 : 0;
+      f->base_on = c->on;
+      f->t_on = t_on;
+      if (t_on) {
+         float tr0 = deg ? c->t_r0_deg : c->t_r0_eh;
+         float tr1 = deg ? c->t_r1_deg : c->t_r1_eh;
+         f->t_r0 = tr0 > 0.f ? tr0 : f->r0;
+         f->t_r1 = tr1 > 0.f ? tr1 : f->r1;
+         if (f->t_r1 < f->t_r0)
+            f->t_r1 = f->t_r0;
+         f->t_cap = c->t_max >= 4 ? 2 : c->t_max >= 2 ? 1 : 0;
+      }
       if (c->harsh) {
          f->r0 = deg ? 5.0f : 0.06f;
          f->r1 = f->r0;
          f->cap = 2;
          f->dither = 0;
+         f->t_r0 = f->t_r1 = f->r0;
+         f->t_cap = 2;
       } else if (f->flags & TU_GAZE_FLAG_SACCADE) {
          f->r0 *= vrs_cfg.saccade_scale;
          f->r1 *= vrs_cfg.saccade_scale;
+         f->t_r0 *= vrs_cfg.saccade_scale;
+         f->t_r1 *= vrs_cfg.saccade_scale;
       }
       /* Ramp in after (re)activation: 2x2 cap for the first half. */
-      if (frame - l->ramp_start < (uint64_t) DIV_ROUND_UP(vrs_cfg.ramp, 2))
+      if (frame - l->ramp_start < (uint64_t) DIV_ROUND_UP(vrs_cfg.ramp, 2)) {
          f->cap = MIN2(f->cap, 1u);
+         f->t_cap = MIN2(f->t_cap, 1u);
+      }
       l->epochs_active++;
    } else {
       f->state = TU_VRS_OFF;

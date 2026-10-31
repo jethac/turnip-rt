@@ -695,6 +695,10 @@ struct tu_cmd_state
        * TU_VRS_PS_ALLOW, so only allowlisted draws shade coarse.
        */
       bool pass_depthless;
+      /* ...and it is a TU_VRS_TRANSL (separate-translucency) pass: transl
+       * radii, and only draws that blend shade coarse.
+       */
+      bool pass_transl;
       /* Secondary continuing a pass begun elsewhere: dimensions unknown, the
        * primary's quality buffer decides (gaze map or flat).
        */

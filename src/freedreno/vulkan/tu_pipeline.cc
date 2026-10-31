@@ -4346,6 +4346,8 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
           * the per-pipeline veto applies here. A veto keeps stock behaviour.
           */
          if ((cmd->state.vrs.inherited || (!att && cmd->state.vrs.pass_eligible)) &&
+             (!cmd->state.vrs.pass_transl ||
+              tu_vrs_transl_draw_ok(&cmd->vk.dynamic_graphics_state.cb)) &&
              tu_vrs_pipeline_fsr(
                 cmd->state.shaders[MESA_SHADER_FRAGMENT],
                 cmd->vk.dynamic_graphics_state.ms.rasterization_samples,
@@ -4365,7 +4367,16 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
                   BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
                               MESA_VK_DYNAMIC_ATTACHMENT_FEEDBACK_LOOP_ENABLE) ||
                   BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
-                              MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES),
+                              MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) ||
+                  (cmd->state.vrs.pass_transl &&
+                   (BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                                MESA_VK_DYNAMIC_CB_BLEND_ENABLES) ||
+                    BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                                MESA_VK_DYNAMIC_CB_WRITE_MASKS) ||
+                    BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                                MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES) ||
+                    BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                                MESA_VK_DYNAMIC_CB_ATTACHMENT_COUNT))),
                   &vrs_fsr,
                   att,
                   cmd->state.program.writes_shading_rate,

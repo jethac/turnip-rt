@@ -7441,7 +7441,8 @@ tu7_emit_vrs_quality_buffer(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
       struct tu_vrs_frame f;
       tu_vrs_frame_get(dev, &f);
       kind = TU_VRS_PASS_OFF;
-      if (f.state != TU_VRS_OFF) {
+      if (f.state != TU_VRS_OFF &&
+          tu_vrs_frame_select(&f, cmd->state.vrs.pass_transl)) {
          uint32_t tw = DIV_ROUND_UP(w, TU_VRS_TEXEL);
          uint32_t th = DIV_ROUND_UP(h, TU_VRS_TEXEL);
          tu_vrs_layout(dev, tw, th, &layout);
@@ -7759,6 +7760,7 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
    if (unlikely(tu_vrs_enabled())) {
       cmd->state.vrs.pass_eligible = false;
       cmd->state.vrs.pass_depthless = false;
+      cmd->state.vrs.pass_transl = false;
    }
 
    if (pass->attachment_count > 0) {
@@ -7883,12 +7885,17 @@ tu_emit_rendering_attachment_locations(struct tu_cmd_buffer *cmd)
  * With TU_VRS_PS_ALLOW, a pass without depth also qualifies (render area on
  * TU_VRS_DIMS or TU_VRS_PS_DIMS, colour attachments of one size covering
  * it); *depthless is then set and only allowlisted draws shade coarse.
+ * With TU_VRS_TRANSL, a depth pass whose render area is on that list (and
+ * not on TU_VRS_DIMS) qualifies under the same attachment rules; *transl is
+ * then set (transl radii, blending draws only).
  */
 static bool
 tu_vrs_rendering_eligible(struct tu_cmd_buffer *cmd,
-                          const VkRenderingInfo *info, bool *depthless)
+                          const VkRenderingInfo *info, bool *depthless,
+                          bool *transl)
 {
    *depthless = false;
+   *transl = false;
    const struct tu_subpass *subpass = &cmd->dynamic_subpasses[0];
    if (subpass->fsr_attachment != VK_ATTACHMENT_UNUSED)
       return false;
@@ -7930,8 +7937,12 @@ tu_vrs_rendering_eligible(struct tu_cmd_buffer *cmd,
       *depthless = true;
       return true;
    }
-   if (!tu_vrs_dims_ok(w, h))
-      return false;
+   bool tr = false;
+   if (!tu_vrs_dims_ok(w, h)) {
+      if (!tu_vrs_transl_dims_ok(w, h))
+         return false;
+      tr = true;
+   }
    VK_FROM_HANDLE(tu_image_view, dview, d->imageView);
    uint32_t dw = dview->vk.extent.width, dh = dview->vk.extent.height;
    if (dw < w || dh < h)
@@ -7946,6 +7957,7 @@ tu_vrs_rendering_eligible(struct tu_cmd_buffer *cmd,
          return false;
       color = true;
    }
+   *transl = color && tr;
    return color;
 }
 
@@ -8103,7 +8115,8 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
        !(pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT))
       cmd->state.vrs.pass_eligible =
          tu_vrs_rendering_eligible(cmd, pRenderingInfo,
-                                   &cmd->state.vrs.pass_depthless);
+                                   &cmd->state.vrs.pass_depthless,
+                                   &cmd->state.vrs.pass_transl);
 
    tu_choose_gmem_layout(cmd);
 
