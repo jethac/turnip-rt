@@ -370,3 +370,127 @@ rd_CmdClearAttachments(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(rd_command_buffer, command, commandBuffer);
    vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 }
+
+/* Graphics-only commands. The only queue family has no VK_QUEUE_GRAPHICS_BIT,
+ * so recording any of these is invalid usage. They exist so that a caller
+ * that records one anyway gets VK_ERROR_FEATURE_NOT_PRESENT from
+ * vkEndCommandBuffer instead of a call through a null pointer.
+ */
+#define RD_GRAPHICS_ONLY(cmd) \
+   vk_command_buffer_set_error(&rd_command_buffer_from_handle(cmd)->vk, \
+                               VK_ERROR_FEATURE_NOT_PRESENT)
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
+   uint32_t drawCount, uint32_t stride)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
+   uint32_t drawCount, uint32_t stride)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
+   VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount,
+   const VkImageBlit *pRegions, VkFilter filter)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBlitImage2(VkCommandBuffer commandBuffer, const VkBlitImageInfo2 *pBlitImageInfo)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
+   VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount,
+   const VkImageResolve *pRegions)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *pResolveImageInfo)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo *pRenderPassBegin,
+   VkSubpassContents contents)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo *pRenderPassBegin,
+   const VkSubpassBeginInfo *pSubpassBeginInfo)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdNextSubpass2(VkCommandBuffer commandBuffer, const VkSubpassBeginInfo *pSubpassBeginInfo,
+   const VkSubpassEndInfo *pSubpassEndInfo)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdEndRenderPass(VkCommandBuffer commandBuffer)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo *pSubpassEndInfo)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRenderingInfo)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdEndRendering(VkCommandBuffer commandBuffer)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBindIndexBuffer(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
+   VkIndexType indexType)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount,
+   const VkBuffer *pBuffers, const VkDeviceSize *pOffsets)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
+   uint32_t bindingCount, const VkBuffer *pBuffers, const VkDeviceSize *pOffsets,
+   const VkDeviceSize *pSizes, const VkDeviceSize *pStrides)
+{
+   RD_GRAPHICS_ONLY(commandBuffer);
+}
