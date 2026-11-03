@@ -589,7 +589,7 @@ rd_CreateImage(VkDevice handle, const VkImageCreateInfo *info,
        (info->samples != VK_SAMPLE_COUNT_1_BIT && info->mipLevels != 1) || !info->mipLevels ||
        info->mipLevels > RD_IMAGE_MAX_LEVELS || !info->arrayLayers ||
        info->arrayLayers > 256 || !info->extent.width || !info->extent.height ||
-       !info->extent.depth || info->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+       !info->extent.depth ||
        (info->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
         info->initialLayout != VK_IMAGE_LAYOUT_PREINITIALIZED))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -1062,13 +1062,27 @@ rd_record_buffer_image(struct rd_command_buffer *command, struct rd_buffer *buff
                        uint32_t count, const VkBufferImageCopy *regions)
 {
    if (!rd_image_command_valid(command, buffer && image && image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
-       !vk_format_is_depth_or_stencil(image->vk.format) &&
        (buffer->vk.usage & (to_image ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : VK_BUFFER_USAGE_TRANSFER_DST_BIT)) &&
        (image->vk.usage & (to_image ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) &&
        rd_image_copy_layout(layout, !to_image)))
       return;
    for (uint32_t i = 0; i < count; i++) {
       const VkBufferImageCopy *region = &regions[i];
+      /* Depth/stencil: single-aspect formats copy texels as they are stored.
+       * The depth aspect of D24S8 is stored and copied as X8_D24 words; on
+       * the way in, the stencil byte of each word is preserved. The stencil
+       * aspect of D24S8 would need repacking and is not supported.
+       */
+      uint32_t copy_mask = 0;
+      bool stencil_lane = false;
+      if (image->vk.format == VK_FORMAT_D24_UNORM_S8_UINT) {
+         if (region->imageSubresource.aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT)
+            stencil_lane = true;
+         else if (!rd_image_command_valid(command,
+             region->imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT))
+            return;
+         copy_mask = to_image && !stencil_lane ? 0x00ffffffu : 0;
+      }
       VkDeviceSize image_offset, image_row, image_slice;
       uint32_t slices;
       if (!rd_image_command_valid(command,
@@ -1084,8 +1098,8 @@ rd_record_buffer_image(struct rd_command_buffer *command, struct rd_buffer *buff
           height >= region->imageExtent.height && row <= RD_IMAGE_MAX_SIZE &&
           (!region->bufferRowLength || !(region->bufferRowLength % bw)) &&
           (!region->bufferImageHeight || !(region->bufferImageHeight % bh)) &&
-          DIV_ROUND_UP(height, bh) <= RD_IMAGE_MAX_SIZE / row && !(region->bufferOffset % image->texel_size) &&
-          !(region->bufferOffset & 3)))
+          DIV_ROUND_UP(height, bh) <= RD_IMAGE_MAX_SIZE / row &&
+          !(region->bufferOffset % image->texel_size)))
          return;
       VkBufferImageCopy2 region2 = {
          .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
@@ -1113,8 +1127,17 @@ rd_record_buffer_image(struct rd_command_buffer *command, struct rd_buffer *buff
          .dst_offset = to_image ? image_offset : region->bufferOffset,
          .src_row_pitch = to_image ? row : image_row, .dst_row_pitch = to_image ? image_row : row,
          .src_slice_pitch = to_image ? slice : image_slice, .dst_slice_pitch = to_image ? image_slice : slice,
-         .row_bytes = row_bytes, .rows = rows, .slices = slices,
+         .row_bytes = row_bytes, .rows = rows, .slices = slices, .copy_mask = copy_mask,
       };
+      if (stencil_lane) {
+         /* Buffer: one stencil byte per texel. Image: byte 3 of each word. */
+         transfer.lane_step = 1;
+         transfer.src_step = to_image ? 1 : 4;
+         transfer.dst_step = to_image ? 4 : 1;
+         transfer.src_lane = to_image ? 0 : 3;
+         transfer.dst_lane = to_image ? 3 : 0;
+         transfer.row_bytes = elements.width;
+      }
       struct rd_command *recorded = rd_command_append(command, RD_CMD_IMAGE_COPY);
       if (!recorded)
          return;
@@ -1197,15 +1220,18 @@ rd_image_transfer_memory(struct rd_image *image, struct rd_buffer *buffer,
 
 static bool
 rd_image_transfer_bounds(VkDeviceSize offset, VkDeviceSize row, VkDeviceSize slice,
-                         const struct rd_image_transfer *transfer, VkDeviceSize size)
+                         const struct rd_image_transfer *transfer, VkDeviceSize size,
+                         uint32_t step, uint32_t lane)
 {
    if (!transfer->rows || !transfer->slices || !transfer->row_bytes || offset > size)
       return false;
    uint64_t remaining = size - offset;
-   if (transfer->row_bytes > remaining ||
-       (transfer->rows > 1 && row > (remaining - transfer->row_bytes) / (transfer->rows - 1)))
+   uint64_t span = transfer->lane_step ?
+      (transfer->row_bytes - 1) * step + lane + 1 : transfer->row_bytes;
+   if (span > remaining ||
+       (transfer->rows > 1 && row > (remaining - span) / (transfer->rows - 1)))
       return false;
-   uint64_t rows = row * (transfer->rows - 1) + transfer->row_bytes;
+   uint64_t rows = row * (transfer->rows - 1) + span;
    return transfer->slices == 1 || slice <= (remaining - rows) / (transfer->slices - 1);
 }
 
@@ -1216,21 +1242,25 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
    VkDeviceSize src_offset = 0, dst_offset = 0, src_size = 0, dst_size = 0;
    if (!rd_image_transfer_memory(transfer->dst_image, transfer->dst_buffer, &dst, &dst_offset, &dst_size) ||
        !rd_image_transfer_bounds(transfer->dst_offset, transfer->dst_row_pitch,
-                                 transfer->dst_slice_pitch, transfer, dst_size))
+                                 transfer->dst_slice_pitch, transfer, dst_size,
+                                 transfer->dst_step, transfer->dst_lane))
       return VK_ERROR_UNKNOWN;
    if (!clear && (!rd_image_transfer_memory(transfer->src_image, transfer->src_buffer, &src, &src_offset, &src_size) ||
        !rd_image_transfer_bounds(transfer->src_offset, transfer->src_row_pitch,
-                                 transfer->src_slice_pitch, transfer, src_size)))
+                                 transfer->src_slice_pitch, transfer, src_size,
+                                 transfer->src_step, transfer->src_lane)))
       return VK_ERROR_UNKNOWN;
    if (clear && (!transfer->texel_size || transfer->texel_size > sizeof(transfer->clear) ||
                  transfer->row_bytes % transfer->texel_size))
       return VK_ERROR_UNKNOWN;
-   if (transfer->copy_mask && (clear || transfer->row_bytes % 4))
+   if (transfer->copy_mask && (clear || transfer->row_bytes % 4 || transfer->lane_step))
+      return VK_ERROR_UNKNOWN;
+   if (transfer->lane_step && (clear || !transfer->src_step || !transfer->dst_step))
       return VK_ERROR_UNKNOWN;
    if (src && src->bo != dst->bo && fd_bo_cpu_prep(src->bo, device->pipe, FD_BO_PREP_READ | FD_BO_PREP_NOSYNC))
       return VK_ERROR_DEVICE_LOST;
    uint32_t flags = FD_BO_PREP_WRITE | FD_BO_PREP_NOSYNC;
-   if ((src && src->bo == dst->bo) || transfer->copy_mask)
+   if ((src && src->bo == dst->bo) || transfer->copy_mask || transfer->lane_step)
       flags |= FD_BO_PREP_READ;
    if (fd_bo_cpu_prep(dst->bo, device->pipe, flags))
       return VK_ERROR_DEVICE_LOST;
@@ -1249,7 +1279,11 @@ rd_execute_image_transfer(struct rd_device *device, const struct rd_image_transf
          } else {
             const uint8_t *from = src_map + src_offset + transfer->src_offset +
                                   z * transfer->src_slice_pitch + y * transfer->src_row_pitch;
-            if (transfer->copy_mask) {
+            if (transfer->lane_step) {
+               for (VkDeviceSize x = 0; x < transfer->row_bytes; x++)
+                  to[x * transfer->dst_step + transfer->dst_lane] =
+                     from[x * transfer->src_step + transfer->src_lane];
+            } else if (transfer->copy_mask) {
                for (VkDeviceSize x = 0; x < transfer->row_bytes; x += 4) {
                   uint32_t source, target;
                   memcpy(&source, from + x, 4);

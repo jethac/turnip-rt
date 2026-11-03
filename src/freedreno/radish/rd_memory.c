@@ -98,8 +98,13 @@ rd_CreateBuffer(VkDevice handle, const VkBufferCreateInfo *info,
                 const VkAllocationCallbacks *allocator, VkBuffer *out)
 {
    VK_FROM_HANDLE(rd_device, device, handle);
-   if (info->flags || info->size > UINT32_MAX - 4095)
+   /* Non-zero flags need sparse or protected memory, neither of which is
+    * advertised. A buffer larger than one allocation can hold cannot be
+    * backed, which vkCreateBuffer reports as out of device memory. */
+   if (info->flags)
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   if (info->size > UINT32_MAX - 4095)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    struct rd_buffer *buffer = vk_buffer_create(&device->vk, info, allocator,
                                                sizeof(*buffer));
    if (!buffer)

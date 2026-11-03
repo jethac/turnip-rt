@@ -42,6 +42,10 @@ struct rd_image_transfer {
    VkDeviceSize src_slice_pitch, dst_slice_pitch;
    VkDeviceSize row_bytes;
    uint32_t rows, slices, texel_size, copy_mask;
+   /* Byte-lane copy: when lane_step is set, row_bytes counts single bytes
+    * taken every src_step bytes from src_lane and written every dst_step
+    * bytes at dst_lane (the stencil byte of D24_UNORM_S8_UINT). */
+   uint8_t lane_step, src_step, dst_step, src_lane, dst_lane;
    uint8_t clear[16];
 };
 
