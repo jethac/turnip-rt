@@ -188,6 +188,34 @@ rd_uses_workgroup_barrier(nir_shader *nir)
 }
 
 static bool
+rd_batch_local_memory(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (nir_intrinsic_has_atomic_op(intr) ||
+                strstr(nir_intrinsic_infos[intr->intrinsic].name, "atomic"))
+               return false;
+            if (nir_intrinsic_has_access(intr) &&
+                (nir_intrinsic_access(intr) & (ACCESS_COHERENT | ACCESS_VOLATILE)))
+               return false;
+            if (intr->intrinsic == nir_intrinsic_barrier &&
+                ((nir_intrinsic_memory_modes(intr) & ~nir_var_mem_shared) ||
+                 (nir_intrinsic_memory_scope(intr) != SCOPE_NONE &&
+                  nir_intrinsic_memory_scope(intr) != SCOPE_WORKGROUP) ||
+                 (nir_intrinsic_execution_scope(intr) != SCOPE_NONE &&
+                  nir_intrinsic_execution_scope(intr) != SCOPE_WORKGROUP)))
+               return false;
+         }
+      }
+   }
+   return true;
+}
+
+static bool
 rd_repack_1d_local_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    if (intr->intrinsic != nir_intrinsic_load_local_invocation_id)
@@ -280,6 +308,7 @@ rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
       ralloc_free(nir);
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
+   pipeline->batch_local_memory = rd_batch_local_memory(nir);
    pipeline->linear_subgroups = rd_uses_subgroups(nir);
    bool workgroup_barrier = rd_uses_workgroup_barrier(nir);
    pipeline->packed_1d_barrier = !pipeline->linear_subgroups &&

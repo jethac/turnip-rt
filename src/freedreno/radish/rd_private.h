@@ -115,6 +115,7 @@ struct rd_pipeline {
    bool linear_subgroups;
    bool packed_1d_barrier;
    bool linear_barriers;
+   bool batch_local_memory;
    VkPipelineCreateFlags compile_flags;
    struct nir_shader *sampling_nir;
    struct rd_sampling_entry *sampling_variants;
