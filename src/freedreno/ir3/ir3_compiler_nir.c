@@ -1338,6 +1338,16 @@ emit_intrinsic_ssbo_size(struct ir3_context *ctx, nir_intrinsic_instr *intr,
                          struct ir3_instruction **dst)
 {
    struct ir3_builder *b = &ctx->build;
+   if (ctx->compiler->gen == 5 && ctx->so->shader_options.nir_options.a5xx_ssbo_size_consts) {
+      const struct ir3_const_state *state = ir3_const_state(ctx->so);
+      assert(nir_src_is_const(intr->src[0]));
+      unsigned index = nir_src_as_uint(intr->src[0]);
+      assert(index < IR3_MAX_SHADER_BUFFERS && (state->ssbo_size_mask & (1u << index)));
+      unsigned offset = state->allocs.consts[IR3_CONST_ALLOC_IMAGE_DIMS].offset_vec4 * 4 +
+                        state->ssbo_size_offset[index];
+      *dst = create_uniform(b, offset);
+      return;
+   }
    struct ir3_instruction *ibo = ir3_ssbo_to_ibo(ctx, intr->src[0]);
    struct ir3_instruction *resinfo = ir3_RESINFO(b, ibo, 0);
    resinfo->cat6.iim_val = 1;
@@ -1796,6 +1806,24 @@ emit_intrinsic_image_size_tex(struct ir3_context *ctx,
                               struct ir3_instruction **dst)
 {
    struct ir3_builder *b = &ctx->build;
+   if (ctx->compiler->gen == 5 && ctx->so->shader_options.nir_options.a5xx_image_size_consts) {
+      const struct ir3_const_state *state = ir3_const_state(ctx->so);
+      unsigned index = nir_src_as_uint(intr->src[0]);
+      assert(index < ARRAY_SIZE(state->image_dims.off));
+      assert(state->image_dims.mask & (1u << index));
+      assert(nir_src_as_uint(intr->src[1]) == 0);
+      unsigned base = ir3_const_reg(state, IR3_CONST_ALLOC_IMAGE_DIMS, 0) +
+                      state->image_dims.off[index] + 3;
+      for (unsigned i = 0; i < intr->def.num_components; i++) {
+         unsigned component = nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_1D &&
+                              nir_intrinsic_image_array(intr) && i == 1 ? 2 : i;
+         assert(component < 3);
+         dst[i] = create_uniform(b, base + component);
+         if (intr->def.bit_size == 16)
+            dst[i] = ir3_COV(b, dst[i], TYPE_U32, TYPE_U16);
+      }
+      return;
+   }
    struct tex_src_info info = get_image_ssbo_samp_tex_src(ctx, &intr->src[0], true);
    struct ir3_instruction *sam, *lod;
    unsigned flags, ncoords = ir3_get_image_coords(intr, &flags);
@@ -1804,7 +1832,9 @@ emit_intrinsic_image_size_tex(struct ir3_context *ctx,
    info.flags |= flags;
    assert(nir_src_as_uint(intr->src[1]) == 0);
    lod = create_immed(b, 0);
-   sam = emit_sam(ctx, OPC_GETSIZE, info, dst_type, 0b1111, lod, NULL);
+   bool buffer = nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF;
+   sam = emit_sam(ctx, buffer ? OPC_GETBUF : OPC_GETSIZE, info, dst_type,
+                  0b1111, buffer ? NULL : lod, NULL);
 
    /* Array size actually ends up in .w rather than .z. This doesn't
     * matter for miplevel 0, but for higher mips the value in z is
@@ -6110,13 +6140,16 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
       progress = false;
 
       /* the folding doesn't seem to work reliably on a4xx */
-      if (ctx->compiler->gen != 4)
+      if (!so->shader_options.nir_options.disable_optimizations && ctx->compiler->gen != 4)
          progress |= IR3_PASS(ir, ir3_cf, so);
       progress |= IR3_PASS(ir, ir3_cp, so, true);
-      progress |= IR3_PASS(ir, ir3_cse);
+      if (!so->shader_options.nir_options.disable_optimizations)
+         progress |= IR3_PASS(ir, ir3_cse);
       progress |= IR3_PASS(ir, ir3_dce, so);
-      progress |= IR3_PASS(ir, ir3_opt_predicates, so);
-      progress |= IR3_PASS(ir, ir3_shared_fold);
+      if (!so->shader_options.nir_options.disable_optimizations) {
+         progress |= IR3_PASS(ir, ir3_opt_predicates, so);
+         progress |= IR3_PASS(ir, ir3_shared_fold);
+      }
    } while (progress);
 
    progress = IR3_PASS(ir, ir3_create_alias_tex_regs);
@@ -6200,7 +6233,8 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
 
    IR3_PASS(ir, ir3_remove_noop_subreg_moves);
    IR3_PASS(ir, ir3_postsched, so);
-   IR3_PASS(ir, ir3_merge_rpt, so);
+   if (!so->shader_options.nir_options.disable_optimizations)
+      IR3_PASS(ir, ir3_merge_rpt, so);
 
    IR3_PASS(ir, ir3_legalize_relative);
    IR3_PASS(ir, ir3_lower_subgroups);

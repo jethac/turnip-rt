@@ -292,7 +292,7 @@ ir3_get_reg_independent_max_waves(struct ir3_shader_variant *v,
             "Compute shader (%s) which has workgroup barrier cannot be used "
             "because it's impossible to have enough concurrent waves.",
             v->name);
-         exit(1);
+         return 0;
       }
 
       /* Due to round_robin_errata we may be unable to support forward progress
@@ -304,7 +304,7 @@ ir3_get_reg_independent_max_waves(struct ir3_shader_variant *v,
                "Compute shader (%s) requires forward progress but uses more "
                "than 8 waves.",
                v->name);
-            exit(1);
+            return 0;
          }
          max_waves = MIN2(max_waves, 8);
       }
@@ -366,6 +366,7 @@ ir3_get_waves_per_wg(struct ir3_shader_variant *v, bool double_threadsize)
       }
    } else {
       threads_per_wg = v->local_size[0] * v->local_size[1] * v->local_size[2];
+      threads_per_wg = MAX2(threads_per_wg, v->shader_options.workgroup_resident_threads);
    }
 
    return DIV_ROUND_UP(threads_per_wg, compiler->info->threadsize_base *

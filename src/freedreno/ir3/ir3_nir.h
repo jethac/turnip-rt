@@ -66,6 +66,7 @@ bool ir3_nir_opt_triops_bitwise(nir_shader *nir);
 
 struct ir3_optimize_options {
    nir_opt_uub_options opt_uub_options;
+   bool disable_optimizations;
 };
 bool ir3_optimize_loop(struct ir3_compiler *compiler,
                        struct ir3_optimize_options *options, nir_shader *s);

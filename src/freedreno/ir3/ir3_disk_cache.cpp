@@ -82,6 +82,12 @@ ir3_disk_cache_init_shader_key(struct ir3_compiler *compiler,
 
    _mesa_blake3_update(&ctx, &shader->options.api_wavesize,
                      sizeof(shader->options.api_wavesize));
+   _mesa_blake3_update(&ctx, &shader->options.api_subgroup_size,
+                     sizeof(shader->options.api_subgroup_size));
+   _mesa_blake3_update(&ctx, &shader->options.workgroup_resident_threads,
+                     sizeof(shader->options.workgroup_resident_threads));
+   _mesa_blake3_update(&ctx, &shader->options.max_compute_reg_footprint,
+                     sizeof(shader->options.max_compute_reg_footprint));
    _mesa_blake3_update(&ctx, &shader->options.real_wavesize,
                      sizeof(shader->options.real_wavesize));
    _mesa_blake3_update(&ctx, &shader->options.nir_options,

@@ -308,6 +308,7 @@ struct ir3_const_state {
    struct ir3_const_allocations allocs;
 
    struct ir3_const_image_dims image_dims;
+   uint32_t ssbo_size_mask, ssbo_size_offset[IR3_MAX_SHADER_BUFFERS];
 
    /* State of ubo access lowered to push consts: */
    struct ir3_ubo_analysis_state ubo_state;
@@ -613,6 +614,11 @@ struct ir3_shader_nir_options {
     * conservative.
     */
    nir_variable_mode robust_modes;
+   uint32_t disable_optimizations;
+   uint32_t a5xx_image_buffer_2d;
+   uint32_t a5xx_raw_global_loads;
+   uint32_t a5xx_image_size_consts;
+   uint32_t a5xx_ssbo_size_consts;
 };
 
 struct ir3_shader_options {
@@ -621,6 +627,9 @@ struct ir3_shader_options {
     * application simply sees the upper half as always disabled.
     */
    enum ir3_wavesize_option api_wavesize;
+   uint32_t api_subgroup_size;
+   uint32_t workgroup_resident_threads;
+   uint32_t max_compute_reg_footprint;
    /* What wavesizes we're allowed to actually use. If the API wavesize is
     * single-only, then this must be single-only too.
     */

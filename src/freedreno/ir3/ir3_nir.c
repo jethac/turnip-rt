@@ -319,11 +319,14 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
       progress |= OPT(s, nir_opt_copy_prop);
       progress |= OPT(s, nir_opt_deref);
       progress |= OPT(s, nir_opt_dce);
-      progress |= OPT(s, nir_opt_cse);
+      if (!options->disable_optimizations)
+         progress |= OPT(s, nir_opt_cse);
 
-      progress |= OPT(s, nir_opt_find_array_copies);
-      progress |= OPT(s, nir_opt_copy_prop_vars);
-      progress |= OPT(s, nir_opt_dead_write_vars);
+      if (!options->disable_optimizations) {
+         progress |= OPT(s, nir_opt_find_array_copies);
+         progress |= OPT(s, nir_opt_copy_prop_vars);
+         progress |= OPT(s, nir_opt_dead_write_vars);
+      }
       progress |= OPT(s, nir_split_struct_vars, nir_var_function_temp);
       progress |= OPT(s, nir_opt_shrink_stores, true);
       progress |= OPT(s, nir_shrink_vec_array_vars, nir_var_function_temp | nir_var_mem_shared);
@@ -331,16 +334,17 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
       static int gcm = -1;
       if (gcm == -1)
          gcm = debug_get_num_option("GCM", 0);
-      if (gcm == 1)
+      if (!options->disable_optimizations && gcm == 1)
          progress |= OPT(s, nir_opt_gcm, true);
-      else if (gcm == 2)
+      else if (!options->disable_optimizations && gcm == 2)
          progress |= OPT(s, nir_opt_gcm, false);
       nir_opt_peephole_select_options peephole_select_options = {
          .limit = 16,
          .indirect_load_ok = true,
          .expensive_alu_ok = true,
       };
-      progress |= OPT(s, nir_opt_peephole_select, &peephole_select_options);
+      if (!options->disable_optimizations)
+         progress |= OPT(s, nir_opt_peephole_select, &peephole_select_options);
       progress |= OPT(s, nir_opt_intrinsics);
       /* NOTE: GS lowering inserts an output var with varying slot that
        * is larger than VARYING_SLOT_MAX (ie. GS_VERTEX_FLAGS_IR3),
@@ -352,7 +356,7 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
        * fp16/int16 for frag and compute, skip phi precision lowering
        * for other stages.
        */
-      if (is_compute_or_frag(s->info.stage)) {
+      if (!options->disable_optimizations && is_compute_or_frag(s->info.stage)) {
          progress |= OPT(s, nir_opt_phi_precision);
       }
       progress |= OPT(s, nir_opt_fp_math_ctrl);
@@ -361,7 +365,8 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
       progress |= OPT(s, nir_lower_pack);
       progress |= OPT(s, nir_lower_bit_size, ir3_lower_bit_size, NULL);
       progress |= OPT(s, nir_opt_constant_folding);
-      progress |= OPT(s, nir_opt_uub, &options->opt_uub_options);
+      if (!options->disable_optimizations)
+         progress |= OPT(s, nir_opt_uub, &options->opt_uub_options);
 
       const nir_opt_offsets_options offset_options = {
          /* How large an offset we can encode in the instr's immediate field.
@@ -378,7 +383,8 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
          .cb_data = compiler,
          .allow_offset_wrap_cb = ir3_nir_allow_base_offset_wrap,
       };
-      progress |= OPT(s, nir_opt_offsets, &offset_options);
+      if (!options->disable_optimizations)
+         progress |= OPT(s, nir_opt_offsets, &offset_options);
 
       if (lower_flrp != 0) {
          OPT(s, nir_lower_flrp, lower_flrp, false /* always_precise */);
@@ -390,7 +396,7 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
       }
 
       progress |= OPT(s, nir_opt_dead_cf);
-      if (OPT(s, nir_opt_loop)) {
+      if (!options->disable_optimizations && OPT(s, nir_opt_loop)) {
          progress |= true;
          /* If nir_opt_loop makes progress, then we need to clean
           * things up if we want any hope of nir_opt_if or nir_opt_loop_unroll
@@ -400,7 +406,8 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
          OPT(s, nir_opt_dce);
       }
       progress |= OPT(s, nir_opt_if, nir_opt_if_optimize_phi_true_false);
-      progress |= OPT(s, nir_opt_loop_unroll);
+      if (!options->disable_optimizations)
+         progress |= OPT(s, nir_opt_loop_unroll);
       progress |= OPT(s, nir_opt_phi_to_bool);
       progress |= OPT(s, nir_opt_remove_phis);
       progress |= OPT(s, nir_opt_undef);
@@ -802,9 +809,12 @@ ir3_finalize_nir(struct ir3_compiler *compiler,
    }
 
    OPT(s, nir_lower_is_helper_invocation);
-   OPT(s, nir_opt_combine_barriers, NULL, NULL);
+   if (!options->disable_optimizations)
+      OPT(s, nir_opt_combine_barriers, NULL, NULL);
 
-   struct ir3_optimize_options optimize_options = {};
+   struct ir3_optimize_options optimize_options = {
+      .disable_optimizations = options->disable_optimizations,
+   };
    ir3_optimize_loop(compiler, &optimize_options, s);
 
    /* do idiv lowering after first opt loop to get a chance to propagate
@@ -813,7 +823,7 @@ ir3_finalize_nir(struct ir3_compiler *compiler,
    nir_lower_idiv_options idiv_options = {
       .allow_fp16 = true,
    };
-   bool progress = OPT(s, nir_opt_idiv_const, 8);
+   bool progress = !options->disable_optimizations && OPT(s, nir_opt_idiv_const, 8);
    progress |= OPT(s, nir_lower_idiv, &idiv_options);
 
    /* Remove unused components from IO loads. */
@@ -831,7 +841,8 @@ ir3_finalize_nir(struct ir3_compiler *compiler,
       .robust_modes = options->robust_modes,
       .cb_data = compiler,
    };
-   progress |= OPT(s, nir_opt_load_store_vectorize, &vectorize_opts);
+   if (!options->disable_optimizations)
+      progress |= OPT(s, nir_opt_load_store_vectorize, &vectorize_opts);
 
    if (progress)
       ir3_optimize_loop(compiler, &optimize_options, s);
@@ -1137,7 +1148,9 @@ ir3_nir_post_finalize(struct ir3_shader *shader)
    if (compiler->gen >= 6)
       OPT(s, ir3_nir_lower_ssbo_size, compiler->options.storage_16bit ? 1 : 2);
 
-   struct ir3_optimize_options optimize_options = {};
+   struct ir3_optimize_options optimize_options = {
+      .disable_optimizations = shader->options.nir_options.disable_optimizations,
+   };
    ir3_optimize_loop(compiler, &optimize_options, s);
 }
 
@@ -1608,12 +1621,14 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
     * progress.
     */
    struct ir3_optimize_options optimize_options = {
+      .disable_optimizations = options->disable_optimizations,
       .opt_uub_options = {
          .opt_imul = true,
       },
    };
 
-   progress |= OPT(s, nir_opt_uub, &optimize_options.opt_uub_options);
+   if (!options->disable_optimizations)
+      progress |= OPT(s, nir_opt_uub, &optimize_options.opt_uub_options);
 
    /* Cleanup code leftover from lowering passes before opt_preamble */
    if (progress) {
@@ -1631,7 +1646,7 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
     * have to lower the preamble after UBO lowering so that UBO lowering can
     * insert instructions in the preamble to push UBOs.
     */
-   if (so->compiler->has_preamble &&
+   if (!options->disable_optimizations && so->compiler->has_preamble &&
        !(ir3_shader_debug & IR3_DBG_NOPREAMBLE))
       progress |= OPT(s, ir3_nir_opt_preamble, so);
 
@@ -1642,7 +1657,8 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
     * multiplies to get hoisted to preamble, which would get scattered with
     * non-uniform calculations post reassociation.
     */
-   progress |= OPT(s, nir_opt_reassociate_matrix_mul);
+   if (!options->disable_optimizations)
+      progress |= OPT(s, nir_opt_reassociate_matrix_mul);
 
    /* TODO: ldg.k might also work on a6xx */
    if (so->compiler->gen >= 7)
@@ -1653,7 +1669,7 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
 
    progress |= OPT(s, ir3_nir_lower_ubo_loads, so);
 
-   if (so->compiler->gen >= 7 &&
+   if (!options->disable_optimizations && so->compiler->gen >= 7 &&
        !(ir3_shader_debug & (IR3_DBG_NOPREAMBLE | IR3_DBG_NODESCPREFETCH)))
       progress |= OPT(s, ir3_nir_opt_prefetch_descriptors, so);
 
@@ -1694,7 +1710,7 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
     * produce fnegs, and if so then we need to keep running to squash
     * fneg(fneg(a)).
     */
-   bool more_late_algebraic = true;
+   bool more_late_algebraic = !options->disable_optimizations;
    while (more_late_algebraic) {
       more_late_algebraic = OPT(s, nir_opt_algebraic_late);
       if (!more_late_algebraic && so->compiler->gen >= 5) {
@@ -1734,7 +1750,8 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
       OPT(s, nir_opt_cse);
    }
 
-   OPT(s, nir_opt_sink, nir_move_const_undef);
+   if (!options->disable_optimizations)
+      OPT(s, nir_opt_sink, nir_move_const_undef);
 
    if (ir3_shader_debug & IR3_DBG_DISASM) {
       mesa_logi("----------------------");
@@ -2020,6 +2037,35 @@ ir3_setup_const_state(nir_shader *nir, struct ir3_shader_variant *v,
    const_state->num_driver_params =
       ir3_nir_scan_driver_consts(compiler, nir, &v->key,
                                  &const_state->image_dims);
+
+   if (compiler->gen == 5 && v->shader_options.nir_options.a5xx_image_size_consts) {
+      for (unsigned i = 0; i < ARRAY_SIZE(const_state->image_dims.off); i++) {
+         if (const_state->image_dims.mask & (1u << i))
+            const_state->image_dims.off[i] *= 2;
+      }
+      const_state->image_dims.count *= 2;
+   }
+
+   if (compiler->gen == 5 && v->shader_options.nir_options.a5xx_ssbo_size_consts) {
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_get_ssbo_size)
+                  continue;
+               assert(nir_src_is_const(intr->src[0]));
+               unsigned index = nir_src_as_uint(intr->src[0]);
+               assert(index < IR3_MAX_SHADER_BUFFERS);
+               if (const_state->ssbo_size_mask & (1u << index))
+                  continue;
+               const_state->ssbo_size_mask |= 1u << index;
+               const_state->ssbo_size_offset[index] = const_state->image_dims.count++;
+            }
+         }
+      }
+   }
 
    if ((compiler->gen < 5) && (v->stream_output.num_outputs > 0)) {
       const_state->num_driver_params =

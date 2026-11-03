@@ -193,6 +193,10 @@ ir3_shader_assemble(struct ir3_shader_variant *v)
 
    ir3_collect_info(v);
 
+   if (ir3_shader_compute(v) && v->has_barrier &&
+       info->max_waves < ir3_get_waves_per_wg(v, info->double_threadsize))
+      return NULL;
+
    if (v->constant_data_size) {
       /* Make sure that where we're about to place the constant_data is safe
        * to indirectly upload from.
@@ -452,6 +456,8 @@ static void
 assemble_variant(struct ir3_shader_variant *v, bool internal)
 {
    v->bin = ir3_shader_assemble(v);
+   if (!v->bin)
+      return;
 
    unsigned char blake3[BLAKE3_KEY_LEN + 1];
 
@@ -1385,6 +1391,15 @@ ir3_shader_get_subgroup_size(const struct ir3_compiler *compiler,
                              mesa_shader_stage stage, unsigned *subgroup_size,
                              unsigned *max_subgroup_size)
 {
+   if (options->api_subgroup_size) {
+      assert(mesa_shader_stage_is_compute(stage));
+      assert(options->api_wavesize == IR3_SINGLE_ONLY);
+      assert(util_is_power_of_two_nonzero(options->api_subgroup_size));
+      assert(options->api_subgroup_size <= compiler->info->threadsize_base);
+      *subgroup_size = *max_subgroup_size = options->api_subgroup_size;
+      return;
+   }
+
    switch (options->api_wavesize) {
    case IR3_SINGLE_ONLY:
       *subgroup_size = *max_subgroup_size = compiler->info->threadsize_base;

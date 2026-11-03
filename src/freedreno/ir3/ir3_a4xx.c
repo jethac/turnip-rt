@@ -199,6 +199,15 @@ emit_intrinsic_atomic_ssbo(struct ir3_context *ctx, nir_intrinsic_instr *intr)
 }
 
 static struct ir3_instruction *
+image_mul32(struct ir3_builder *b, struct ir3_instruction *a,
+             struct ir3_instruction *c)
+{
+   struct ir3_instruction *low = ir3_MULL_U(b, a, 0, c, 0);
+   struct ir3_instruction *mixed = ir3_MADSH_M16(b, a, 0, c, 0, low, 0);
+   return ir3_MADSH_M16(b, c, 0, a, 0, mixed, 0);
+}
+
+static struct ir3_instruction *
 get_image_offset(struct ir3_context *ctx, const nir_intrinsic_instr *instr,
                  struct ir3_instruction *const *coords, bool byteoff)
 {
@@ -226,15 +235,17 @@ get_image_offset(struct ir3_context *ctx, const nir_intrinsic_instr *instr,
    if (ctx->compiler->gen == 4)
       offset = ir3_MUL_S24(b, coords[0], 0, create_uniform(b, cb + 3), 0);
    else
-      offset = ir3_MUL_S24(b, coords[0], 0, create_uniform(b, cb + 0), 0);
+      offset = image_mul32(b, coords[0], create_uniform(b, cb + 0));
    if (ncoords > 1) {
       /* offset += coords.y * y_pitch: */
-      offset =
+      offset = ctx->compiler->gen == 5 ?
+         ir3_ADD_U(b, image_mul32(b, create_uniform(b, cb + 1), coords[1]), 0, offset, 0) :
          ir3_MAD_S24(b, create_uniform(b, cb + 1), 0, coords[1], 0, offset, 0);
    }
    if (ncoords > 2) {
       /* offset += coords.z * z_pitch: */
-      offset =
+      offset = ctx->compiler->gen == 5 ?
+         ir3_ADD_U(b, image_mul32(b, create_uniform(b, cb + 2), coords[2]), 0, offset, 0) :
          ir3_MAD_S24(b, create_uniform(b, cb + 2), 0, coords[2], 0, offset, 0);
    }
 
@@ -256,6 +267,24 @@ get_image_offset(struct ir3_context *ctx, const nir_intrinsic_instr *instr,
       return offset;
 }
 
+static struct ir3_instruction *
+get_image_bounds_coords(struct ir3_context *ctx, const nir_intrinsic_instr *intr,
+                        struct ir3_instruction *const *coords, unsigned *ncoords)
+{
+   struct ir3_builder *b = &ctx->build;
+   if (ctx->compiler->gen == 5 &&
+       ctx->so->shader_options.nir_options.a5xx_image_buffer_2d &&
+       nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF) {
+      struct ir3_instruction *xy[] = {
+         ir3_AND_B(b, coords[0], 0, create_immed(b, 0x7fff), 0),
+         ir3_SHR_B(b, coords[0], 0, create_immed(b, 15), 0),
+      };
+      *ncoords = 2;
+      return ir3_create_collect(b, xy, 2);
+   }
+   return ir3_create_collect(b, coords, *ncoords);
+}
+
 /* src[] = { deref, coord, sample_index }. const_index[] = {} */
 static void
 emit_intrinsic_load_image(struct ir3_context *ctx, nir_intrinsic_instr *intr,
@@ -269,6 +298,7 @@ emit_intrinsic_load_image(struct ir3_context *ctx, nir_intrinsic_instr *intr,
    unsigned ncomp =
       ir3_get_num_components_for_image_format(nir_intrinsic_format(intr));
 
+   struct ir3_instruction *bounds = get_image_bounds_coords(ctx, intr, coords, &ncoords);
    struct ir3_instruction *ldib;
    /* At least A420 does not have LDIB. Use LDGB and perform conversion
     * ourselves.
@@ -278,10 +308,10 @@ emit_intrinsic_load_image(struct ir3_context *ctx, nir_intrinsic_instr *intr,
     */
    if (ctx->compiler->gen > 4) {
       ldib = ir3_LDIB(
-            b, ibo, 0, offset, 0, ir3_create_collect(b, coords, ncoords), 0);
+            b, ibo, 0, offset, 0, bounds, 0);
    } else {
       ldib = ir3_LDGB(
-            b, ibo, 0, offset, 0, ir3_create_collect(b, coords, ncoords), 0);
+            b, ibo, 0, offset, 0, bounds, 0);
       switch (nir_intrinsic_format(intr)) {
       case PIPE_FORMAT_R32_UINT:
       case PIPE_FORMAT_R32_SINT:
@@ -329,8 +359,9 @@ emit_intrinsic_store_image(struct ir3_context *ctx, nir_intrinsic_instr *intr)
     * one over the other in various cases.
     */
 
+   struct ir3_instruction *bounds = get_image_bounds_coords(ctx, intr, coords, &ncoords);
    stib = ir3_STIB(b, ibo, 0, ir3_create_collect(b, value, ncomp), 0,
-                   ir3_create_collect(b, coords, ncoords), 0, offset, 0);
+                   bounds, 0, offset, 0);
    stib->cat6.iim_val = ncomp;
    stib->cat6.d = ncoords;
    stib->cat6.type = ir3_get_type_for_image_intrinsic(intr);
@@ -357,7 +388,7 @@ emit_intrinsic_atomic_image(struct ir3_context *ctx, nir_intrinsic_instr *intr)
     * src2 is 64b byte offset
     */
    src0 = ir3_get_src(ctx, &intr->src[3])[0];
-   src1 = ir3_create_collect(b, coords, ncoords);
+   src1 = get_image_bounds_coords(ctx, intr, coords, &ncoords);
    src2 = get_image_offset(ctx, intr, coords, ctx->compiler->gen == 4);
 
    if (op == nir_atomic_op_cmpxchg)
@@ -377,6 +408,58 @@ emit_intrinsic_atomic_image(struct ir3_context *ctx, nir_intrinsic_instr *intr)
    return atomic;
 }
 
+static void
+add_global_address(struct ir3_builder *b, struct ir3_instruction **lo,
+                    struct ir3_instruction **hi, struct ir3_instruction *add_lo,
+                    struct ir3_instruction *add_hi)
+{
+   struct ir3_instruction *previous = *lo;
+   *lo = ir3_ADD_U(b, previous, 0, add_lo, 0);
+   struct ir3_instruction *carry = ir3_CMPS_U(b, *lo, 0, previous, 0);
+   carry->cat2.condition = IR3_COND_LT;
+   *hi = ir3_ADD_U(b, ir3_ADD_U(b, *hi, 0, add_hi, 0), 0, carry, 0);
+}
+
+static void
+emit_intrinsic_load_global(struct ir3_context *ctx, nir_intrinsic_instr *intr,
+                           struct ir3_instruction **dst)
+{
+   assert(ctx->compiler->gen == 5 &&
+          ctx->so->shader_options.nir_options.a5xx_raw_global_loads);
+   assert(intr->def.bit_size == 32 && nir_src_bit_size(intr->src[0]) == 64);
+   struct ir3_builder *b = &ctx->build;
+   struct ir3_instruction *address = ir3_get_src(ctx, &intr->src[0])[0];
+   struct ir3_instruction *lo = ir3_64b_get_lo(address);
+   struct ir3_instruction *hi = ir3_64b_get_hi(address);
+   if (intr->intrinsic == nir_intrinsic_load_global_offset) {
+      unsigned shift = nir_intrinsic_offset_shift(intr);
+      assert(shift <= 2 && nir_src_bit_size(intr->src[1]) == 32);
+      struct ir3_instruction *offset = ir3_get_src(ctx, &intr->src[1])[0];
+      struct ir3_instruction *offset_lo = shift ?
+         ir3_SHL_B(b, offset, 0, create_immed(b, shift), 0) : offset;
+      struct ir3_instruction *offset_hi = shift ?
+         ir3_SHR_B(b, offset, 0, create_immed(b, 32 - shift), 0) : create_immed(b, 0);
+      add_global_address(b, &lo, &hi, offset_lo, offset_hi);
+      uint64_t base = (uint64_t)nir_intrinsic_base(intr) << shift;
+      add_global_address(b, &lo, &hi, create_immed(b, (uint32_t)base),
+                          create_immed(b, base >> 32));
+   } else {
+      assert(intr->intrinsic == nir_intrinsic_load_global);
+   }
+   for (unsigned i = 0; i < intr->num_components; i++) {
+      struct ir3_instruction *part_lo = lo, *part_hi = hi;
+      if (i)
+         add_global_address(b, &part_lo, &part_hi, create_immed(b, i * 4),
+                             create_immed(b, 0));
+      struct ir3_instruction *load = ir3_LDG(b, ir3_collect(b, part_lo, part_hi), 0,
+         create_immed(b, 0), 0, create_immed(b, 1), 0);
+      load->cat6.type = TYPE_U32;
+      load->barrier_class = IR3_BARRIER_BUFFER_R | IR3_BARRIER_IMAGE_R;
+      load->barrier_conflict = IR3_BARRIER_BUFFER_W | IR3_BARRIER_IMAGE_W;
+      dst[i] = load;
+   }
+}
+
 static struct ir3_instruction *
 emit_intrinsic_atomic_global(struct ir3_context *ctx, nir_intrinsic_instr *intr)
 {
@@ -392,4 +475,5 @@ const struct ir3_context_funcs ir3_a4xx_funcs = {
    .emit_intrinsic_atomic_image = emit_intrinsic_atomic_image,
    .emit_intrinsic_image_size = emit_intrinsic_image_size_tex,
    .emit_intrinsic_atomic_global = emit_intrinsic_atomic_global,
+   .emit_intrinsic_load_global = emit_intrinsic_load_global,
 };

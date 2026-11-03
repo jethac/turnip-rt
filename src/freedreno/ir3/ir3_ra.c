@@ -2854,6 +2854,25 @@ ir3_ra(struct ir3_shader_variant *v)
        v->shader->nir->info.uses_control_barrier)
       phys_file_size = MIN2(phys_file_size, calc_cs_barrier_reg_budget(v, false));
 
+   if (!v->mergedregs && mesa_shader_stage_is_compute(v->type) &&
+       v->shader_options.max_compute_reg_footprint) {
+      unsigned wave_size = v->compiler->info->threadsize_base *
+         (ir3_should_double_threadsize(v, 0) ? 2 : 1);
+      uint64_t resident_threads = wave_size;
+      if (v->has_barrier) {
+         uint64_t local_size = (uint64_t)v->local_size[0] *
+            v->local_size[1] * v->local_size[2];
+         resident_threads = DIV_ROUND_UP(local_size, wave_size) * wave_size;
+         resident_threads = MAX2(resident_threads,
+            v->shader_options.workgroup_resident_threads);
+      }
+      if (!resident_threads)
+         goto fail;
+      unsigned budget = MIN2(phys_file_size,
+         4ull * (v->shader_options.max_compute_reg_footprint / resident_threads));
+      phys_file_size = ROUND_DOWN_TO(budget, 4 * 2);
+   }
+
    if (!v->mergedregs &&
        limit_pressure.full + limit_pressure.half > phys_file_size) {
       /* a whole register is reserved even for a single component of it */
