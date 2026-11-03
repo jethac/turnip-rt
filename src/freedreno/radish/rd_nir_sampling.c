@@ -99,6 +99,8 @@ rd_reduce_coordinate(nir_builder *b, nir_def *value, unsigned wrap)
       return nir_ffract(b, value);
    if (wrap == 2)
       return nir_fmul_imm(b, nir_ffract(b, nir_fmul_imm(b, value, 0.5)), 2.0);
+   if (wrap == 4) /* mirror once, then clamp to edge */
+      return nir_fmin(b, nir_fabs(b, value), nir_imm_float(b, 17));
    return nir_fmin(b, nir_fmax(b, value, nir_imm_float(b, -16)), nir_imm_float(b, 17));
 }
 
@@ -115,6 +117,9 @@ rd_wrap_coordinate(nir_builder *b, nir_def *coordinate, nir_def *size,
    }
    if (wrap == 3)
       *inside = nir_iand(b, *inside, nir_ult(b, coordinate, size));
+   if (wrap == 4)
+      coordinate = nir_bcsel(b, nir_ilt_imm(b, coordinate, 0),
+                             nir_isub(b, nir_imm_int(b, -1), coordinate), coordinate);
    return nir_imin(b, nir_imax(b, coordinate, nir_imm_int(b, 0)), nir_iadd_imm(b, size, -1));
 }
 

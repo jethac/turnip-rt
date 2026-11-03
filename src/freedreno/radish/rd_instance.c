@@ -60,6 +60,7 @@ static const struct vk_device_extension_table rd_device_extensions = {
    .KHR_8bit_storage = true,
    .KHR_shader_float16_int8 = true,
    .KHR_relaxed_block_layout = true,
+   .KHR_sampler_mirror_clamp_to_edge = true,
 };
 
 VKAPI_ATTR VkResult VKAPI_CALL

@@ -860,9 +860,9 @@ rd_CreateSampler(VkDevice handle, const VkSamplerCreateInfo *info,
        (info->magFilter != VK_FILTER_NEAREST && info->magFilter != VK_FILTER_LINEAR) ||
        (info->minFilter != VK_FILTER_NEAREST && info->minFilter != VK_FILTER_LINEAR) ||
        info->mipmapMode > VK_SAMPLER_MIPMAP_MODE_LINEAR ||
-       info->addressModeU > VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
-       info->addressModeV > VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
-       info->addressModeW > VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+       info->addressModeU > VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE ||
+       info->addressModeV > VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE ||
+       info->addressModeW > VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE ||
        info->borderColor > VK_BORDER_COLOR_INT_OPAQUE_WHITE ||
        info->compareOp > VK_COMPARE_OP_ALWAYS || info->minLod > info->maxLod ||
        fabsf(info->mipLodBias) > 16.0f ||
