@@ -32,11 +32,28 @@ static nir_def *
 emit_udiv(nir_builder *bld, nir_def *numer, nir_def *denom, bool modulo)
 {
    nir_def *rcp = nir_frcp(bld, nir_u2f32(bld, denom));
-   rcp = nir_f2u32(bld, nir_fmul_imm(bld, rcp, 4294966784.0));
+   nir_def *scaled_rcp = nir_fmul_imm(bld, rcp, 4294966784.0);
+   /* A rounded-up reciprocal of one can round the scaled seed to 2^32.
+    * Keep the float-to-uint conversion within its representable range.
+    */
+   rcp = nir_f2u32(bld, nir_fmin(bld, scaled_rcp,
+                                nir_imm_float(bld, 4294967040.0)));
 
-   nir_def *neg_rcp_times_denom =
-      nir_imul(bld, rcp, nir_ineg(bld, denom));
-   rcp = nir_iadd(bld, rcp, nir_umul_high(bld, rcp, neg_rcp_times_denom));
+   nir_def *product = nir_imul(bld, rcp, denom);
+   nir_def *product_hi = nir_umul_high(bld, rcp, denom);
+   nir_def *over = nir_ine_imm(bld, product_hi, 0);
+   nir_def *error = nir_bcsel(bld, over, product, nir_ineg(bld, product));
+   nir_def *correction = nir_umul_high(bld, rcp, error);
+
+   /* The floating seed need not be a lower bound.  In the overestimate
+    * case, the wrapped negative product has the wrong sign for UNR.
+    * Subtract a rounded-up correction instead, so either path produces
+    * a lower bound.  For s = 2^32 / denom and seed error e, the refined
+    * error is less than 1 + e^2 / s, retaining the two-step refinement.
+    */
+   rcp = nir_bcsel(bld, over,
+                   nir_isub(bld, rcp, nir_iadd_imm(bld, correction, 1)),
+                   nir_iadd(bld, rcp, correction));
 
    /* Get initial estimate for quotient/remainder, then refine the estimate
     * in two iterations after */
