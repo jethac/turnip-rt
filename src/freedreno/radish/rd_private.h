@@ -51,6 +51,7 @@ struct rd_device {
    uint64_t faults;
    struct list_head active_queries;
    uint32_t queue_priority;
+   struct rd_trace *trace;
 };
 struct rd_memory {
    struct vk_device_memory vk;

@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include "rd_trace.h"
 #include "util/os_time.h"
 #include <time.h>
 
@@ -125,6 +126,7 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
       goto fail;
    }
    device->compiler->nir_options.lower_device_index_to_zero = true;
+   rd_trace_init(device);
    result = rd_init_border_colors(device);
    if (result == VK_SUCCESS)
       result = vk_queue_enable_submit_thread(&device->queue);
@@ -152,6 +154,7 @@ rd_DestroyDevice(VkDevice handle, const VkAllocationCallbacks *allocator)
    if (!device)
       return;
    vk_queue_finish(&device->queue);
+   rd_trace_finish(device);
    fd_bo_del(device->border_colors);
    fd_bo_del(device->control);
    ir3_compiler_destroy(device->compiler);

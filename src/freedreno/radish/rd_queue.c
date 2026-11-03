@@ -4,6 +4,7 @@
  */
 
 #include "rd_private.h"
+#include "rd_trace.h"
 #include "common/fd5_hw.h"
 #include "common/freedreno_common.h"
 #include "drm/freedreno_ringbuffer.h"
@@ -474,6 +475,7 @@ rd_flush(struct rd_device *device, struct fd_ringbuffer *ring)
    OUT_RING(ring, seqno);
    OUT_RING(ring, ~0u);
    OUT_RING(ring, CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES(16));
+   rd_trace_submit_end(device, ring);
 }
 
 static VkResult
@@ -483,11 +485,19 @@ rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
 {
    device->submit_count++;
    int64_t start = profile ? os_time_get_nano() : 0;
+   int64_t t0 = device->trace ? os_time_get_nano() : 0;
    struct fd_fence *fence = fd_submit_flush(submit, -1, false);
    VkResult result = VK_ERROR_DEVICE_LOST;
    if (fence) {
       fd_fence_flush(fence);
-      if (!fd_pipe_wait_timeout(device->pipe, fence, 5000000000ull)) {
+      int64_t t1 = device->trace ? os_time_get_nano() : 0;
+      int wait = fd_pipe_wait_timeout(device->pipe, fence, 5000000000ull);
+      if (device->trace) {
+         int64_t t2 = os_time_get_nano();
+         device->trace->flush_ns += t1 - t0;
+         device->trace->wait_ns += t2 - t1;
+      }
+      if (!wait) {
          uint64_t faults = 0;
          if (!fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) &&
              faults == device->faults)
@@ -543,7 +553,11 @@ rd_window_drain(struct rd_device *device, struct rd_submit_window *window,
       return VK_SUCCESS;
    struct fd_fence *last = window->pending[window->count - 1].fence;
    VkResult result = VK_ERROR_DEVICE_LOST;
-   if (!fd_pipe_wait_timeout(device->pipe, last, 5000000000ull)) {
+   int64_t t0 = device->trace ? os_time_get_nano() : 0;
+   int wait = fd_pipe_wait_timeout(device->pipe, last, 5000000000ull);
+   if (device->trace)
+      device->trace->wait_ns += os_time_get_nano() - t0;
+   if (!wait) {
       uint64_t faults = 0;
       if (!fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) &&
           faults == device->faults)
@@ -634,14 +648,18 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
    if (!window)
       return rd_finish_submit(device, submit, ring, profile, sample);
    device->submit_count++;
+   int64_t t0 = device->trace ? os_time_get_nano() : 0;
    struct fd_fence *fence = fd_submit_flush(submit, -1, false);
+   if (fence)
+      fd_fence_flush(fence);
+   if (device->trace)
+      device->trace->flush_ns += os_time_get_nano() - t0;
    if (!fence) {
       rd_window_drain(device, window, "error");
       fd_ringbuffer_del(ring);
       fd_submit_del(submit);
       return VK_ERROR_DEVICE_LOST;
    }
-   fd_fence_flush(fence);
    if (fence->submit_error) {
       rd_window_drain(device, window, "error");
       fd_fence_del(fence);
@@ -661,8 +679,11 @@ rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
       (bounded && !known_backing ? backing->size : 0);
    if (!bounded || backing_bytes > 4 * 1024 * 1024) {
       VkResult before = rd_window_drain(device, window, "fallback");
+      int64_t w0 = device->trace ? os_time_get_nano() : 0;
       VkResult result = fd_pipe_wait_timeout(device->pipe, fence, 5000000000ull) ?
          VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+      if (device->trace)
+         device->trace->wait_ns += os_time_get_nano() - w0;
       uint64_t faults = 0;
       if (fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) ||
           faults != device->faults)
@@ -721,7 +742,10 @@ rd_emit_dispatch_chunk(struct rd_device *device, struct fd_ringbuffer *ring,
                        bool first_chunk, struct rd_gpu_elapsed *sample)
 {
    const struct ir3_shader_variant *v = dispatch->pipeline->variant;
+   if (device->trace)
+      device->trace->chunks++;
    if (first_chunk) {
+      rd_trace_submit_begin(device, ring);
       cs_restore_emit(ring, device);
       if (sample && sample->bo)
          rd_gpu_elapsed_emit(ring, sample->bo, 0);
@@ -1039,6 +1063,13 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
       dispatch->pipeline->descriptor_count == 4 && v->instrlen == 31;
    if (tiled_x2)
       budget = 2;
+   /* Experiment knobs: workgroups per CP_EXEC_CS chunk. */
+   const int64_t barrier_groups = debug_get_num_option("RADISH_BARRIER_GROUPS", 0);
+   const int64_t plain_groups = debug_get_num_option("RADISH_GROUPS", 0);
+   if (v->has_barrier && barrier_groups >= 1 && barrier_groups <= 65535)
+      budget = barrier_groups;
+   if (!v->has_barrier && plain_groups >= 1 && plain_groups <= 65535)
+      budget = plain_groups;
    for (unsigned i = 0; i < 3; i++) {
       if (dispatch->grid[i] > 65535)
          return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -1316,6 +1347,7 @@ rd_execute_transfer(struct rd_device *device, enum rd_command_type type,
          fd_submit_del(submit);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
+      rd_trace_submit_begin(device, ring);
       struct rd_buffer *dst = transfer->dst;
       unsigned dst_offset = dst->offset + transfer->dst_offset + done;
       if (type == RD_CMD_COPY) {
@@ -1383,6 +1415,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    struct rd_submit_window window = {0};
    bool deferred = !profile && debug_get_num_option("RADISH_BATCH_CHUNKS", 1) == 8;
    __sync_synchronize();
+   const int64_t queue_start = device->trace ? os_time_get_nano() : 0;
    VkResult result = vk_sync_wait_many(&device->vk, submit->wait_count,
       submit->waits, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
    if (result != VK_SUCCESS)
@@ -1391,6 +1424,13 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
       struct rd_command_buffer *command = container_of(submit->command_buffers[i],
          struct rd_command_buffer, vk);
       util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
+         if (rd_trace_needs_resolve(device)) {
+            result = rd_window_drain(device, &window, "trace");
+            if (result != VK_SUCCESS)
+               return rd_queue_fail(queue);
+            rd_trace_resolve(device, queue_start);
+         }
+         rd_trace_command_begin(device);
          int64_t start = profile ? os_time_get_nano() : 0;
          uint32_t seqno = device->seqno;
          uint64_t submit_count = device->submit_count;
@@ -1443,6 +1483,27 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          } else {
             result = VK_ERROR_UNKNOWN;
          }
+         if (device->trace) {
+            struct rd_trace_record info = {
+               .type = recorded->type,
+            };
+            if (recorded->type == RD_CMD_DISPATCH) {
+               const struct ir3_shader_variant *v = dispatch->pipeline->variant;
+               info.seq = device->trace->dispatch_seq++;
+               info.pipeline = dispatch->pipeline;
+               memcpy(info.grid, dispatch->grid, sizeof(info.grid));
+               for (unsigned i = 0; i < 3; i++)
+                  info.local[i] = v->local_size[i];
+               info.instrlen = v->instrlen;
+               info.max_reg = v->info.max_reg + 1;
+               info.max_half_reg = v->info.max_half_reg + 1;
+               info.barrier = v->has_barrier;
+               info.shared_size = v->shared_size;
+            } else if (recorded->type >= RD_CMD_COPY && recorded->type <= RD_CMD_UPDATE) {
+               info.bytes = recorded->transfer.size;
+            }
+            rd_trace_command_end(device, &info);
+         }
          if (profile) {
             int64_t elapsed = os_time_get_nano() - start;
             uint32_t chunks = device->seqno - seqno;
@@ -1480,6 +1541,7 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
    result = rd_window_drain(device, &window, "final");
    if (result != VK_SUCCESS)
       return rd_queue_fail(queue);
+   rd_trace_resolve(device, queue_start);
    result = vk_sync_signal_many(&device->vk, submit->signal_count, submit->signals);
    return result == VK_SUCCESS ? VK_SUCCESS : rd_queue_fail(queue);
 }
