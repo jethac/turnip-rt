@@ -46,6 +46,10 @@ rd_init_border_colors(struct rd_device *device)
    }
    uint64_t address = fd_bo_get_iova(device->border_colors);
    device->border_colors_offset = align64(address, 8192) - address;
+   if (debug_get_bool_option("RADISH_RESOURCE_DIAGNOSTICS", false))
+      fprintf(stderr, "radish: border colors bo=%llx size=%u table=%llx\n",
+              (unsigned long long)address, fd_bo_size(device->border_colors),
+              (unsigned long long)(address + device->border_colors_offset));
    struct rd_border_color *colors = (void *)((uint8_t *)map + device->border_colors_offset);
    memset(colors, 0, 6 * sizeof(*colors));
    for (uint32_t i = 0; i < 6; i++) {
@@ -413,7 +417,7 @@ rd_emit_resource_texture(struct fd_ringbuffer *ring, uint32_t slot,
             A5XX_TEX_CONST_3_MIN_LAYERSZ(MIN2(resource->min_layer_size, 0xf000u)) : 0),
          address, (address >> 32) | A5XX_TEX_CONST_5_DEPTH(resource->depth),
       };
-      fprintf(stderr, "RADISH_TEXTURE_DIAG slot=%u buffer=%u size_only=%u bo=%llx bo_size=%u offset=%llu address=%llx cpp=%u width=%u height=%u depth=%u row=%u array=%u words=%08x,%08x,%08x,%08x,%08x,%08x,00000000,00000000,00000000,00000000,00000000,00000000\n",
+      fprintf(stderr, "radish: RADISH_TEXTURE_DIAG slot=%u buffer=%u size_only=%u bo=%llx bo_size=%u offset=%llu address=%llx cpp=%u width=%u height=%u depth=%u row=%u array=%u words=%08x,%08x,%08x,%08x,%08x,%08x,00000000,00000000,00000000,00000000,00000000,00000000\n",
          slot, resource->buffer, resource->image_size_only,
          (unsigned long long)fd_bo_get_iova(resource->bo), fd_bo_size(resource->bo),
          (unsigned long long)resource->offset, (unsigned long long)address, resource->cpp,
@@ -545,7 +549,7 @@ rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ring,
                 sizeof(words));
       rd_resource_packet(ring, i, SB4_CS_TEX, ST4_SHADER, 1, 4);
       if (debug_get_bool_option("RADISH_RESOURCE_DIAGNOSTICS", false))
-         fprintf(stderr, "RADISH_SAMPLER_DIAG slot=%u words=%08x,%08x,%08x,%08x\n",
+         fprintf(stderr, "radish: RADISH_SAMPLER_DIAG slot=%u words=%08x,%08x,%08x,%08x\n",
             i, words[0], words[1], words[2], words[3]);
       for (uint32_t j = 0; j < 4; j++)
          OUT_RING(ring, words[j]);
