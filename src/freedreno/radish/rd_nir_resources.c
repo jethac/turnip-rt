@@ -1,3 +1,4 @@
+#include <math.h>
 #include "rd_nir_resources.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
@@ -266,6 +267,47 @@ rd_storage_format_native(enum pipe_format format)
    }
 }
 
+/* Unsigned 5-bit-exponent float (10/11-bit) to fp32 bits, in integer
+ * arithmetic so denormals, infinities and NaNs survive (the 16-bit float
+ * conversion path flushes denormals). */
+static nir_def *
+rd_unpack_ufloat(nir_builder *b, nir_def *value, unsigned mantissa_bits)
+{
+   nir_def *mantissa = nir_iand_imm(b, value, (1u << mantissa_bits) - 1);
+   nir_def *exponent = nir_ushr_imm(b, value, mantissa_bits);
+   nir_def *shifted = nir_ishl_imm(b, mantissa, 23 - mantissa_bits);
+   nir_def *normal = nir_ior(b, nir_ishl_imm(b, nir_iadd_imm(b, exponent, 127 - 15), 23), shifted);
+   nir_def *special = nir_ior_imm(b, shifted, 0x7f800000);
+   nir_def *denormal = nir_fmul_imm(b, nir_u2f32(b, mantissa),
+                                    ldexp(1.0, -14 - (int)mantissa_bits));
+   return nir_bcsel(b, nir_ieq_imm(b, exponent, 0), denormal,
+                    nir_bcsel(b, nir_ieq_imm(b, exponent, 31), special, normal));
+}
+
+/* fp32 to an unsigned 5-bit-exponent float, in integer arithmetic for the
+ * same reason. Negative values become 0, overflow becomes infinity, NaN
+ * stays NaN; the mantissa is truncated. */
+static nir_def *
+rd_pack_ufloat(nir_builder *b, nir_def *value, unsigned mantissa_bits)
+{
+   nir_def *bits = value;
+   nir_def *exponent32 = nir_ubitfield_extract_imm(b, bits, 23, 8);
+   nir_def *mantissa32 = nir_iand_imm(b, bits, 0x7fffff);
+   nir_def *mantissa = nir_ushr_imm(b, mantissa32, 23 - mantissa_bits);
+   nir_def *exponent = nir_iadd_imm(b, exponent32, 15 - 127);
+   nir_def *infinity = nir_imm_int(b, 31u << mantissa_bits);
+   nir_def *nan = nir_ior(b, infinity, nir_umax(b, mantissa, nir_imm_int(b, 1)));
+   nir_def *normal = nir_ior(b, nir_ishl_imm(b, exponent, mantissa_bits), mantissa);
+   nir_def *denormal = nir_f2u32(b, nir_fmul_imm(b, value, ldexp(1.0, 14 + (int)mantissa_bits)));
+   nir_def *result = nir_bcsel(b, nir_ilt_imm(b, exponent, 1), denormal,
+                               nir_bcsel(b, nir_ige_imm(b, exponent, 31), infinity, normal));
+   result = nir_bcsel(b, nir_ieq_imm(b, exponent32, 255),
+                      nir_bcsel(b, nir_ine_imm(b, mantissa32, 0), nan, infinity), result);
+   nir_def *negative = nir_iand(b, nir_ine_imm(b, nir_ushr_imm(b, bits, 31), 0),
+      nir_inot(b, nir_iand(b, nir_ieq_imm(b, exponent32, 255), nir_ine_imm(b, mantissa32, 0))));
+   return nir_bcsel(b, negative, nir_imm_int(b, 0), result);
+}
+
 static void
 rd_lower_raw_storage(nir_builder *b, nir_intrinsic_instr *intr)
 {
@@ -301,7 +343,16 @@ rd_lower_raw_storage(nir_builder *b, nir_intrinsic_instr *intr)
       } else {
          words = nir_trim_vector(b, &intr->def, 4);
       }
-      nir_def *rgba = nir_format_unpack_rgba(b, words, format);
+      nir_def *rgba;
+      if (format == PIPE_FORMAT_R11G11B10_FLOAT) {
+         rgba = nir_vec4(b,
+            rd_unpack_ufloat(b, nir_ubitfield_extract_imm(b, words, 0, 11), 6),
+            rd_unpack_ufloat(b, nir_ubitfield_extract_imm(b, words, 11, 11), 6),
+            rd_unpack_ufloat(b, nir_ubitfield_extract_imm(b, words, 22, 10), 5),
+            nir_imm_float(b, 1.0));
+      } else {
+         rgba = nir_format_unpack_rgba(b, words, format);
+      }
       nir_def *components[4];
       for (unsigned i = 0; i < intr->num_components; i++)
          components[i] = nir_channel(b, rgba, MIN2(i, 3));
@@ -309,8 +360,15 @@ rd_lower_raw_storage(nir_builder *b, nir_intrinsic_instr *intr)
    } else {
       b->cursor = nir_before_instr(&intr->instr);
       nir_def *value = intr->src[3].ssa;
-      nir_def *words = nir_format_pack_rgba(b, format,
-         nir_trim_vector(b, value, MIN2(value->num_components, 4)));
+      nir_def *words;
+      if (format == PIPE_FORMAT_R11G11B10_FLOAT) {
+         words = nir_ior(b, rd_pack_ufloat(b, nir_channel(b, value, 0), 6),
+                 nir_ior(b, nir_ishl_imm(b, rd_pack_ufloat(b, nir_channel(b, value, 1), 6), 11),
+                            nir_ishl_imm(b, rd_pack_ufloat(b, nir_channel(b, value, 2), 5), 22)));
+      } else {
+         words = nir_format_pack_rgba(b, format,
+            nir_trim_vector(b, value, MIN2(value->num_components, 4)));
+      }
       nir_def *raw_value;
       if (bytes <= 4) {
          raw_value = nir_pad_vector_imm_int(b, nir_channel(b, words, 0), 0, intr->num_components);
