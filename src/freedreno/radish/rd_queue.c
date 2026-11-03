@@ -7,6 +7,7 @@
 #include "common/fd5_hw.h"
 #include "common/freedreno_common.h"
 #include "drm/freedreno_ringbuffer.h"
+#include "drm/freedreno_ringbuffer_sp.h"
 #include "vk_sync.h"
 #include "util/u_math.h"
 #include "util/u_atomic.h"
@@ -18,6 +19,7 @@
 #include <string.h>
 
 struct rd_submit_profile {
+   uint64_t chunks;
    int64_t total_ns;
    int64_t max_ns;
 };
@@ -29,7 +31,7 @@ struct rd_gpu_elapsed {
    const char *reason;
    const char *calibration;
    unsigned sample;
-   uint32_t seqno;
+   uint64_t chunks;
    uint64_t submit_count;
 };
 
@@ -137,17 +139,17 @@ rd_gpu_elapsed_finish(struct rd_device *device, struct rd_gpu_elapsed *sample,
    }
    char line[1024];
    int length = snprintf(line, sizeof(line),
-      "RADISH_GPU_ELAPSED version=1 sample=%u valid=%u reason=%s pipeline=%p grid=4,2,1 local=16,8,1 instrlen=27 chunks=%u submits=%" PRIu64 " submit_id=%" PRIu64 " start_ticks=%" PRIu64 " stop_ticks=%" PRIu64 " delta_ticks=%" PRIu64 " gpu_ns=%" PRIu64 " host_start_ns=%" PRId64 " host_done_ns=%" PRId64 " submit_ns=%" PRId64 " result=%d\n",
+      "RADISH_GPU_ELAPSED version=1 sample=%u valid=%u reason=%s pipeline=%p grid=4,2,1 local=16,8,1 instrlen=27 chunks=%" PRIu64 " submits=%" PRIu64 " submit_id=%" PRIu64 " start_ticks=%" PRIu64 " stop_ticks=%" PRIu64 " delta_ticks=%" PRIu64 " gpu_ns=%" PRIu64 " host_start_ns=%" PRId64 " host_done_ns=%" PRId64 " submit_ns=%" PRId64 " result=%d\n",
       sample->sample, (unsigned)(sample->reason == NULL), sample->reason ? sample->reason : "ok",
-      (void *)sample->dispatch->pipeline, device->seqno - sample->seqno,
+      (void *)sample->dispatch->pipeline, sample->chunks,
       device->submit_count - sample->submit_count, device->submit_count,
       values[0], values[2], delta, gpu_ns, start, done, host_ns, result);
    if (sample->calibration)
       length = snprintf(line, sizeof(line),
-         "RADISH_GPU_ELAPSED version=1 sample=%u valid=%u reason=%s pipeline=%p grid=4,2,1 local=16,8,1 instrlen=%u chunks=%u submits=%" PRIu64 " submit_id=%" PRIu64 " start_ticks=%" PRIu64 " stop_ticks=%" PRIu64 " delta_ticks=%" PRIu64 " gpu_ns=%" PRIu64 " host_start_ns=%" PRId64 " host_done_ns=%" PRId64 " submit_ns=%" PRId64 " result=%d calibration=%s\n",
+         "RADISH_GPU_ELAPSED version=1 sample=%u valid=%u reason=%s pipeline=%p grid=4,2,1 local=16,8,1 instrlen=%u chunks=%" PRIu64 " submits=%" PRIu64 " submit_id=%" PRIu64 " start_ticks=%" PRIu64 " stop_ticks=%" PRIu64 " delta_ticks=%" PRIu64 " gpu_ns=%" PRIu64 " host_start_ns=%" PRId64 " host_done_ns=%" PRId64 " submit_ns=%" PRId64 " result=%d calibration=%s\n",
          sample->sample, (unsigned)(sample->reason == NULL), sample->reason ? sample->reason : "ok",
          (void *)sample->dispatch->pipeline,
-         sample->dispatch->pipeline->variant->instrlen, device->seqno - sample->seqno,
+         sample->dispatch->pipeline->variant->instrlen, sample->chunks,
          device->submit_count - sample->submit_count, device->submit_count,
          values[0], values[2], delta, gpu_ns, start, done, host_ns, result,
          sample->calibration);
@@ -384,32 +386,11 @@ rd_emit_buffers(struct rd_device *device, struct fd_ringbuffer *ring,
 }
 
 static void
-rd_emit_constants(struct fd_ringbuffer *ring, const struct rd_dispatch *dispatch,
-                  const uint32_t group_base[3])
+rd_emit_constants(struct fd_ringbuffer *ring, const struct rd_dispatch *dispatch)
 {
    const struct ir3_shader_variant *v = dispatch->pipeline->variant;
    const struct ir3_const_state *state = ir3_const_state(v);
    emit_const(ring, 0, MIN2(32, v->constlen * 4), dispatch->push);
-   if (v->need_driver_params) {
-      struct ir3_driver_params_cs params = {
-         .num_work_groups_x = dispatch->grid[0],
-         .num_work_groups_y = dispatch->grid[1],
-         .num_work_groups_z = dispatch->grid[2],
-         .work_dim = 3,
-         .base_group_x = dispatch->base[0] + group_base[0],
-         .base_group_y = dispatch->base[1] + group_base[1],
-         .base_group_z = dispatch->base[2] + group_base[2],
-         .subgroup_size = 16,
-         .subgroup_id_shift = 4,
-         .local_group_size_x = v->local_size[0],
-         .local_group_size_y = v->local_size[1],
-         .local_group_size_z = v->local_size[2],
-      };
-      unsigned base = state->allocs.consts[IR3_CONST_ALLOC_DRIVER_PARAMS].offset_vec4 * 4;
-      unsigned size = MIN2(state->num_driver_params, v->constlen * 4 - base);
-      if (size)
-         emit_const(ring, base, size, (const uint32_t *)&params);
-   }
    if (v->constant_data_size) {
       if (ir3_const_can_upload(&state->allocs, IR3_CONST_ALLOC_UBO_PTRS,
                               v->constlen)) {
@@ -448,6 +429,34 @@ rd_emit_constants(struct fd_ringbuffer *ring, const struct rd_dispatch *dispatch
    if (v->imm_state.count && base < v->constlen * 4)
       emit_const(ring, base, MIN2(align(v->imm_state.count, 4),
                                 v->constlen * 4 - base), v->imm_state.values);
+}
+
+static void
+rd_emit_driver_params(struct fd_ringbuffer *ring, const struct rd_dispatch *dispatch,
+                      const uint32_t group_base[3])
+{
+   const struct ir3_shader_variant *v = dispatch->pipeline->variant;
+   const struct ir3_const_state *state = ir3_const_state(v);
+   if (v->need_driver_params) {
+      struct ir3_driver_params_cs params = {
+         .num_work_groups_x = dispatch->grid[0],
+         .num_work_groups_y = dispatch->grid[1],
+         .num_work_groups_z = dispatch->grid[2],
+         .work_dim = 3,
+         .base_group_x = dispatch->base[0] + group_base[0],
+         .base_group_y = dispatch->base[1] + group_base[1],
+         .base_group_z = dispatch->base[2] + group_base[2],
+         .subgroup_size = 16,
+         .subgroup_id_shift = 4,
+         .local_group_size_x = v->local_size[0],
+         .local_group_size_y = v->local_size[1],
+         .local_group_size_z = v->local_size[2],
+      };
+      unsigned base = state->allocs.consts[IR3_CONST_ALLOC_DRIVER_PARAMS].offset_vec4 * 4;
+      unsigned size = MIN2(state->num_driver_params, v->constlen * 4 - base);
+      if (size)
+         emit_const(ring, base, size, (const uint32_t *)&params);
+   }
 }
 
 static void
@@ -499,6 +508,182 @@ rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
    return result;
 }
 
+struct rd_pending_submit {
+   struct fd_submit *submit;
+   struct fd_ringbuffer *ring;
+   struct fd_fence *fence;
+   struct fd_bo *cs_backing;
+};
+
+struct rd_submit_window {
+   struct rd_pending_submit pending[8];
+   unsigned count, chunks, cs_bytes, bo_refs, backing_bytes;
+   size_t metadata_bytes;
+};
+
+static void
+rd_window_report(const char *action, const char *reason,
+                 const struct rd_submit_window *window, VkResult result)
+{
+   static int counter;
+   if (!debug_get_bool_option("TRANSCRIBE_RESOURCE_DIAGNOSTICS", false) ||
+       p_atomic_inc_return(&counter) > 256)
+      return;
+   fprintf(stderr, "RADISH_DEFERRED_%s slots=%u chunks=%u cs_bytes=%u bo_refs=%u metadata_bytes=%zu backing_bytes=%u reason=%s result=%d\n",
+      action, window->count, window->chunks, window->cs_bytes,
+      window->bo_refs, window->metadata_bytes, window->backing_bytes, reason, result);
+   fflush(stderr);
+}
+
+static VkResult
+rd_window_drain(struct rd_device *device, struct rd_submit_window *window,
+                const char *reason)
+{
+   if (!window->count)
+      return VK_SUCCESS;
+   struct fd_fence *last = window->pending[window->count - 1].fence;
+   VkResult result = VK_ERROR_DEVICE_LOST;
+   if (!fd_pipe_wait_timeout(device->pipe, last, 5000000000ull)) {
+      uint64_t faults = 0;
+      if (!fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) &&
+          faults == device->faults)
+         result = VK_SUCCESS;
+   }
+   rd_window_report("DRAIN", reason, window, result);
+   for (unsigned i = 0; i < window->count; i++) {
+      fd_fence_del(window->pending[i].fence);
+      fd_ringbuffer_del(window->pending[i].ring);
+      fd_submit_del(window->pending[i].submit);
+   }
+   memset(window, 0, sizeof(*window));
+   return result;
+}
+
+static bool
+rd_window_pipeline(struct rd_device *device, const struct rd_dispatch *dispatch)
+{
+   const struct rd_pipeline *p = dispatch->pipeline;
+   const struct ir3_shader_variant *v = p->variant;
+   const uint64_t threads = (uint64_t)v->local_size[0] *
+      v->local_size[1] * v->local_size[2];
+   const uint64_t wave_size = (uint64_t)device->info.threadsize_base *
+      (v->info.double_threadsize ? 2 : 1);
+   if (!wave_size)
+      return false;
+   const uint64_t resident_threads = v->has_barrier ?
+      DIV_ROUND_UP(threads, wave_size) * wave_size : wave_size;
+   if (fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) != 506 ||
+       fd_device_version(device->fd) < FD_VERSION_SOFTPIN || dispatch->indirect ||
+       p->sampling_nir || p->sampling_variants || !p->batch_local_memory ||
+       p->linear_subgroups || p->linear_barriers ||
+       v->shader_options.workgroup_resident_threads ||
+       !v->shader_options.nir_options.a5xx_ssbo_size_consts ||
+       v->pvtmem_size || v->constant_data_size || v->info.preamble_instrs_count ||
+       p->private_bo || !threads || threads > 128 ||
+       resident_threads * ir3_shader_halfregs(v) > 4096 ||
+       v->shared_size > 16384 || p->resource_count < 1 || p->resource_count > 5 ||
+       v->num_ssbos != p->resource_count ||
+       p->descriptor_count != p->resource_count || p->buffer_count != p->resource_count ||
+       p->resource_usage.texture_count || p->resource_usage.sampler_count ||
+       p->resource_usage.image_count || p->sampling_mask || v->image_mapping.num_tex)
+      return false;
+   for (unsigned i = 0; i < p->resource_count; i++) {
+      if (p->resources[i].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+         return false;
+   }
+   return true;
+}
+
+static bool
+rd_window_footprint(struct fd_submit *submit, struct fd_ringbuffer *ring,
+                    uint32_t *initial_start, struct fd_bo **backing,
+                    unsigned *references, size_t *metadata)
+{
+   const struct fd_submit_sp *sp = to_fd_submit_sp(submit);
+   const struct fd_ringbuffer_sp *rp = to_fd_ringbuffer_sp(ring);
+   if (ring->start != initial_start || ring->size != 32768 ||
+       rp->u.nr_cmds != 1 || rp->u.max_cmds > 5 ||
+       sp->nr_bos > 12 || sp->max_bos > 20 ||
+       sp->nr_suballoc_bos > 12 || sp->max_suballoc_bos > 20 ||
+       sp->bo_table->size > 43 || sp->suballoc_bo_table->size > 43 ||
+       sp->suballoc_ring || !sp->ring_pool.parent ||
+       (uint64_t)sp->ring_pool.parent->element_size *
+          sp->ring_pool.parent->num_elements + sizeof(void *) > 4096)
+      return false;
+   struct fd_bo *bo = rp->ring_bo;
+   *backing = bo->handle ? bo : fd_bo_heap_block(bo);
+   if (!*backing || (*backing)->size > 4 * 1024 * 1024)
+      return false;
+   *references = sp->nr_bos + sp->nr_suballoc_bos;
+   *metadata = sizeof(*sp) + sizeof(*rp) + sizeof(struct fd_fence) + 4096 +
+      (sp->max_bos + sp->max_suballoc_bos) * sizeof(struct fd_bo *) +
+      rp->u.max_cmds * sizeof(struct fd_cmd_sp) +
+      2 * sizeof(struct hash_table) +
+      (sp->bo_table->size + sp->suballoc_bo_table->size) * sizeof(struct hash_entry);
+   return *metadata <= 16384;
+}
+
+static VkResult
+rd_finish_dispatch_submit(struct rd_device *device, struct fd_submit *submit,
+                          struct fd_ringbuffer *ring,
+                          struct rd_submit_profile *profile,
+                          struct rd_gpu_elapsed *sample,
+                          struct rd_submit_window *window,
+                          uint32_t *initial_start, unsigned chunks)
+{
+   if (!window)
+      return rd_finish_submit(device, submit, ring, profile, sample);
+   device->submit_count++;
+   struct fd_fence *fence = fd_submit_flush(submit, -1, false);
+   if (!fence) {
+      rd_window_drain(device, window, "error");
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return VK_ERROR_DEVICE_LOST;
+   }
+   fd_fence_flush(fence);
+   if (fence->submit_error) {
+      rd_window_drain(device, window, "error");
+      fd_fence_del(fence);
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return VK_ERROR_DEVICE_LOST;
+   }
+   struct fd_bo *backing = NULL;
+   unsigned references = 0;
+   size_t metadata = 0;
+   bool bounded = rd_window_footprint(submit, ring, initial_start,
+                                       &backing, &references, &metadata);
+   bool known_backing = false;
+   for (unsigned i = 0; i < window->count; i++)
+      known_backing |= window->pending[i].cs_backing == backing;
+   const uint64_t backing_bytes = window->backing_bytes +
+      (bounded && !known_backing ? backing->size : 0);
+   if (!bounded || backing_bytes > 4 * 1024 * 1024) {
+      VkResult before = rd_window_drain(device, window, "fallback");
+      VkResult result = fd_pipe_wait_timeout(device->pipe, fence, 5000000000ull) ?
+         VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+      uint64_t faults = 0;
+      if (fd_pipe_get_param(device->pipe, FD_CTX_FAULTS, &faults) ||
+          faults != device->faults)
+         result = VK_ERROR_DEVICE_LOST;
+      fd_fence_del(fence);
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return before == VK_SUCCESS ? result : before;
+   }
+   window->pending[window->count++] = (struct rd_pending_submit){submit, ring, fence, backing};
+   window->chunks += chunks;
+   window->cs_bytes += 32768;
+   window->bo_refs += references;
+   window->metadata_bytes += metadata;
+   window->backing_bytes = backing_bytes;
+   rd_window_report("ENQUEUE", "gpu", window, VK_SUCCESS);
+   if (window->count == ARRAY_SIZE(window->pending))
+      return rd_window_drain(device, window, "capacity");
+   return VK_SUCCESS;
+}
+
 VkResult
 rd_query_timestamp(struct rd_device *device, struct rd_query_pool *pool,
                     uint64_t *value)
@@ -533,17 +718,20 @@ static void
 rd_emit_dispatch_chunk(struct rd_device *device, struct fd_ringbuffer *ring,
                        const struct rd_dispatch *dispatch,
                        const uint32_t grid[3], const uint32_t base[3],
-                       struct rd_gpu_elapsed *sample)
+                       bool first_chunk, struct rd_gpu_elapsed *sample)
 {
    const struct ir3_shader_variant *v = dispatch->pipeline->variant;
-   cs_restore_emit(ring, device);
-   if (sample && sample->bo)
-      rd_gpu_elapsed_emit(ring, sample->bo, 0);
-   cs_program_emit(ring, dispatch->pipeline);
-   rd_emit_constants(ring, dispatch, base);
-   rd_emit_buffers(device, ring, dispatch);
-   rd_emit_shader_resources(device, ring, dispatch);
-   rd_emit_image_constants(ring, dispatch);
+   if (first_chunk) {
+      cs_restore_emit(ring, device);
+      if (sample && sample->bo)
+         rd_gpu_elapsed_emit(ring, sample->bo, 0);
+      cs_program_emit(ring, dispatch->pipeline);
+      rd_emit_constants(ring, dispatch);
+      rd_emit_buffers(device, ring, dispatch);
+      rd_emit_shader_resources(device, ring, dispatch);
+      rd_emit_image_constants(ring, dispatch);
+   }
+   rd_emit_driver_params(ring, dispatch, base);
    OUT_PKT4(ring, REG_A5XX_HLSQ_CS_NDRANGE_0, 7);
    OUT_RING(ring, A5XX_HLSQ_CS_NDRANGE_0_KERNELDIM(3) |
       A5XX_HLSQ_CS_NDRANGE_0_LOCALSIZEX(v->local_size[0] - 1) |
@@ -563,7 +751,6 @@ rd_emit_dispatch_chunk(struct rd_device *device, struct fd_ringbuffer *ring,
    OUT_RING(ring, grid[1]);
    OUT_RING(ring, grid[2]);
    OUT_WFI5(ring);
-   rd_flush(device, ring);
 }
 
 static bool
@@ -618,9 +805,202 @@ rd_short_buffer_batch_resources(struct rd_device *device,
    return (uint64_t)device->info.threadsize_base * ir3_shader_halfregs(v) <= 4096;
 }
 
+static bool
+rd_long_binary_batch_resources(struct rd_device *device,
+                               const struct rd_pipeline *pipeline)
+{
+   const struct ir3_shader_variant *v = pipeline->variant;
+   if (fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) != 506 ||
+       v->local_size[0] != 128 || v->local_size[1] != 1 || v->local_size[2] != 1 ||
+       v->loops || v->has_barrier || v->shared_size || v->pvtmem_size ||
+       v->constant_data_size || v->info.double_threadsize || v->info.preamble_instrs_count ||
+       v->instrlen > 202 || v->info.max_reg + 1 > 16 || v->info.max_half_reg + 1 > 12 ||
+       !pipeline->batch_local_memory || pipeline->private_bo ||
+       pipeline->resource_count != 3 || pipeline->descriptor_count != 3 ||
+       pipeline->buffer_count != 3 || pipeline->used_descriptors != UINT64_C(7) ||
+       pipeline->resource_usage.texture_count || pipeline->resource_usage.sampler_count ||
+       pipeline->resource_usage.image_count || pipeline->sampling_mask ||
+       v->image_mapping.num_tex || v->num_ssbos != 3 ||
+       pipeline->linear_subgroups || pipeline->linear_barriers || pipeline->packed_1d_barrier ||
+       v->shader_options.workgroup_resident_threads ||
+       !v->shader_options.nir_options.a5xx_ssbo_size_consts ||
+       pipeline->layout->push_range_count != 1 ||
+       pipeline->layout->push_ranges[0].offset != 0 ||
+       pipeline->layout->push_ranges[0].size != 116 ||
+       pipeline->layout->push_ranges[0].stageFlags != VK_SHADER_STAGE_COMPUTE_BIT)
+      return false;
+   for (unsigned i = 0; i < 3; i++) {
+      if (pipeline->resources[i].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+          pipeline->resources[i].buffer_slot != i || pipeline->buffer_descriptors[i] != i)
+         return false;
+   }
+   return (uint64_t)device->info.threadsize_base * ir3_shader_halfregs(v) <= 4096;
+}
+
+static bool
+rd_packed_quant_batch_resources(struct rd_device *device,
+                                const struct rd_pipeline *pipeline)
+{
+   const struct ir3_shader_variant *v = pipeline->variant;
+   const bool mm = pipeline->logical_local_size[0] == 64 &&
+      v->local_size[0] == 32 && v->shared_size == 4096 && (v->loops == 3 || v->loops == 4);
+   const bool mv = pipeline->logical_local_size[0] == 128 &&
+      v->local_size[0] == 64 && v->shared_size == 512 && (v->loops == 2 || v->loops == 3);
+   if (fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) != 506 || (!mm && !mv) ||
+       pipeline->logical_local_size[1] != 1 || pipeline->logical_local_size[2] != 1 ||
+       v->local_size[1] != 2 || v->local_size[2] != 1 || !v->has_barrier ||
+       !pipeline->packed_1d_barrier || !pipeline->batch_local_memory ||
+       pipeline->linear_subgroups || pipeline->linear_barriers ||
+       v->shader_options.workgroup_resident_threads ||
+       !v->shader_options.nir_options.a5xx_ssbo_size_consts ||
+       v->pvtmem_size || v->constant_data_size || v->info.double_threadsize ||
+       v->info.preamble_instrs_count || v->instrlen > (mm && v->loops == 4 ? 54 : 53) ||
+       v->info.max_reg + 1 > 12 || v->info.max_half_reg + 1 > 12 ||
+       pipeline->resource_count != 3 || pipeline->descriptor_count != 3 ||
+       pipeline->buffer_count != 3 || pipeline->used_descriptors != UINT64_C(7) ||
+       pipeline->resource_usage.texture_count || pipeline->resource_usage.sampler_count ||
+       pipeline->resource_usage.image_count || pipeline->sampling_mask ||
+       v->image_mapping.num_tex || v->num_ssbos != 3 ||
+       pipeline->layout->push_range_count != 1 ||
+       pipeline->layout->push_ranges[0].offset != 0 ||
+       pipeline->layout->push_ranges[0].size != 68 ||
+       pipeline->layout->push_ranges[0].stageFlags != VK_SHADER_STAGE_COMPUTE_BIT)
+      return false;
+   for (unsigned i = 0; i < 3; i++) {
+      if (pipeline->resources[i].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+          pipeline->resources[i].buffer_slot != i || pipeline->buffer_descriptors[i] != i)
+         return false;
+   }
+   return (uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] *
+      ir3_shader_halfregs(v) <= 4096;
+}
+
+static bool
+rd_packed_rms_batch_resources(struct rd_device *device,
+                                const struct rd_pipeline *pipeline)
+{
+   const struct ir3_shader_variant *v = pipeline->variant;
+   if (fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) != 506 ||
+       pipeline->logical_local_size[0] != 128 || v->local_size[0] != 64 ||
+       v->shared_size != 512 || v->loops != 2 ||
+       pipeline->logical_local_size[1] != 1 || pipeline->logical_local_size[2] != 1 ||
+       v->local_size[1] != 2 || v->local_size[2] != 1 || !v->has_barrier ||
+       !pipeline->packed_1d_barrier || !pipeline->batch_local_memory ||
+       pipeline->linear_subgroups || pipeline->linear_barriers ||
+       v->shader_options.workgroup_resident_threads ||
+       !v->shader_options.nir_options.a5xx_ssbo_size_consts ||
+       v->pvtmem_size || v->constant_data_size || v->info.double_threadsize ||
+       v->info.preamble_instrs_count || v->instrlen > 477 ||
+       v->info.max_reg + 1 > 10 || v->info.max_half_reg + 1 > 12 ||
+       pipeline->resource_count != 3 || pipeline->descriptor_count != 3 ||
+       pipeline->buffer_count != 3 ||
+       (pipeline->used_descriptors & UINT64_C(5)) != UINT64_C(5) ||
+       (pipeline->used_descriptors & ~UINT64_C(7)) ||
+       pipeline->resource_usage.texture_count || pipeline->resource_usage.sampler_count ||
+       pipeline->resource_usage.image_count || pipeline->sampling_mask ||
+       v->image_mapping.num_tex || v->num_ssbos != 3 ||
+       pipeline->layout->push_range_count != 1 ||
+       pipeline->layout->push_ranges[0].offset != 0 ||
+       pipeline->layout->push_ranges[0].size != 116 ||
+       pipeline->layout->push_ranges[0].stageFlags != VK_SHADER_STAGE_COMPUTE_BIT)
+      return false;
+   for (unsigned i = 0; i < 3; i++) {
+      if (pipeline->resources[i].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+          pipeline->resources[i].buffer_slot != i || pipeline->buffer_descriptors[i] != i)
+         return false;
+   }
+   return (uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] *
+      ir3_shader_halfregs(v) <= 4096;
+}
+
+static bool
+rd_local_two_buffer_batch_resources(struct rd_device *device,
+                                const struct rd_pipeline *pipeline)
+{
+   const struct ir3_shader_variant *v = pipeline->variant;
+   const bool transpose = pipeline->logical_local_size[0] == 32 &&
+      pipeline->logical_local_size[1] == 4 && v->local_size[0] == 32 &&
+      v->local_size[1] == 4 && !pipeline->packed_1d_barrier &&
+      v->shared_size == 4224 && v->loops == 3 && v->instrlen <= 73 &&
+      v->info.max_reg + 1 <= 8 && v->info.max_half_reg + 1 <= 16;
+   const bool norm = pipeline->logical_local_size[0] == 128 &&
+      pipeline->logical_local_size[1] == 1 && v->local_size[0] == 64 &&
+      v->local_size[1] == 2 && pipeline->packed_1d_barrier &&
+      v->shared_size == 1024 && v->loops == 2 && v->instrlen <= 30 &&
+      v->info.max_reg + 1 <= 8 && v->info.max_half_reg + 1 <= 2;
+   if (fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) != 506 || (!transpose && !norm) ||
+       pipeline->logical_local_size[2] != 1 || v->local_size[2] != 1 ||
+       !v->has_barrier || !pipeline->batch_local_memory ||
+       pipeline->linear_subgroups || pipeline->linear_barriers ||
+       v->shader_options.workgroup_resident_threads ||
+       !v->shader_options.nir_options.a5xx_ssbo_size_consts ||
+       v->pvtmem_size || v->constant_data_size || v->info.double_threadsize ||
+       v->info.preamble_instrs_count ||
+       pipeline->resource_count != 2 || pipeline->descriptor_count != 2 ||
+       pipeline->buffer_count != 2 || pipeline->used_descriptors != UINT64_C(3) ||
+       pipeline->resource_usage.texture_count || pipeline->resource_usage.sampler_count ||
+       pipeline->resource_usage.image_count || pipeline->sampling_mask ||
+       v->image_mapping.num_tex || v->num_ssbos != 2 ||
+       pipeline->layout->push_range_count != 1 ||
+       pipeline->layout->push_ranges[0].offset != 0 ||
+       pipeline->layout->push_ranges[0].size != 120 ||
+       pipeline->layout->push_ranges[0].stageFlags != VK_SHADER_STAGE_COMPUTE_BIT)
+      return false;
+   for (unsigned i = 0; i < 2; i++) {
+      if (pipeline->resources[i].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+          pipeline->resources[i].buffer_slot != i || pipeline->buffer_descriptors[i] != i)
+         return false;
+   }
+   return (uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] *
+      ir3_shader_halfregs(v) <= 4096;
+}
+
+static bool
+rd_packed_attention_batch_resources(struct rd_device *device,
+                                    const struct rd_pipeline *pipeline)
+{
+   const struct ir3_shader_variant *v = pipeline->variant;
+   const bool mm = v->shared_size == 8704 && v->instrlen <= 358 &&
+      v->info.max_reg + 1 <= 48 && v->info.max_half_reg + 1 <= 48;
+   const bool mv = v->shared_size == 256 && v->instrlen <= 536 &&
+      v->info.max_reg + 1 <= 12 && v->info.max_half_reg + 1 <= 48;
+   const bool softmax = v->shared_size == 128 && v->instrlen <= 65 &&
+      v->loops == 3 && v->info.max_reg + 1 <= 10 && v->info.max_half_reg + 1 <= 9;
+   const unsigned buffers = mm ? 3 : mv ? 5 : 4;
+   const unsigned push_size = mv ? 52 : 68;
+   if (fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) != 506 || (!mm && !mv && !softmax) ||
+       pipeline->logical_local_size[0] != 32 || pipeline->logical_local_size[1] != 1 ||
+       pipeline->logical_local_size[2] != 1 || v->local_size[0] != 16 ||
+       v->local_size[1] != 2 || v->local_size[2] != 1 || !v->has_barrier ||
+       !pipeline->packed_1d_barrier || !pipeline->batch_local_memory ||
+       pipeline->linear_subgroups || pipeline->linear_barriers ||
+       v->shader_options.workgroup_resident_threads ||
+       !v->shader_options.nir_options.a5xx_ssbo_size_consts ||
+       v->pvtmem_size || v->constant_data_size || v->info.double_threadsize ||
+       v->info.preamble_instrs_count ||
+       pipeline->resource_count != buffers || pipeline->descriptor_count != buffers ||
+       pipeline->buffer_count != buffers ||
+       (pipeline->used_descriptors & UINT64_C(7)) != UINT64_C(7) ||
+       (pipeline->used_descriptors & ~((UINT64_C(1) << buffers) - 1)) ||
+       pipeline->resource_usage.texture_count || pipeline->resource_usage.sampler_count ||
+       pipeline->resource_usage.image_count || pipeline->sampling_mask ||
+       v->image_mapping.num_tex || v->num_ssbos != buffers ||
+       pipeline->layout->push_range_count != 1 ||
+       pipeline->layout->push_ranges[0].offset != 0 ||
+       pipeline->layout->push_ranges[0].size != push_size ||
+       pipeline->layout->push_ranges[0].stageFlags != VK_SHADER_STAGE_COMPUTE_BIT)
+      return false;
+   for (unsigned i = 0; i < buffers; i++) {
+      if (pipeline->resources[i].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+          pipeline->resources[i].buffer_slot != i || pipeline->buffer_descriptors[i] != i)
+         return false;
+   }
+   return UINT64_C(32) * ir3_shader_halfregs(v) <= 4096;
+}
+
 static VkResult
 rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch,
-                    struct rd_submit_profile *profile)
+                    struct rd_submit_profile *profile, struct rd_submit_window *window)
 {
    if (!dispatch->grid[0] || !dispatch->grid[1] || !dispatch->grid[2])
       return VK_SUCCESS;
@@ -631,10 +1011,21 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
          return VK_ERROR_UNKNOWN;
    }
    const struct ir3_shader_variant *v = dispatch->pipeline->variant;
+   if (window && (profile || !rd_window_pipeline(device, dispatch))) {
+      VkResult drained = rd_window_drain(device, window, "unsupported");
+      if (drained != VK_SUCCESS)
+         return drained;
+      window = NULL;
+   }
    uint32_t tile[3], budget = v->has_barrier ? 1 : 64;
    int64_t shared_groups = debug_get_num_option("RADISH_SHARED_GROUPS", 1);
+   const bool packed_shared = dispatch->pipeline->packed_1d_barrier &&
+      (rd_packed_quant_batch_resources(device, dispatch->pipeline) ||
+       rd_packed_attention_batch_resources(device, dispatch->pipeline) ||
+       rd_packed_rms_batch_resources(device, dispatch->pipeline) ||
+       rd_local_two_buffer_batch_resources(device, dispatch->pipeline));
    if (v->has_barrier &&
-       (uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] <= 32 &&
+       ((uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] <= 32 || packed_shared) &&
        shared_groups >= 1 && shared_groups <= 8)
       budget = shared_groups;
    bool tiled_x2 = debug_get_num_option("RADISH_TILED_GROUPS_X", 1) == 2 &&
@@ -657,20 +1048,36 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
    int64_t requested_chunks = debug_get_num_option("RADISH_BATCH_CHUNKS", 1);
    unsigned max_chunks = 1;
    if (!v->loops && !v->has_barrier &&
-       (v->instrlen <= 32 || rd_short_buffer_batch_resources(device, dispatch->pipeline)) &&
+       (v->instrlen <= 32 || rd_short_buffer_batch_resources(device, dispatch->pipeline) ||
+        rd_long_binary_batch_resources(device, dispatch->pipeline)) &&
        ((requested_chunks >= 1 && requested_chunks <= 4) || requested_chunks == 8))
+      max_chunks = requested_chunks;
+   if ((requested_chunks == 2 || requested_chunks == 4 || requested_chunks == 8) &&
+       (rd_packed_quant_batch_resources(device, dispatch->pipeline) ||
+        rd_packed_attention_batch_resources(device, dispatch->pipeline) ||
+        rd_packed_rms_batch_resources(device, dispatch->pipeline) ||
+        rd_local_two_buffer_batch_resources(device, dispatch->pipeline)))
       max_chunks = requested_chunks;
    int64_t tiled_chunks = debug_get_num_option("RADISH_TILED_BATCH_CHUNKS", 1);
    if ((tiled_chunks == 2 || tiled_chunks == 4 || tiled_chunks == 8) &&
        fd_dev_gpu_id(fd_pipe_dev_id(device->pipe)) == 506 &&
        v->local_size[0] == 16 && v->local_size[1] == 8 &&
-       v->local_size[2] == 1 && v->has_barrier && v->loops == 4 &&
-       v->shared_size == 16384 && !v->pvtmem_size &&
-       !v->info.double_threadsize && v->info.max_reg + 1 <= 16 &&
+       v->local_size[2] == 1 && v->has_barrier &&
+       ((v->loops == 4 && v->shared_size == 16384) ||
+        (v->loops == 3 && v->shared_size == 10240 &&
+         dispatch->pipeline->layout->push_range_count == 1 &&
+         dispatch->pipeline->layout->push_ranges[0].offset == 0 &&
+         dispatch->pipeline->layout->push_ranges[0].size == 12 &&
+         dispatch->pipeline->layout->push_ranges[0].stageFlags == VK_SHADER_STAGE_COMPUTE_BIT)) &&
+       !v->pvtmem_size && !v->info.double_threadsize && v->info.max_reg + 1 <= 16 &&
        rd_shared_batch_resources(dispatch->pipeline))
       max_chunks = tiled_chunks;
    if (tiled_x2)
       max_chunks = MIN2(max_chunks, 4);
+   if (rd_packed_quant_batch_resources(device, dispatch->pipeline) ||
+       (rd_packed_attention_batch_resources(device, dispatch->pipeline) &&
+        (v->shared_size == 8704 || v->shared_size == 256)))
+      max_chunks = 1;
    struct rd_gpu_elapsed storage = {0};
    struct rd_gpu_elapsed *sample = NULL;
    const bool zero_base = !dispatch->base[0] && !dispatch->base[1] && !dispatch->base[2];
@@ -691,7 +1098,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
           rd_gpu_elapsed_reserve(&storage.sample)) {
          sample = &storage;
          sample->dispatch = dispatch;
-         sample->seqno = device->seqno;
+         sample->chunks = 0;
          sample->submit_count = device->submit_count;
          rd_gpu_elapsed_prepare(device, sample);
       }
@@ -723,7 +1130,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
          sample = &storage;
          sample->dispatch = dispatch;
          sample->calibration = calibration;
-         sample->seqno = device->seqno;
+         sample->chunks = 0;
          sample->submit_count = device->submit_count;
          rd_gpu_elapsed_prepare(device, sample);
       }
@@ -750,7 +1157,7 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
             sample = &storage;
             sample->dispatch = dispatch;
             sample->calibration = "shared-hot";
-            sample->seqno = device->seqno;
+            sample->chunks = 0;
             sample->submit_count = device->submit_count;
             rd_gpu_elapsed_prepare(device, sample);
          }
@@ -776,14 +1183,26 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
          sample = &storage;
          sample->dispatch = dispatch;
          sample->calibration = "packed-a";
-         sample->seqno = device->seqno;
+         sample->chunks = 0;
          sample->submit_count = device->submit_count;
          rd_gpu_elapsed_prepare(device, sample);
       }
    }
    struct fd_submit *submit = NULL;
    struct fd_ringbuffer *ring = NULL;
+   static unsigned diagnostic_dispatches;
+   const bool diagnostics = debug_get_bool_option("RADISH_RESOURCE_DIAGNOSTICS", false) &&
+      p_atomic_inc_return(&diagnostic_dispatches) <= 4096;
+   const uint64_t first_submit = device->submit_count;
+   if (diagnostics) {
+      fprintf(stderr, "RADISH_DISPATCH_BEGIN native=%u grid=%u,%u,%u tile=%u,%u,%u batch=%u packed=%u local_memory=%u\n",
+         v->instrlen, dispatch->grid[0], dispatch->grid[1], dispatch->grid[2],
+         tile[0], tile[1], tile[2], max_chunks, dispatch->pipeline->packed_1d_barrier,
+         dispatch->pipeline->batch_local_memory);
+      fflush(stderr);
+   }
    unsigned chunks = 0;
+   uint32_t *initial_ring_start = NULL;
    uint32_t base[3];
    for (base[2] = 0; base[2] < dispatch->grid[2]; base[2] += tile[2]) {
       for (base[1] = 0; base[1] < dispatch->grid[1]; base[1] += tile[1]) {
@@ -806,18 +1225,25 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
                   return VK_ERROR_OUT_OF_HOST_MEMORY;
                }
             }
+            if (!chunks)
+               initial_ring_start = ring->start;
             uint32_t grid[3];
             for (unsigned i = 0; i < 3; i++)
                grid[i] = MIN2(tile[i], dispatch->grid[i] - base[i]);
             rd_emit_dispatch_chunk(device, ring, dispatch, grid, base,
-                                   chunks == 0 ? sample : NULL);
+                                   chunks == 0, sample);
+            if (profile)
+               profile->chunks++;
+            if (sample)
+               sample->chunks++;
             if (++chunks == max_chunks) {
+               rd_flush(device, ring);
                if (sample && sample->bo) {
                   rd_gpu_elapsed_emit(ring, sample->bo, 16);
                   OUT_WFI5(ring);
                }
-               VkResult result = rd_finish_submit(device, submit, ring, profile,
-                                                   sample);
+               VkResult result = rd_finish_dispatch_submit(device, submit, ring, profile,
+                                                   sample, window, initial_ring_start, chunks);
                rd_gpu_elapsed_release(sample);
                sample = NULL;
                submit = NULL;
@@ -830,11 +1256,23 @@ rd_execute_dispatch(struct rd_device *device, const struct rd_dispatch *dispatch
       }
    }
    if (submit) {
-      VkResult result = rd_finish_submit(device, submit, ring, profile, sample);
+      rd_flush(device, ring);
+      VkResult result = rd_finish_dispatch_submit(device, submit, ring, profile, sample,
+                                                    window, initial_ring_start, chunks);
       rd_gpu_elapsed_release(sample);
+      if (diagnostics) {
+         fprintf(stderr, "RADISH_DISPATCH_END native=%u result=%d submits=%" PRIu64 "\n",
+            v->instrlen, result, device->submit_count - first_submit);
+         fflush(stderr);
+      }
       return result;
    }
    rd_gpu_elapsed_release(sample);
+   if (diagnostics) {
+      fprintf(stderr, "RADISH_DISPATCH_END native=%u result=0 submits=%" PRIu64 "\n",
+         v->instrlen, device->submit_count - first_submit);
+      fflush(stderr);
+   }
    return VK_SUCCESS;
 }
 
@@ -942,6 +1380,8 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    struct rd_device *device = container_of(queue->base.device, struct rd_device, vk);
    bool profile = debug_get_bool_option("RADISH_PROFILE", false);
+   struct rd_submit_window window = {0};
+   bool deferred = !profile && debug_get_num_option("RADISH_BATCH_CHUNKS", 1) == 8;
    __sync_synchronize();
    VkResult result = vk_sync_wait_many(&device->vk, submit->wait_count,
       submit->waits, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
@@ -957,6 +1397,12 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
          struct rd_submit_profile submit_profile = {0};
          const struct rd_dispatch *dispatch = &recorded->dispatch;
          struct rd_dispatch indirect;
+         if (recorded->type != RD_CMD_DISPATCH || recorded->dispatch.indirect ||
+             !rd_window_pipeline(device, &recorded->dispatch)) {
+            result = rd_window_drain(device, &window, "cpu");
+            if (result != VK_SUCCESS)
+               return rd_queue_fail(queue);
+         }
          if (recorded->type == RD_CMD_DISPATCH) {
             result = VK_SUCCESS;
             indirect = *dispatch;
@@ -978,7 +1424,8 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
                result = rd_prepare_sampling(device, &indirect);
             if (result == VK_SUCCESS)
                result = rd_execute_dispatch(device, dispatch,
-                                            profile ? &submit_profile : NULL);
+                                            profile ? &submit_profile : NULL,
+                                            deferred ? &window : NULL);
             if (result == VK_SUCCESS)
                rd_query_account_dispatch(device, dispatch);
             if (indirect.sampling_addresses)
@@ -1003,11 +1450,11 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             if (recorded->type == RD_CMD_DISPATCH) {
                const struct rd_dispatch *d = dispatch;
                const struct ir3_shader_variant *v = d->pipeline->variant;
-               fprintf(stderr, "RADISH_PROFILE dispatch pipeline=%p grid=%u,%u,%u local=%u,%u,%u barrier=%u loops=%u instrlen=%u chunks=%u submits=%" PRIu64 " ns=%" PRId64 " submit_ns=%" PRId64 " submit_max_ns=%" PRId64 " result=%d\n",
+               fprintf(stderr, "RADISH_PROFILE dispatch pipeline=%p grid=%u,%u,%u local=%u,%u,%u barrier=%u loops=%u instrlen=%u chunks=%" PRIu64 " submits=%" PRIu64 " ns=%" PRId64 " submit_ns=%" PRId64 " submit_max_ns=%" PRId64 " result=%d\n",
                        (void *)d->pipeline, d->grid[0], d->grid[1], d->grid[2],
                        v->local_size[0], v->local_size[1], v->local_size[2],
                        (unsigned)v->has_barrier, v->loops, v->instrlen,
-                       chunks, submits, elapsed, submit_profile.total_ns,
+                       submit_profile.chunks, submits, elapsed, submit_profile.total_ns,
                        submit_profile.max_ns, result);
             } else if (recorded->type == RD_CMD_IMAGE_COPY || recorded->type == RD_CMD_IMAGE_CLEAR) {
                const struct rd_image_transfer *t = &recorded->image_transfer;
@@ -1024,10 +1471,15 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
                        (unsigned)recorded->type, submits, elapsed, result);
             }
          }
-         if (result != VK_SUCCESS)
+         if (result != VK_SUCCESS) {
+            rd_window_drain(device, &window, "error");
             return rd_queue_fail(queue);
+         }
       }
    }
+   result = rd_window_drain(device, &window, "final");
+   if (result != VK_SUCCESS)
+      return rd_queue_fail(queue);
    result = vk_sync_signal_many(&device->vk, submit->signal_count, submit->signals);
    return result == VK_SUCCESS ? VK_SUCCESS : rd_queue_fail(queue);
 }
