@@ -225,6 +225,7 @@ fd_fence_new(struct fd_pipe *pipe, bool use_fence_fd)
    util_queue_fence_init(&f->ready);
    f->use_fence_fd = use_fence_fd;
    f->fence_fd = -1;
+   f->submit_error = -EINPROGRESS;
 
    return f;
 }

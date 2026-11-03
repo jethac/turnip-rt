@@ -131,6 +131,7 @@ flush_submit_list(struct list_head *submit_list)
 
    ret = drmCommandWriteRead(pipe->dev->fd, DRM_MSM_GEM_SUBMIT, &req,
                              sizeof(req));
+   fd_submit->out_fence->submit_error = ret;
    if (ret) {
       ERROR_MSG("submit failed: %d (%s)", ret, strerror(errno));
       msm_dump_submit(&req);

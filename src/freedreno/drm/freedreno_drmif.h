@@ -105,6 +105,7 @@ struct fd_fence {
     */
    int fence_fd;
    bool use_fence_fd;
+   int submit_error;
 };
 
 struct fd_fence *fd_fence_new(struct fd_pipe *pipe, bool use_fence_fd);
