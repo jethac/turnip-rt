@@ -234,4 +234,14 @@ VkResult rd_query_timestamp(struct rd_device *device, struct rd_query_pool *pool
                             uint64_t *value);
 void rd_query_account_dispatch(struct rd_device *device,
                                 const struct rd_dispatch *dispatch);
+#ifdef __cplusplus
+extern "C" {
+#endif
+bool rd_pipeline_cache_restore(struct rd_device *device, struct rd_pipeline *pipeline,
+   VkPipelineCache cache, const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags);
+void rd_pipeline_cache_store(struct rd_device *device, struct rd_pipeline *pipeline,
+   VkPipelineCache cache, const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags);
+#ifdef __cplusplus
+}
+#endif
 #endif

@@ -217,6 +217,8 @@ rd_linearize_local_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+static VkResult rd_upload_pipeline(struct rd_device *device, struct rd_pipeline *pipeline);
+
 static VkResult rd_build_nir_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
                                       nir_shader *nir, VkPipelineCreateFlags flags);
 
@@ -374,6 +376,13 @@ rd_build_nir_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
    if (!v)
       return VK_ERROR_UNKNOWN;
    v->shader = NULL;
+   return rd_upload_pipeline(device, pipeline);
+}
+
+static VkResult
+rd_upload_pipeline(struct rd_device *device, struct rd_pipeline *pipeline)
+{
+   struct ir3_shader_variant *v = pipeline->variant;
    if (v->image_mapping.tex_base + v->image_mapping.num_tex > 32 ||
        pipeline->buffer_count + pipeline->resource_usage.image_count > 32 ||
        !v->local_size[0] || !v->local_size[1] || !v->local_size[2] ||
@@ -574,12 +583,16 @@ rd_CreateComputePipelines(VkDevice handle, VkPipelineCache cache, uint32_t count
          continue;
       }
       pipeline->layout = vk_pipeline_layout_ref(layout);
-      VkResult result = rd_compile_pipeline(device, pipeline, &infos[i].stage, infos[i].flags);
+      bool cached = rd_pipeline_cache_restore(device, pipeline, cache, &infos[i].stage, infos[i].flags);
+      VkResult result = cached ? rd_upload_pipeline(device, pipeline) :
+         rd_compile_pipeline(device, pipeline, &infos[i].stage, infos[i].flags);
       if (result != VK_SUCCESS) {
          rd_destroy_pipeline(device, pipeline, allocator);
          failure = result;
          continue;
       }
+      if (!cached)
+         rd_pipeline_cache_store(device, pipeline, cache, &infos[i].stage, infos[i].flags);
       out[i] = rd_pipeline_to_handle(pipeline);
    }
    return failure;

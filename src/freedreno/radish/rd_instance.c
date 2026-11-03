@@ -230,6 +230,7 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    const struct build_id_note *build_id = build_id_find_nhdr_for_addr(rd_try_create_physical);
    if (build_id && build_id_length(build_id) >= VK_UUID_SIZE)
       memcpy(properties.driverUUID, build_id_data(build_id), VK_UUID_SIZE);
+   memcpy(properties.pipelineCacheUUID, properties.driverUUID, VK_UUID_SIZE);
    properties.deviceNodeMask = 1;
    snprintf(properties.deviceName, sizeof(properties.deviceName),
             "Radish Adreno 506 (experimental compute)");

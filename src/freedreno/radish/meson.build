@@ -10,7 +10,7 @@ rd_entrypoints = custom_target(
 
 libvulkan_radish = shared_library(
   'vulkan_radish',
-  ['rd_instance.c', 'rd_device.c', 'rd_memory.c', 'rd_descriptor.c', 'rd_pipeline.c',
+  ['rd_instance.c', 'rd_device.c', 'rd_memory.c', 'rd_descriptor.c', 'rd_pipeline.c', 'rd_pipeline_cache.cpp',
    'rd_command.c', 'rd_sampling.c', 'rd_nir_sampling.c', 'rd_nir_resources.c', 'rd_nir_robust.c', 'rd_resources.c', 'rd_transfer.c', 'rd_image.c',
    'rd_event.c', 'rd_query.c', 'rd_queue.c', rd_entrypoints, freedreno_xml_header_files],
   include_directories : [inc_freedreno, inc_include, inc_src],
