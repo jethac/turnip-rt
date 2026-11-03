@@ -271,6 +271,14 @@ rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out
          out->type = A5XX_TEX_2D;
          out->depth = view->layer_count;
       }
+      /* A 1D-array storage image is addressed as (x, layer), with the layer
+       * in the second coordinate (the byte-offset constants already use the
+       * array pitch as the y pitch), so the layer count is its height: the
+       * ldib/stib bounds check against HEIGHT=1 dropped every layer but 0.
+       */
+      if (descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+          view->view_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY)
+         out->height = view->layer_count;
       out->mip_levels = view->level_count - 1;
       out->image_size_only = descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
       out->pitchalign = image->native_layout.pitchalign - 6;
