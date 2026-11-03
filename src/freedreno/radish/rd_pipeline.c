@@ -5,6 +5,16 @@
 #include "ir3/ir3_nir.h"
 #include "util/u_math.h"
 
+/* RADISH_DEBUG=pipeline prints why a compute pipeline is rejected. */
+static VkResult
+rd_pipeline_unsupported(int line)
+{
+   const char *debug = getenv("RADISH_DEBUG");
+   if (debug && strstr(debug, "pipeline"))
+      fprintf(stderr, "radish: compute pipeline rejected at rd_pipeline.c:%d\n", line);
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
 struct rd_lower_state { struct rd_pipeline *pipeline; bool failed; };
 
 static void
@@ -278,14 +288,14 @@ rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
             nir_address_format_32bit_offset);
    if (nir->info.shared_size > RD_MAX_SHARED_SIZE) {
       ralloc_free(nir);
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    }
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
    if (!rd_nir_lower_compute_resources(nir, rd_pipeline_resource,
           pipeline, &pipeline->resource_usage)) {
       ralloc_free(nir);
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    }
    pipeline->used_descriptors |= pipeline->resource_usage.descriptors;
    struct rd_lower_state lower = { .pipeline = pipeline };
@@ -293,7 +303,7 @@ rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
       nir_metadata_control_flow, &lower);
    if (lower.failed) {
       ralloc_free(nir);
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    }
    NIR_PASS(_, nir, nir_opt_dce);
    pipeline->descriptor_count = pipeline->resource_count;
@@ -306,7 +316,7 @@ rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
    }
    if (nir->info.workgroup_size_variable || !local_count || local_count > 128) {
       ralloc_free(nir);
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    }
    pipeline->batch_local_memory = rd_batch_local_memory(nir);
    pipeline->linear_subgroups = rd_uses_subgroups(nir);
@@ -320,11 +330,11 @@ rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
        pipeline->logical_local_size[2] != 1);
    if (device->vk.enabled_features.robustBufferAccess && !rd_nir_lower_robust_buffers(nir)) {
       ralloc_free(nir);
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    }
    if (!rd_nir_lower_subword_storage(nir)) {
       ralloc_free(nir);
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    }
    const struct nir_lower_compute_system_values_options sysvals = {
       .has_base_workgroup_id = true,
@@ -429,7 +439,7 @@ rd_upload_pipeline(struct rd_device *device, struct rd_pipeline *pipeline)
        pipeline->buffer_count + pipeline->resource_usage.image_count > 32 ||
        !v->local_size[0] || !v->local_size[1] || !v->local_size[2] ||
        (uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] > 128)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    unsigned local_size = v->local_size[0] * v->local_size[1] * v->local_size[2];
    unsigned wave_size = device->info.threadsize_base *
                         (v->info.double_threadsize ? 2 : 1);
@@ -438,7 +448,7 @@ rd_upload_pipeline(struct rd_device *device, struct rd_pipeline *pipeline)
    if (v->has_barrier && v->shader_options.workgroup_resident_threads)
       resident_threads = MAX2(resident_threads, v->shader_options.workgroup_resident_threads);
    if ((uint64_t)resident_threads * ir3_shader_halfregs(v) > 4096)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    if (v->constant_data_size) {
       const struct ir3_const_state *state = ir3_const_state(v);
       if (!v->bin || v->info.constant_data_offset > v->info.size ||
@@ -517,7 +527,7 @@ rd_sampling_compile(struct rd_device *device, struct rd_pipeline *source,
                       const struct rd_sampling_key *key, struct rd_pipeline **out)
 {
    if (!source->sampling_nir || source->buffer_count >= 32)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    for (struct rd_sampling_entry *entry = source->sampling_variants; entry; entry = entry->next) {
       if (!memcmp(&entry->key, key, sizeof(*key))) {
          *out = entry->pipeline;
@@ -550,7 +560,7 @@ rd_sampling_compile(struct rd_device *device, struct rd_pipeline *source,
       ralloc_free(nir);
       rd_destroy_pipeline(device, pipeline, NULL);
       vk_free(&device->vk.alloc, entry);
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      return rd_pipeline_unsupported(__LINE__);
    }
    NIR_PASS(_, nir, nir_opt_dce);
    pipeline->resource_usage.textures = 0;
