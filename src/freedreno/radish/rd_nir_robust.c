@@ -15,69 +15,6 @@ rd_access_valid(nir_builder *b, nir_def *offset, nir_def *size,
    return valid;
 }
 
-static bool
-rd_robust_load(nir_builder *b, nir_intrinsic_instr *intr,
-                 struct rd_robust_state *state)
-{
-   if ((intr->def.bit_size != 8 && intr->def.bit_size != 16 &&
-        intr->def.bit_size != 32) ||
-       intr->src[1].ssa->bit_size != 32 ||
-       nir_intrinsic_offset_shift(intr)) {
-      state->failed = true;
-      return false;
-   }
-   nir_def *index = intr->src[0].ssa, *offset = intr->src[1].ssa;
-   nir_def *size = nir_get_ssbo_size(b, 32, index);
-   nir_def *parts[NIR_MAX_VEC_COMPONENTS];
-   uint32_t bytes = intr->def.bit_size / 8;
-   nir_def *zero = nir_imm_intN_t(b, 0, intr->def.bit_size);
-   uint32_t alignment = MAX2(1, nir_intrinsic_align_mul(intr));
-   for (uint32_t i = 0; i < intr->def.num_components; i++) {
-      uint32_t added = i * bytes;
-      nir_def *valid = rd_access_valid(b, offset, size, added, bytes);
-      nir_push_if(b, valid);
-      nir_def *value = nir_load_ssbo(b, 1, intr->def.bit_size, index,
-         nir_iadd_imm(b, offset, added),
-         .access = nir_intrinsic_access(intr) & ~(ACCESS_CAN_REORDER | ACCESS_CAN_SPECULATE),
-         .align_mul = alignment,
-         .align_offset = (nir_intrinsic_align_offset(intr) + added) % alignment);
-      nir_pop_if(b, NULL);
-      parts[i] = nir_if_phi(b, value, zero);
-   }
-   nir_def_replace(&intr->def, nir_vec(b, parts, intr->def.num_components));
-   return true;
-}
-
-static bool
-rd_robust_store(nir_builder *b, nir_intrinsic_instr *intr,
-                  struct rd_robust_state *state)
-{
-   uint32_t bits = nir_src_bit_size(intr->src[0]);
-   if ((bits != 8 && bits != 16 && bits != 32) || intr->src[2].ssa->bit_size != 32) {
-      state->failed = true;
-      return false;
-   }
-   nir_def *index = intr->src[1].ssa, *offset = intr->src[2].ssa;
-   nir_def *size = nir_get_ssbo_size(b, 32, index);
-   uint32_t bytes = bits / 8;
-   uint32_t mask = nir_intrinsic_write_mask(intr);
-   uint32_t alignment = MAX2(1, nir_intrinsic_align_mul(intr));
-   for (uint32_t i = 0; i < intr->num_components; i++) {
-      if (!(mask & (1u << i)))
-         continue;
-      uint32_t added = i * bytes;
-      nir_def *valid = rd_access_valid(b, offset, size, added, bytes);
-      nir_push_if(b, valid);
-      nir_store_ssbo(b, nir_channel(b, intr->src[0].ssa, i), index,
-         nir_iadd_imm(b, offset, added), .write_mask = 1,
-         .access = nir_intrinsic_access(intr), .align_mul = alignment,
-         .align_offset = (nir_intrinsic_align_offset(intr) + added) % alignment);
-      nir_pop_if(b, NULL);
-   }
-   nir_instr_remove(&intr->instr);
-   return true;
-}
-
 static void
 rd_robust_clone(nir_builder *b, nir_intrinsic_instr *intr, nir_def *valid)
 {
@@ -96,6 +33,55 @@ rd_robust_clone(nir_builder *b, nir_intrinsic_instr *intr, nir_def *valid)
    } else {
       nir_instr_remove(&intr->instr);
    }
+}
+
+/* One bounds check per access instruction. The spec allows an access with
+ * any out-of-bounds byte to be treated as wholly out of bounds (and accesses
+ * within 16 bytes of an out-of-bounds one too), so a vector load returns zero
+ * and a vector store writes nothing unless every byte it touches is in range.
+ */
+static bool
+rd_robust_load(nir_builder *b, nir_intrinsic_instr *intr,
+                 struct rd_robust_state *state)
+{
+   if ((intr->def.bit_size != 8 && intr->def.bit_size != 16 &&
+        intr->def.bit_size != 32) ||
+       intr->src[1].ssa->bit_size != 32 ||
+       nir_intrinsic_offset_shift(intr)) {
+      state->failed = true;
+      return false;
+   }
+   nir_def *index = intr->src[0].ssa, *offset = intr->src[1].ssa;
+   nir_def *size = nir_get_ssbo_size(b, 32, index);
+   uint32_t bytes = intr->def.num_components * (intr->def.bit_size / 8);
+   nir_def *valid = rd_access_valid(b, offset, size, 0, bytes);
+   rd_robust_clone(b, intr, valid);
+   return true;
+}
+
+static bool
+rd_robust_store(nir_builder *b, nir_intrinsic_instr *intr,
+                  struct rd_robust_state *state)
+{
+   uint32_t bits = nir_src_bit_size(intr->src[0]);
+   if ((bits != 8 && bits != 16 && bits != 32) || intr->src[2].ssa->bit_size != 32) {
+      state->failed = true;
+      return false;
+   }
+   uint32_t mask = nir_intrinsic_write_mask(intr);
+   if (!mask) {
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   nir_def *offset = intr->src[2].ssa;
+   nir_def *size = nir_get_ssbo_size(b, 32, intr->src[1].ssa);
+   /* Check the written span, first to last enabled component. */
+   uint32_t bytes = bits / 8;
+   uint32_t first = ffs(mask) - 1, last = util_last_bit(mask) - 1;
+   nir_def *valid = rd_access_valid(b, offset, size, first * bytes,
+                                    (last - first + 1) * bytes);
+   rd_robust_clone(b, intr, valid);
+   return true;
 }
 
 static bool
