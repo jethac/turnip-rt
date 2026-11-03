@@ -26,6 +26,7 @@ rd_AllocateMemory(VkDevice handle, const VkMemoryAllocateInfo *info,
       vk_device_memory_destroy(&device->vk, allocator, &memory->vk);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
+   memory->bo->bo_reuse = NO_CACHE;
    *out = rd_memory_to_handle(memory);
    return VK_SUCCESS;
 }
