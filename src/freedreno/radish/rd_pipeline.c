@@ -1,0 +1,609 @@
+#include "rd_private.h"
+#include "compiler/nir/nir_builder.h"
+#include "compiler/spirv/nir_spirv.h"
+#include "vk_pipeline.h"
+#include "ir3/ir3_nir.h"
+#include "util/u_math.h"
+
+struct rd_lower_state { struct rd_pipeline *pipeline; bool failed; };
+
+static void
+rd_shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *alignment)
+{
+   assert(glsl_type_is_vector_or_scalar(type));
+   unsigned component_size = glsl_type_is_boolean(type) ? 4 : glsl_get_bit_size(type) / 8;
+   *size = component_size * glsl_get_vector_elements(type);
+   *alignment = component_size;
+}
+
+static const struct rd_nir_resource_binding *
+rd_pipeline_resource(void *data, uint32_t set, uint32_t binding, uint32_t element)
+{
+   struct rd_pipeline *pipeline = data;
+   for (uint32_t i = 0; i < pipeline->resource_count; i++) {
+      const struct rd_nir_resource_binding *resource = &pipeline->resources[i];
+      if (resource->descriptor_set == set && resource->binding == binding &&
+          resource->array_element == element)
+         return resource;
+   }
+   if (set >= pipeline->layout->set_count ||
+       pipeline->resource_count >= RD_MAX_ACTIVE_RESOURCES)
+      return NULL;
+   const struct rd_set_layout *layout = container_of(pipeline->layout->set_layouts[set],
+                                                     const struct rd_set_layout, vk);
+   const struct rd_binding *found = NULL;
+   for (uint32_t i = 0; i < layout->binding_count; i++)
+      if (layout->bindings[i].binding == binding)
+         found = &layout->bindings[i];
+   if (!found || element >= found->count)
+      return NULL;
+   bool buffer = found->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+      found->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
+      found->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+      found->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+   bool texture = found->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+      found->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+      found->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+   bool sampler = found->type == VK_DESCRIPTOR_TYPE_SAMPLER ||
+      found->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+   bool image = found->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+      found->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+   if ((!buffer && !texture && !sampler && !image) ||
+       (buffer && pipeline->buffer_count >= 32))
+      return NULL;
+   uint32_t textures = 0, samplers = 0, images = 0;
+   for (uint32_t i = 0; i < pipeline->resource_count; i++) {
+      const struct rd_nir_resource_binding *resource = &pipeline->resources[i];
+      textures += resource->texture_slot != UINT32_MAX;
+      samplers += resource->sampler_slot != UINT32_MAX;
+      images += resource->image_slot != UINT32_MAX;
+   }
+   if ((texture && textures >= 16) || (sampler && samplers >= 16) || (image && images >= 16))
+      return NULL;
+   uint32_t slot = pipeline->resource_count++;
+   struct rd_nir_resource_binding *resource = &pipeline->resources[slot];
+   *resource = (struct rd_nir_resource_binding) {
+      .descriptor_set = set, .binding = binding, .array_element = element,
+      .logical_slot = found->slot + element, .descriptor_slot = slot, .type = found->type,
+      .buffer_slot = buffer ? pipeline->buffer_count : UINT32_MAX,
+      .texture_slot = texture ? textures : UINT32_MAX,
+      .sampler_slot = sampler ? samplers : UINT32_MAX,
+      .image_slot = image ? images : UINT32_MAX,
+   };
+   if (buffer)
+      pipeline->buffer_descriptors[pipeline->buffer_count++] = slot;
+   if (texture)
+      pipeline->texture_descriptors[textures] = slot;
+   if (sampler)
+      pipeline->sampler_descriptors[samplers] = slot;
+   if (image)
+      pipeline->image_descriptors[images] = slot;
+   return resource;
+}
+
+static const struct rd_nir_resource_binding *
+rd_buffer_resource(struct rd_pipeline *pipeline, nir_def *index)
+{
+   uint32_t element = 0;
+   while (nir_def_instr(index)->type == nir_instr_type_intrinsic) {
+      const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(nir_def_instr(index));
+      if (intr->intrinsic == nir_intrinsic_vulkan_resource_index) {
+         if (!nir_src_is_const(intr->src[0]))
+            return NULL;
+         element += nir_src_as_uint(intr->src[0]);
+         return rd_pipeline_resource(pipeline, nir_intrinsic_desc_set(intr),
+                                       nir_intrinsic_binding(intr), element);
+      }
+      if (intr->intrinsic != nir_intrinsic_vulkan_resource_reindex ||
+          !nir_src_is_const(intr->src[1]))
+         return NULL;
+      element += nir_src_as_uint(intr->src[1]);
+      index = intr->src[0].ssa;
+   }
+   return NULL;
+}
+
+static bool
+rd_lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct rd_lower_state *state = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *replacement = NULL;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_vulkan_descriptor: {
+      const struct rd_nir_resource_binding *resource =
+         rd_buffer_resource(state->pipeline, intr->src[0].ssa);
+      if (!resource || resource->buffer_slot == UINT32_MAX) {
+         state->failed = true;
+         return false;
+      }
+      state->pipeline->used_descriptors |= UINT64_C(1) << resource->descriptor_slot;
+      replacement = nir_vec2(b, nir_imm_int(b, resource->buffer_slot), nir_imm_int(b, 0));
+      break;
+   }
+   case nir_intrinsic_load_ubo:
+      replacement = nir_load_ssbo(b, intr->num_components, intr->def.bit_size,
+         intr->src[0].ssa, intr->src[1].ssa,
+         .access = nir_intrinsic_access(intr),
+         .align_mul = nir_intrinsic_align_mul(intr),
+         .align_offset = nir_intrinsic_align_offset(intr));
+      break;
+   case nir_intrinsic_load_push_constant:
+      replacement = nir_load_const_ir3(b, intr->num_components, intr->def.bit_size,
+         nir_ushr_imm(b, intr->src[0].ssa, 2), .base = nir_intrinsic_base(intr) / 4);
+      break;
+   default:
+      return false;
+   }
+   nir_def_replace(&intr->def, replacement);
+   return true;
+}
+
+static bool
+rd_uses_subgroups(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_elect:
+            case nir_intrinsic_load_subgroup_size:
+            case nir_intrinsic_load_subgroup_id:
+            case nir_intrinsic_load_subgroup_invocation:
+            case nir_intrinsic_load_num_subgroups:
+               return true;
+            case nir_intrinsic_barrier:
+               if (nir_intrinsic_execution_scope(intr) == SCOPE_SUBGROUP ||
+                   nir_intrinsic_memory_scope(intr) == SCOPE_SUBGROUP)
+                  return true;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+rd_uses_workgroup_barrier(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_barrier &&
+                nir_intrinsic_execution_scope(intr) == SCOPE_WORKGROUP)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+rd_repack_1d_local_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_local_invocation_id)
+      return false;
+   const uint32_t *physical_x = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *raw = nir_load_local_invocation_id(b);
+   nir_def *q = nir_iadd(b, nir_channel(b, raw, 0),
+      nir_imul_imm(b, nir_channel(b, raw, 1), *physical_x));
+   nir_def_replace(&intr->def,
+      nir_vec3(b, q, nir_imm_int(b, 0), nir_imm_int(b, 0)));
+   return true;
+}
+
+static bool
+rd_linearize_local_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_local_invocation_id)
+      return false;
+   const uint32_t *size = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *q = nir_channel(b, nir_load_local_invocation_id(b), 0);
+   nir_def *x = nir_umod_imm(b, q, size[0]);
+   nir_def *y = nir_umod_imm(b, nir_udiv_imm(b, q, size[0]), size[1]);
+   nir_def *z = nir_udiv_imm(b, q, size[0] * size[1]);
+   nir_def_replace(&intr->def, nir_vec3(b, x, y, z));
+   return true;
+}
+
+static VkResult rd_build_nir_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
+                                      nir_shader *nir, VkPipelineCreateFlags flags);
+
+VkResult
+rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
+                     const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags)
+{
+   const struct spirv_to_nir_options spirv_options = {
+      .ubo_addr_format = nir_address_format_32bit_index_offset,
+      .ssbo_addr_format = nir_address_format_32bit_index_offset,
+      .push_const_addr_format = nir_address_format_logical,
+      .shared_addr_format = nir_address_format_32bit_offset,
+      .min_ubo_alignment = 16, .min_ssbo_alignment = 4,
+   };
+   nir_shader *nir = NULL;
+   VkResult result = vk_pipeline_shader_stage_to_nir(&device->vk, flags, stage,
+      &spirv_options, ir3_get_compiler_options(device->compiler), NULL, &nir);
+   if (result != VK_SUCCESS)
+      return result;
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_lower_system_values);
+   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
+            rd_shared_type_info);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
+            nir_address_format_32bit_offset);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
+            nir_address_format_32bit_index_offset);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
+            nir_address_format_32bit_offset);
+   if (nir->info.shared_size > RD_MAX_SHARED_SIZE) {
+      ralloc_free(nir);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_dce);
+   if (!rd_nir_lower_compute_resources(nir, rd_pipeline_resource,
+          pipeline, &pipeline->resource_usage)) {
+      ralloc_free(nir);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   pipeline->used_descriptors |= pipeline->resource_usage.descriptors;
+   struct rd_lower_state lower = { .pipeline = pipeline };
+   nir_shader_intrinsics_pass(nir, rd_lower_intrinsic,
+      nir_metadata_control_flow, &lower);
+   if (lower.failed) {
+      ralloc_free(nir);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   NIR_PASS(_, nir, nir_opt_dce);
+   pipeline->descriptor_count = pipeline->resource_count;
+   nir->info.num_ubos = 0;
+   nir->info.num_ssbos = pipeline->buffer_count;
+   uint64_t local_count = 1;
+   for (unsigned i = 0; i < 3; i++) {
+      pipeline->logical_local_size[i] = nir->info.workgroup_size[i];
+      local_count *= nir->info.workgroup_size[i];
+   }
+   if (nir->info.workgroup_size_variable || !local_count || local_count > 128) {
+      ralloc_free(nir);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   pipeline->linear_subgroups = rd_uses_subgroups(nir);
+   bool workgroup_barrier = rd_uses_workgroup_barrier(nir);
+   pipeline->packed_1d_barrier = !pipeline->linear_subgroups &&
+      pipeline->logical_local_size[1] == 1 && pipeline->logical_local_size[2] == 1 &&
+      local_count >= 32 && !(local_count & 1) && workgroup_barrier;
+   pipeline->linear_barriers = workgroup_barrier && !pipeline->linear_subgroups &&
+      !pipeline->packed_1d_barrier &&
+      ((pipeline->logical_local_size[0] & 1) || (pipeline->logical_local_size[1] & 1) ||
+       pipeline->logical_local_size[2] != 1);
+   if (device->vk.enabled_features.robustBufferAccess && !rd_nir_lower_robust_buffers(nir)) {
+      ralloc_free(nir);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   if (!rd_nir_lower_subword_storage(nir)) {
+      ralloc_free(nir);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   const struct nir_lower_compute_system_values_options sysvals = {
+      .has_base_workgroup_id = true,
+   };
+   NIR_PASS(_, nir, nir_lower_compute_system_values, &sysvals);
+   if (pipeline->linear_subgroups || pipeline->linear_barriers) {
+      if (pipeline->logical_local_size[1] != 1 || pipeline->logical_local_size[2] != 1)
+         nir_shader_intrinsics_pass(nir, rd_linearize_local_id,
+            nir_metadata_control_flow, pipeline->logical_local_size);
+      nir->info.workgroup_size[0] = local_count;
+      nir->info.workgroup_size[1] = 1;
+      nir->info.workgroup_size[2] = 1;
+   } else if (pipeline->packed_1d_barrier) {
+      uint32_t physical_x = local_count / 2;
+      nir_shader_intrinsics_pass(nir, rd_repack_1d_local_id,
+         nir_metadata_control_flow, &physical_x);
+      nir->info.workgroup_size[0] = physical_x;
+      nir->info.workgroup_size[1] = 2;
+      nir->info.workgroup_size[2] = 1;
+   }
+   ir3_nir_lower_io_vars_to_temporaries(nir);
+   ir3_nir_lower_io(nir);
+   pipeline->compile_flags = flags;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               const nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (tex->is_array || tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+                  pipeline->sampling_nir = nir_shader_clone(NULL, nir);
+                  goto saved_sampling_nir;
+               }
+            }
+         }
+      }
+   }
+saved_sampling_nir:
+   return rd_build_nir_pipeline(device, pipeline, nir, flags);
+}
+
+static VkResult
+rd_build_nir_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
+                       nir_shader *nir, VkPipelineCreateFlags flags)
+{
+   uint32_t local_count = pipeline->logical_local_size[0] * pipeline->logical_local_size[1] *
+                          pipeline->logical_local_size[2];
+   struct ir3_shader_options options = {
+      .nir_options.robust_modes = device->vk.enabled_features.robustBufferAccess ? nir_var_mem_ssbo : 0,
+      .nir_options.a5xx_image_buffer_2d = true,
+      .nir_options.a5xx_raw_global_loads = true,
+      .nir_options.a5xx_image_size_consts = true,
+      .nir_options.a5xx_ssbo_size_consts = true,
+      .nir_options.disable_optimizations = flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT,
+      .api_wavesize = IR3_SINGLE_ONLY,
+      .api_subgroup_size = 16,
+      .workgroup_resident_threads = (pipeline->linear_subgroups || pipeline->linear_barriers) ?
+         DIV_ROUND_UP(local_count, 16) * device->info.threadsize_base : 0,
+      .max_compute_reg_footprint = 4096,
+      .real_wavesize = IR3_SINGLE_ONLY,
+      .push_consts_type = IR3_PUSH_CONSTS_PER_STAGE,
+      .push_consts_dwords = 32,
+      .const_allocs = {
+         .consts[IR3_CONST_ALLOC_PUSH_CONSTS] = { .offset_vec4 = 0, .size_vec4 = 8 },
+         .max_const_offset_vec4 = 8,
+      },
+   };
+   ir3_finalize_nir(device->compiler, &options.nir_options, nir);
+   struct ir3_shader *shader = ir3_shader_from_nir(device->compiler, nir, &options);
+   if (!shader) {
+      ralloc_free(nir);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   shader->cs.req_local_mem = nir->info.shared_size;
+   struct ir3_shader_key key = {0};
+   pipeline->variant = ir3_shader_create_variant(shader, &key, false);
+   ir3_shader_destroy(shader);
+   struct ir3_shader_variant *v = pipeline->variant;
+   if (!v)
+      return VK_ERROR_UNKNOWN;
+   v->shader = NULL;
+   if (v->image_mapping.tex_base + v->image_mapping.num_tex > 32 ||
+       pipeline->buffer_count + pipeline->resource_usage.image_count > 32 ||
+       !v->local_size[0] || !v->local_size[1] || !v->local_size[2] ||
+       (uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] > 128)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   unsigned local_size = v->local_size[0] * v->local_size[1] * v->local_size[2];
+   unsigned wave_size = device->info.threadsize_base *
+                        (v->info.double_threadsize ? 2 : 1);
+   unsigned resident_threads = v->has_barrier ?
+      DIV_ROUND_UP(local_size, wave_size) * wave_size : wave_size;
+   if (v->has_barrier && v->shader_options.workgroup_resident_threads)
+      resident_threads = MAX2(resident_threads, v->shader_options.workgroup_resident_threads);
+   if ((uint64_t)resident_threads * ir3_shader_halfregs(v) > 4096)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   if (v->constant_data_size) {
+      const struct ir3_const_state *state = ir3_const_state(v);
+      if (!v->bin || v->info.constant_data_offset > v->info.size ||
+          v->constant_data_size > v->info.size - v->info.constant_data_offset ||
+          (v->info.constant_data_offset & 15) || (v->constant_data_size & 15) ||
+          state->consts_ubo.idx < 0)
+         return VK_ERROR_UNKNOWN;
+      if (ir3_const_can_upload(&state->allocs, IR3_CONST_ALLOC_UBO_PTRS,
+                              v->constlen)) {
+         uint64_t base = state->allocs.consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4 * 4ull;
+         if ((uint32_t)state->consts_ubo.idx >= state->num_ubos ||
+             base + 2ull * align(state->num_ubos, 2) > 4ull * v->constlen)
+            return VK_ERROR_UNKNOWN;
+      }
+      for (unsigned i = 0; i < state->ubo_state.num_enabled; i++) {
+         const struct ir3_ubo_range *range = &state->ubo_state.range[i];
+         if (range->ubo.bindless || range->ubo.global ||
+             range->ubo.block != (uint32_t)state->consts_ubo.idx ||
+             range->start > range->end || range->end > v->constant_data_size ||
+             ((range->start | range->end | range->offset) & 15))
+            return VK_ERROR_UNKNOWN;
+      }
+   }
+   if (v->pvtmem_size) {
+      uint64_t per_sp = (uint64_t)v->pvtmem_size * device->info.fibers_per_sp;
+      per_sp = (per_sp + 4095) & ~UINT64_C(4095);
+      uint64_t total = per_sp * device->info.num_sp_cores;
+      if (v->pvtmem_per_wave || (v->pvtmem_size & 511) ||
+          v->pvtmem_size > (0xffu << 9) || !per_sp ||
+          per_sp > (0xffffu << 11) || per_sp > (0x3ffffu << 12) ||
+          !total || total > UINT32_MAX)
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      pipeline->private_per_sp = per_sp;
+      pipeline->private_bo = fd_bo_new(device->fd, total, FD_BO_NOMAP,
+                                       "radish-private");
+      if (!pipeline->private_bo)
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   if (v->info.size > UINT32_MAX - 127)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   pipeline->bo = fd_bo_new(device->fd, align(v->info.size, 128),
+                            FD_BO_GPUREADONLY, "radish-shader");
+   if (!pipeline->bo)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   fd_bo_mark_for_dump(pipeline->bo);
+   void *map = fd_bo_map(pipeline->bo);
+   if (!map)
+      return VK_ERROR_MEMORY_MAP_FAILED;
+   memcpy(map, v->bin, v->info.size);
+   return VK_SUCCESS;
+}
+
+static void
+rd_destroy_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
+                     const VkAllocationCallbacks *allocator)
+{
+   while (pipeline->sampling_variants) {
+      struct rd_sampling_entry *entry = pipeline->sampling_variants;
+      pipeline->sampling_variants = entry->next;
+      rd_destroy_pipeline(device, entry->pipeline, NULL);
+      vk_free(&device->vk.alloc, entry);
+   }
+   ralloc_free(pipeline->sampling_nir);
+   if (pipeline->bo)
+      fd_bo_del(pipeline->bo);
+   if (pipeline->private_bo)
+      fd_bo_del(pipeline->private_bo);
+   if (pipeline->variant)
+      ralloc_free(pipeline->variant);
+   vk_pipeline_layout_unref(&device->vk, pipeline->layout);
+   vk_object_free(&device->vk, allocator, pipeline);
+}
+
+VkResult
+rd_sampling_compile(struct rd_device *device, struct rd_pipeline *source,
+                      const struct rd_sampling_key *key, struct rd_pipeline **out)
+{
+   if (!source->sampling_nir || source->buffer_count >= 32)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   for (struct rd_sampling_entry *entry = source->sampling_variants; entry; entry = entry->next) {
+      if (!memcmp(&entry->key, key, sizeof(*key))) {
+         *out = entry->pipeline;
+         return VK_SUCCESS;
+      }
+   }
+   struct rd_sampling_entry *entry = vk_zalloc(&device->vk.alloc, sizeof(*entry), 8,
+                                               VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   struct rd_pipeline *pipeline = vk_object_zalloc(&device->vk, NULL,
+      sizeof(*pipeline), VK_OBJECT_TYPE_PIPELINE);
+   if (!entry || !pipeline) {
+      vk_free(&device->vk.alloc, entry);
+      if (pipeline) vk_object_free(&device->vk, NULL, pipeline);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   struct vk_object_base base = pipeline->base;
+   *pipeline = *source;
+   pipeline->base = base;
+   pipeline->layout = vk_pipeline_layout_ref(source->layout);
+   pipeline->variant = NULL;
+   pipeline->bo = pipeline->private_bo = NULL;
+   pipeline->private_per_sp = 0;
+   pipeline->sampling_nir = NULL;
+   pipeline->sampling_variants = NULL;
+   pipeline->sampling_mask = key->mask;
+   pipeline->sampling_buffer = pipeline->buffer_count++;
+   pipeline->buffer_descriptors[pipeline->sampling_buffer] = UINT32_MAX;
+   nir_shader *nir = nir_shader_clone(NULL, source->sampling_nir);
+   if (!rd_nir_lower_array_fetch(nir, key, pipeline->sampling_buffer)) {
+      ralloc_free(nir);
+      rd_destroy_pipeline(device, pipeline, NULL);
+      vk_free(&device->vk.alloc, entry);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   NIR_PASS(_, nir, nir_opt_dce);
+   pipeline->resource_usage.textures = 0;
+   pipeline->resource_usage.texture_count = 0;
+   BITSET_ZERO(nir->info.textures_used);
+   BITSET_ZERO(nir->info.textures_used_by_txf);
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            const nir_tex_instr *tex = nir_instr_as_tex(instr);
+            assert(tex->texture_index < ARRAY_SIZE(pipeline->texture_descriptors));
+            pipeline->resource_usage.textures |= 1u << tex->texture_index;
+            pipeline->resource_usage.texture_count =
+               MAX2(pipeline->resource_usage.texture_count, tex->texture_index + 1);
+            BITSET_SET(nir->info.textures_used, tex->texture_index);
+            if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms)
+               BITSET_SET(nir->info.textures_used_by_txf, tex->texture_index);
+         }
+      }
+   }
+   nir->info.num_textures = pipeline->resource_usage.texture_count;
+   nir->info.num_ssbos = pipeline->buffer_count;
+   VkResult result = rd_build_nir_pipeline(device, pipeline, nir, source->compile_flags);
+   if (result != VK_SUCCESS) {
+      rd_destroy_pipeline(device, pipeline, NULL);
+      vk_free(&device->vk.alloc, entry);
+      return result;
+   }
+   entry->key = *key;
+   entry->pipeline = pipeline;
+   entry->next = source->sampling_variants;
+   source->sampling_variants = entry;
+   struct rd_sampling_entry **tail = &source->sampling_variants;
+   for (unsigned count = 0; *tail; count++) {
+      if (count >= 16) {
+         struct rd_sampling_entry *discard = *tail;
+         *tail = discard->next;
+         rd_destroy_pipeline(device, discard->pipeline, NULL);
+         vk_free(&device->vk.alloc, discard);
+      } else {
+         tail = &(*tail)->next;
+      }
+   }
+   *out = pipeline;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+rd_CreateComputePipelines(VkDevice handle, VkPipelineCache cache, uint32_t count,
+   const VkComputePipelineCreateInfo *infos, const VkAllocationCallbacks *allocator,
+   VkPipeline *out)
+{
+   VK_FROM_HANDLE(rd_device, device, handle);
+   VkResult failure = VK_SUCCESS;
+   memset(out, 0, count * sizeof(*out));
+   for (uint32_t i = 0; i < count; i++) {
+      VK_FROM_HANDLE(vk_pipeline_layout, layout, infos[i].layout);
+      if (infos[i].stage.stage != VK_SHADER_STAGE_COMPUTE_BIT ||
+          layout->set_count > RD_MAX_SETS ||
+          (infos[i].flags & ~(VK_PIPELINE_CREATE_DISPATCH_BASE_BIT |
+             VK_PIPELINE_CREATE_ALLOW_DERIVATIVES_BIT | VK_PIPELINE_CREATE_DERIVATIVE_BIT |
+             VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT))) {
+         failure = VK_ERROR_FEATURE_NOT_PRESENT;
+         continue;
+      }
+      struct rd_pipeline *pipeline = vk_object_zalloc(&device->vk, allocator,
+         sizeof(*pipeline), VK_OBJECT_TYPE_PIPELINE);
+      if (!pipeline) {
+         failure = VK_ERROR_OUT_OF_HOST_MEMORY;
+         continue;
+      }
+      pipeline->layout = vk_pipeline_layout_ref(layout);
+      VkResult result = rd_compile_pipeline(device, pipeline, &infos[i].stage, infos[i].flags);
+      if (result != VK_SUCCESS) {
+         rd_destroy_pipeline(device, pipeline, allocator);
+         failure = result;
+         continue;
+      }
+      out[i] = rd_pipeline_to_handle(pipeline);
+   }
+   return failure;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_DestroyPipeline(VkDevice handle, VkPipeline pipeline_handle,
+                   const VkAllocationCallbacks *allocator)
+{
+   VK_FROM_HANDLE(rd_device, device, handle);
+   VK_FROM_HANDLE(rd_pipeline, pipeline, pipeline_handle);
+   if (pipeline)
+      rd_destroy_pipeline(device, pipeline, allocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+rd_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+   const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *allocator,
+   VkPipeline *out)
+{
+   (void)device;
+   (void)cache;
+   (void)infos;
+   (void)allocator;
+   memset(out, 0, count * sizeof(*out));
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}

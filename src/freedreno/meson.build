@@ -53,6 +53,10 @@ if with_freedreno_vk
   subdir('vulkan')
 endif
 
+if with_radish_vk
+  subdir('radish')
+endif
+
 # 77 is a convention used by Meson and other build systems to skip tests.
 SKIP_RETURN_CODE = 77
 
