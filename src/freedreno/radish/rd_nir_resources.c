@@ -438,6 +438,13 @@ rd_lower_resource(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_image_deref_load:
    case nir_intrinsic_image_deref_store:
       access = true;
+      /* Atomic loads/stores of an image texel arrive without a format;
+       * take the image variable's. */
+      if (nir_intrinsic_format(intr) == PIPE_FORMAT_NONE) {
+         nir_variable *variable = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+         if (variable)
+            nir_intrinsic_set_format(intr, variable->data.image.format);
+      }
       if (!rd_storage_format(nir_intrinsic_format(intr)) ||
           (intr->intrinsic == nir_intrinsic_image_deref_load &&
            intr->def.bit_size != 32) ||
