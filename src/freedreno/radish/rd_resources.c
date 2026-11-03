@@ -425,8 +425,29 @@ rd_emit_resource_texture(struct fd_ringbuffer *ring, uint32_t slot,
 }
 
 static enum a5xx_tex_fmt
-rd_storage_resource_format(enum a5xx_tex_fmt format)
+rd_storage_resource_format(enum a5xx_tex_fmt format, uint32_t cpp)
 {
+   /* Must match rd_storage_format_native() in rd_nir_resources.c: formats
+    * the shader accesses as raw unsigned integers of the same size. */
+   switch (format) {
+   case TFMT5_8_UNORM: case TFMT5_8_UINT: case TFMT5_8_SINT:
+   case TFMT5_8_8_8_8_UNORM: case TFMT5_8_8_8_8_UINT: case TFMT5_8_8_8_8_SINT:
+   case TFMT5_16_UINT: case TFMT5_16_SINT: case TFMT5_16_FLOAT:
+   case TFMT5_16_16_16_16_UINT: case TFMT5_16_16_16_16_SINT: case TFMT5_16_16_16_16_FLOAT:
+   case TFMT5_32_UINT: case TFMT5_32_SINT: case TFMT5_32_FLOAT:
+   case TFMT5_32_32_32_32_UINT: case TFMT5_32_32_32_32_SINT: case TFMT5_32_32_32_32_FLOAT:
+   case TFMT5_8_SNORM: case TFMT5_8_8_8_8_SNORM: case TFMT5_16_SNORM: case TFMT5_16_16_16_16_SNORM:
+      break;
+   default:
+      switch (cpp) {
+      case 1: return TFMT5_8_UINT;
+      case 2: return TFMT5_16_UINT;
+      case 4: return TFMT5_32_UINT;
+      case 8: return TFMT5_16_16_16_16_UINT;
+      case 16: return TFMT5_32_32_32_32_UINT;
+      default: return format;
+      }
+   }
    switch (format) {
    case TFMT5_8_SNORM: return TFMT5_8_SINT;
    case TFMT5_8_8_SNORM: return TFMT5_8_8_SINT;
@@ -442,7 +463,7 @@ static void
 rd_emit_resource_image(struct fd_ringbuffer *ring, uint32_t slot,
                         const struct rd_resource *resource)
 {
-   enum a5xx_tex_fmt format = rd_storage_resource_format(resource->format);
+   enum a5xx_tex_fmt format = rd_storage_resource_format(resource->format, resource->cpp);
    rd_resource_packet(ring, slot, SB4_CS_SSBO, ST4_CONSTANTS, 1, 2);
    uint32_t width = resource->buffer ? (1u << 15) : resource->width;
    uint32_t height = resource->buffer ? resource->height + !!resource->width : resource->height;

@@ -227,6 +227,109 @@ rd_lower_snorm_storage(nir_builder *b, nir_intrinsic_instr *intr)
    }
 }
 
+/* Storage formats that ldib/stib convert correctly (SNORM ones are handled
+ * above as SINT). Every other storage format is accessed as an unsigned
+ * integer format of the same texel size, converted in the shader. The
+ * hardware path returned wrong values for two-component formats, UNORM16
+ * and the packed 10/11-bit formats, and faulted on some of them. The
+ * descriptor side (rd_storage_resource_format) applies the same rule.
+ */
+static bool
+rd_storage_format_native(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8_UINT:
+   case PIPE_FORMAT_R8_SINT:
+   case PIPE_FORMAT_R8_SNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UINT:
+   case PIPE_FORMAT_R8G8B8A8_SINT:
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+   case PIPE_FORMAT_R16_UINT:
+   case PIPE_FORMAT_R16_SINT:
+   case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R16_SNORM:
+   case PIPE_FORMAT_R16G16B16A16_UINT:
+   case PIPE_FORMAT_R16G16B16A16_SINT:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_SNORM:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void
+rd_lower_raw_storage(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_image_load &&
+       intr->intrinsic != nir_intrinsic_image_store)
+      return;
+   enum pipe_format format = nir_intrinsic_format(intr);
+   if (format == PIPE_FORMAT_NONE || rd_storage_format_native(format))
+      return;
+   const unsigned bytes = util_format_get_blocksize(format);
+   enum pipe_format raw;
+   switch (bytes) {
+   case 1: raw = PIPE_FORMAT_R8_UINT; break;
+   case 2: raw = PIPE_FORMAT_R16_UINT; break;
+   case 4: raw = PIPE_FORMAT_R32_UINT; break;
+   case 8: raw = PIPE_FORMAT_R16G16B16A16_UINT; break;
+   case 16: raw = PIPE_FORMAT_R32G32B32A32_UINT; break;
+   default: return;
+   }
+   nir_intrinsic_set_format(intr, raw);
+   if (intr->intrinsic == nir_intrinsic_image_load) {
+      nir_intrinsic_set_dest_type(intr, nir_type_uint32);
+      b->cursor = nir_after_instr(&intr->instr);
+      nir_def *words;
+      if (bytes <= 4) {
+         words = nir_channel(b, &intr->def, 0);
+      } else if (bytes == 8) {
+         nir_def *halves[2];
+         for (unsigned i = 0; i < 2; i++)
+            halves[i] = nir_ior(b, nir_iand_imm(b, nir_channel(b, &intr->def, 2 * i), 0xffff),
+                                nir_ishl_imm(b, nir_channel(b, &intr->def, 2 * i + 1), 16));
+         words = nir_vec(b, halves, 2);
+      } else {
+         words = nir_trim_vector(b, &intr->def, 4);
+      }
+      nir_def *rgba = nir_format_unpack_rgba(b, words, format);
+      nir_def *components[4];
+      for (unsigned i = 0; i < intr->num_components; i++)
+         components[i] = nir_channel(b, rgba, MIN2(i, 3));
+      nir_def_rewrite_uses_after(&intr->def, nir_vec(b, components, intr->num_components));
+   } else {
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *value = intr->src[3].ssa;
+      nir_def *words = nir_format_pack_rgba(b, format,
+         nir_trim_vector(b, value, MIN2(value->num_components, 4)));
+      nir_def *raw_value;
+      if (bytes <= 4) {
+         raw_value = nir_pad_vector_imm_int(b, nir_channel(b, words, 0), 0, intr->num_components);
+      } else if (bytes == 8) {
+         nir_def *parts[4];
+         for (unsigned i = 0; i < 2; i++) {
+            nir_def *w = nir_channel(b, words, i);
+            parts[2 * i] = nir_iand_imm(b, w, 0xffff);
+            parts[2 * i + 1] = nir_ushr_imm(b, w, 16);
+         }
+         raw_value = nir_pad_vector_imm_int(b, nir_vec(b, parts, 4), 0, intr->num_components);
+      } else {
+         raw_value = nir_pad_vector_imm_int(b, words, 0, intr->num_components);
+      }
+      nir_src_rewrite(&intr->src[3], raw_value);
+      nir_intrinsic_set_src_type(intr, nir_type_uint32);
+   }
+}
+
 static bool
 rd_lower_resource(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -328,6 +431,7 @@ rd_lower_resource(nir_builder *b, nir_instr *instr, void *data)
          (nir_intrinsic_access(intr) & ~ACCESS_CAN_REORDER) | ACCESS_COHERENT);
    nir_rewrite_image_intrinsic(intr, nir_imm_int(b, entry->image_slot + element),
                                nir_image_intrinsic_type_default);
+   rd_lower_raw_storage(b, intr);
    rd_lower_snorm_storage(b, intr);
    return true;
 }
