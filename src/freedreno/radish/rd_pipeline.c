@@ -365,6 +365,19 @@ saved_sampling_nir:
    return rd_build_nir_pipeline(device, pipeline, nir, flags);
 }
 
+/* Experiment: RADISH_WAVESIZE=double|any selects the hardware thread size
+ * (default single). */
+static enum ir3_wavesize_option
+rd_real_wavesize(void)
+{
+   const char *value = getenv("RADISH_WAVESIZE");
+   if (value && !strcmp(value, "double"))
+      return IR3_DOUBLE_ONLY;
+   if (value && !strcmp(value, "any"))
+      return IR3_SINGLE_OR_DOUBLE;
+   return IR3_SINGLE_ONLY;
+}
+
 static VkResult
 rd_build_nir_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
                        nir_shader *nir, VkPipelineCreateFlags flags)
@@ -383,7 +396,7 @@ rd_build_nir_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
       .workgroup_resident_threads = (pipeline->linear_subgroups || pipeline->linear_barriers) ?
          DIV_ROUND_UP(local_count, 16) * device->info.threadsize_base : 0,
       .max_compute_reg_footprint = 4096,
-      .real_wavesize = IR3_SINGLE_ONLY,
+      .real_wavesize = rd_real_wavesize(),
       .push_consts_type = IR3_PUSH_CONSTS_PER_STAGE,
       .push_consts_dwords = 32,
       .const_allocs = {
