@@ -895,7 +895,7 @@ rd_DestroySampler(VkDevice handle, VkSampler sampler_handle, const VkAllocationC
 static bool
 rd_image_range(const struct rd_image *image, const VkImageSubresourceRange *range)
 {
-   if (!image || range->aspectMask != vk_format_aspects(image->vk.format) ||
+   if (!image || !range->aspectMask || (range->aspectMask & ~vk_format_aspects(image->vk.format)) ||
        range->baseMipLevel >= image->vk.mip_levels || range->baseArrayLayer >= image->vk.array_layers)
       return false;
    uint32_t levels = vk_image_subresource_level_count(&image->vk, range);

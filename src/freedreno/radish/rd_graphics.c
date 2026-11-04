@@ -918,7 +918,14 @@ rd_gfx_depth_buffer(struct fd_ringbuffer *ring, const struct rd_render *render)
       case VK_FORMAT_D32_SFLOAT: fmt = DEPTH5_32; break;
       case VK_FORMAT_D24_UNORM_S8_UINT:
       case VK_FORMAT_X8_D24_UNORM_PACK32: fmt = DEPTH5_24_8; break;
-      case VK_FORMAT_S8_UINT: separate_stencil = true; break;
+      case VK_FORMAT_S8_UINT:
+         /* the separate stencil buffer is only used with a depth format
+          * programmed (found with a per-pixel stencil probe); depth tests
+          * are off for an image without depth, so the depth unit does not
+          * touch it */
+         separate_stencil = true;
+         fmt = DEPTH5_32;
+         break;
       default: break;
       }
    }
