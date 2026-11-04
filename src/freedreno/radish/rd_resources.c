@@ -389,10 +389,10 @@ rd_resource_packet(struct fd_ringbuffer *ring, uint32_t slot,
 }
 
 static void
-rd_emit_resource_texture(struct fd_ringbuffer *ring, uint32_t slot,
-                          const struct rd_resource *resource)
+rd_emit_resource_texture_sb(struct fd_ringbuffer *ring, uint32_t slot,
+                            const struct rd_resource *resource, enum a4xx_state_block sb)
 {
-   rd_resource_packet(ring, slot, SB4_CS_TEX, ST4_CONSTANTS, 1, 12);
+   rd_resource_packet(ring, slot, sb, ST4_CONSTANTS, 1, 12);
    OUT_RING(ring, resource->format_word | A5XX_TEX_CONST_0_MIPLVLS(resource->mip_levels));
    OUT_RING(ring, A5XX_TEX_CONST_1_WIDTH(resource->width) |
                   A5XX_TEX_CONST_1_HEIGHT(resource->height));
@@ -426,6 +426,13 @@ rd_emit_resource_texture(struct fd_ringbuffer *ring, uint32_t slot,
    }
    for (uint32_t i = 0; i < 6; i++)
       OUT_RING(ring, 0);
+}
+
+static void
+rd_emit_resource_texture(struct fd_ringbuffer *ring, uint32_t slot,
+                          const struct rd_resource *resource)
+{
+   rd_emit_resource_texture_sb(ring, slot, resource, SB4_CS_TEX);
 }
 
 static enum a5xx_tex_fmt
@@ -636,4 +643,33 @@ rd_emit_image_constants(struct fd_ringbuffer *ring,
    rd_resource_packet(ring, offset, SB4_CS_SHADER, ST4_CONSTANTS, count / 4, count);
    for (uint32_t i = 0; i < count; i++)
       OUT_RING(ring, values[i]);
+}
+
+/* Samplers and textures of one graphics stage (state block VS/FS_TEX). */
+void
+rd_emit_stage_textures(struct rd_device *device, struct fd_ringbuffer *ring,
+                       enum a4xx_state_block sb, const struct rd_pipeline *stage,
+                       const struct rd_descriptor *descriptors)
+{
+   const struct rd_nir_resource_usage *usage = &stage->resource_usage;
+   if (usage->sampler_count) {
+      OUT_PKT4(ring, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR, 2);
+      OUT_RELOC(ring, device->border_colors, device->border_colors_offset, 0, 0);
+   }
+   for (uint32_t i = 0; i < usage->sampler_count; i++) {
+      uint32_t words[4];
+      rd_sampler_descriptor(NULL, words);
+      if (i < 16 && (usage->samplers & (1u << i)))
+         memcpy(words, descriptors[stage->sampler_descriptors[i]].sampler, sizeof(words));
+      rd_resource_packet(ring, i, sb, ST4_SHADER, 1, 4);
+      for (uint32_t j = 0; j < 4; j++)
+         OUT_RING(ring, words[j]);
+   }
+   for (uint32_t i = 0; i < usage->texture_count; i++) {
+      if (!(usage->textures & (1u << i)))
+         continue;
+      struct rd_resource resource;
+      if (rd_make_resource(&descriptors[stage->texture_descriptors[i]], &resource))
+         rd_emit_resource_texture_sb(ring, i, &resource, sb);
+   }
 }

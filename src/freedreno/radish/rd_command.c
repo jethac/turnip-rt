@@ -15,8 +15,12 @@ rd_command_reset(struct vk_command_buffer *base, VkCommandBufferResetFlags flags
    command->pipeline = NULL;
    command->gfx_pipeline = NULL;
    command->render = NULL;
-   memset(command->sets, 0, sizeof(command->sets));
-   memset(command->dynamic_offsets, 0, sizeof(command->dynamic_offsets));
+   for (unsigned i = 0; i < 2; i++) {
+      memset(command->bind[i].sets, 0, sizeof(command->bind[i].sets));
+      memset(command->bind[i].dynamic_offsets, 0, sizeof(command->bind[i].dynamic_offsets));
+   }
+   memset(command->vertex_buffers, 0, sizeof(command->vertex_buffers));
+   command->index_buffer = NULL;
    memset(command->push, 0, sizeof(command->push));
    util_dynarray_clear(&command->commands);
 }
@@ -72,6 +76,8 @@ rd_BeginCommandBuffer(VkCommandBuffer handle, const VkCommandBufferBeginInfo *in
       return VK_ERROR_INITIALIZATION_FAILED;
    rd_command_reset(&command->vk, 0);
    vk_command_buffer_begin(&command->vk, info);
+   command->render_continue = command->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
+      (info->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);
    return VK_SUCCESS;
 }
 
@@ -135,31 +141,33 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
    const VkDescriptorSet *sets, uint32_t dynamic_count, const uint32_t *offsets)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
-   if (bind_point != VK_PIPELINE_BIND_POINT_COMPUTE ||
+   if ((bind_point != VK_PIPELINE_BIND_POINT_COMPUTE &&
+        bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) ||
        first > RD_MAX_SETS || count > RD_MAX_SETS - first) {
       vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
+   struct rd_bind_state *bound = &command->bind[bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS];
    uint8_t compatibility[RD_MAX_SETS][BLAKE3_OUT_LEN];
    rd_layout_compatibility(pipeline_layout, compatibility);
    if (count) {
       uint32_t last = first + count - 1;
       for (uint32_t i = 0; i < RD_MAX_SETS; i++) {
-         if (!command->sets[i] || (i >= first && i <= last))
+         if (!bound->sets[i] || (i >= first && i <= last))
             continue;
          uint32_t compare = i < first ? i : last;
-         if (memcmp(command->set_compatibility[i][compare], compatibility[compare], BLAKE3_OUT_LEN))
-            command->sets[i] = NULL;
+         if (memcmp(bound->set_compatibility[i][compare], compatibility[compare], BLAKE3_OUT_LEN))
+            bound->sets[i] = NULL;
       }
    }
    uint32_t dynamic = 0;
    for (uint32_t i = 0; i < count; i++) {
       struct rd_descriptor_set *set = rd_descriptor_set_from_handle(sets[i]);
-      command->sets[first + i] = set;
-      memcpy(command->set_compatibility[first + i], compatibility, sizeof(compatibility));
-      memset(command->dynamic_offsets[first + i], 0,
-             sizeof(command->dynamic_offsets[first + i]));
+      bound->sets[first + i] = set;
+      memcpy(bound->set_compatibility[first + i], compatibility, sizeof(compatibility));
+      memset(bound->dynamic_offsets[first + i], 0,
+             sizeof(bound->dynamic_offsets[first + i]));
       for (uint32_t j = 0; j < set->layout->binding_count; j++) {
          const struct rd_binding *binding = &set->layout->bindings[j];
          if (binding->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
@@ -170,7 +178,7 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
             return;
          }
          for (uint32_t k = 0; k < binding->count; k++)
-            command->dynamic_offsets[first + i][binding->slot + k] = offsets[dynamic++];
+            bound->dynamic_offsets[first + i][binding->slot + k] = offsets[dynamic++];
       }
    }
    if (dynamic != dynamic_count)
@@ -186,8 +194,9 @@ rd_CmdPushConstants(VkCommandBuffer handle, VkPipelineLayout layout,
       vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (stages & VK_SHADER_STAGE_COMPUTE_BIT)
-      memcpy((uint8_t *)command->push + offset, values, size);
+   /* Push constant values are shared by every stage and bind point. */
+   (void)stages;
+   memcpy((uint8_t *)command->push + offset, values, size);
 }
 
 static struct rd_dispatch *
@@ -210,13 +219,13 @@ rd_record_dispatch(struct rd_command_buffer *command)
          continue;
       const struct rd_nir_resource_binding *resource = &command->pipeline->resources[i];
       uint32_t index = resource->descriptor_set;
-      struct rd_descriptor_set *set = command->sets[index];
-      if (!set || memcmp(command->set_compatibility[index][index], compatibility[index], BLAKE3_OUT_LEN)) {
+      struct rd_descriptor_set *set = command->bind[0].sets[index];
+      if (!set || memcmp(command->bind[0].set_compatibility[index][index], compatibility[index], BLAKE3_OUT_LEN)) {
          vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
          return NULL;
       }
       dispatch->sets[index] = set;
-      dispatch->dynamic_offsets[i] = command->dynamic_offsets[index][resource->logical_slot];
+      dispatch->dynamic_offsets[i] = command->bind[0].dynamic_offsets[index][resource->logical_slot];
    }
    return dispatch;
 }
@@ -270,6 +279,13 @@ rd_CmdExecuteCommands(VkCommandBuffer handle, uint32_t count,
    for (uint32_t i = 0; i < count; i++) {
       VK_FROM_HANDLE(rd_command_buffer, secondary, handles[i]);
       util_dynarray_foreach(&secondary->commands, struct rd_command, source) {
+         if (source->type == RD_CMD_RENDER) {
+            /* Draws of a secondary recorded inside a render pass join the
+             * primary's current render; a secondary's own renders are copied. */
+            if (!rd_render_execute(primary, source->render))
+               return;
+            continue;
+         }
          struct rd_command *destination = rd_command_append(primary, source->type);
          if (!destination)
             return;
@@ -287,7 +303,9 @@ rd_CmdExecuteCommands(VkCommandBuffer handle, uint32_t count,
       }
    }
    primary->pipeline = NULL;
-   memset(primary->sets, 0, sizeof(primary->sets));
+   primary->gfx_pipeline = NULL;
+   for (unsigned i = 0; i < 2; i++)
+      memset(primary->bind[i].sets, 0, sizeof(primary->bind[i].sets));
    memset(primary->push, 0, sizeof(primary->push));
 }
 
@@ -338,18 +356,6 @@ rd_command_append(struct rd_command_buffer *command, enum rd_command_type type)
 }
 
 VKAPI_ATTR void VKAPI_CALL
-rd_CmdDrawIndexed(VkCommandBuffer commandBuffer,
-   uint32_t indexCount,
-   uint32_t instanceCount,
-   uint32_t firstIndex,
-   int32_t vertexOffset,
-   uint32_t firstInstance)
-{
-   VK_FROM_HANDLE(rd_command_buffer, command, commandBuffer);
-   vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-}
-
-VKAPI_ATTR void VKAPI_CALL
 rd_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
    VkImage image,
    VkImageLayout imageLayout,
@@ -382,20 +388,6 @@ rd_CmdClearAttachments(VkCommandBuffer commandBuffer,
                                VK_ERROR_FEATURE_NOT_PRESENT)
 
 VKAPI_ATTR void VKAPI_CALL
-rd_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
-   uint32_t drawCount, uint32_t stride)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
-   uint32_t drawCount, uint32_t stride)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
 rd_CmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
    VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount,
    const VkImageBlit *pRegions, VkFilter filter)
@@ -419,28 +411,6 @@ rd_CmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayou
 
 VKAPI_ATTR void VKAPI_CALL
 rd_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *pResolveImageInfo)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdBindIndexBuffer(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
-   VkIndexType indexType)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount,
-   const VkBuffer *pBuffers, const VkDeviceSize *pOffsets)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
-   uint32_t bindingCount, const VkBuffer *pBuffers, const VkDeviceSize *pOffsets,
-   const VkDeviceSize *pSizes, const VkDeviceSize *pStrides)
 {
    RD_GRAPHICS_ONLY(commandBuffer);
 }

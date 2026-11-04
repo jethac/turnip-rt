@@ -6,6 +6,7 @@
 #include <string.h>
 
 struct rd_resource_lower {
+   bool fragment;
    rd_nir_resource_resolver resolve;
    void *data;
    struct rd_nir_resource_usage *usage;
@@ -72,7 +73,13 @@ rd_lower_texture(nir_tex_instr *tex, struct rd_resource_lower *state)
        nir_tex_instr_src_index(tex, nir_tex_src_texture_handle) >= 0 ||
        nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle) >= 0)
       return false;
+   if ((tex->op == nir_texop_tex || tex->op == nir_texop_txb || tex->op == nir_texop_lod) &&
+       !state->fragment)
+      return false; /* implicit derivatives exist only in fragment shaders */
    switch (tex->op) {
+   case nir_texop_tex:
+   case nir_texop_txb:
+   case nir_texop_lod:
    case nir_texop_txl:
    case nir_texop_txd:
    case nir_texop_tg4:
@@ -129,7 +136,8 @@ rd_lower_texture(nir_tex_instr *tex, struct rd_resource_lower *state)
       tex->sampler_index = entry->sampler_slot + element;
       nir_tex_instr_remove_src(tex, sampler);
    } else if (tex->op == nir_texop_txl || tex->op == nir_texop_txd ||
-              tex->op == nir_texop_tg4) {
+              tex->op == nir_texop_tg4 || tex->op == nir_texop_tex ||
+              tex->op == nir_texop_txb || tex->op == nir_texop_lod) {
       return false;
    }
    return true;
@@ -506,10 +514,13 @@ rd_nir_lower_compute_resources(nir_shader *shader,
    rd_nir_resource_resolver resolve, void *data,
    struct rd_nir_resource_usage *usage)
 {
-   if (!shader || shader->info.stage != MESA_SHADER_COMPUTE || !usage || !resolve)
+   if (!shader || (shader->info.stage != MESA_SHADER_COMPUTE &&
+                   shader->info.stage != MESA_SHADER_VERTEX &&
+                   shader->info.stage != MESA_SHADER_FRAGMENT) || !usage || !resolve)
       return false;
    memset(usage, 0, sizeof(*usage));
    struct rd_resource_lower state = {
+      .fragment = shader->info.stage == MESA_SHADER_FRAGMENT,
       .resolve = resolve, .data = data, .usage = usage,
    };
    nir_shader_instructions_pass(shader, rd_lower_resource,

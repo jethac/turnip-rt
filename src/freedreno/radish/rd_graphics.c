@@ -51,37 +51,56 @@ rd_gfx_upload(struct rd_device *device, struct rd_gfx_shader *shader)
    return VK_SUCCESS;
 }
 
+/* Buffers in graphics stages are read through global loads from addresses
+ * the driver puts in the const file after the push constants (graphics
+ * stages have no SSBO state on a5xx's vertex side). Stores and atomics need
+ * vertexPipelineStoresAndAtomics / fragmentStoresAndAtomics, which are not
+ * advertised.
+ */
+#define RD_GFX_PUSH_DWORDS 32
+#define RD_GFX_MAX_BUFFERS 16
+#define RD_GFX_CONST_VEC4 ((RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS) / 4)
+
+struct rd_gfx_lower { bool failed; };
+
 static bool
-rd_gfx_uses_resources(nir_shader *nir)
+rd_gfx_lower_buffer(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_tex)
-               return true;
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            switch (intr->intrinsic) {
-            case nir_intrinsic_load_ubo:
-            case nir_intrinsic_load_ssbo:
-            case nir_intrinsic_store_ssbo:
-            case nir_intrinsic_ssbo_atomic:
-            case nir_intrinsic_ssbo_atomic_swap:
-            case nir_intrinsic_load_push_constant:
-               return true;
-            default:
-               if (!strncmp(nir_intrinsic_infos[intr->intrinsic].name, "image_", 6))
-                  return true;
-            }
-         }
+   struct rd_gfx_lower *state = data;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ssbo: {
+      if (!nir_src_is_const(intr->src[0]) || intr->def.bit_size != 32 ||
+          nir_src_as_uint(intr->src[0]) >= RD_GFX_MAX_BUFFERS) {
+         state->failed = true;
+         return false;
       }
+      b->cursor = nir_before_instr(&intr->instr);
+      unsigned slot = nir_src_as_uint(intr->src[0]);
+      nir_def *address = nir_load_const_ir3(b, 2, 32, nir_imm_int(b, 0),
+                                            .base = RD_GFX_PUSH_DWORDS + 2 * slot);
+      nir_def *value = nir_load_global_offset(b, intr->def.num_components, 32,
+                                              nir_pack_64_2x32(b, address), intr->src[1].ssa,
+                                              .align_mul = nir_intrinsic_align_mul(intr),
+                                              .align_offset = nir_intrinsic_align_offset(intr));
+      nir_def_replace(&intr->def, value);
+      return true;
    }
-   return false;
+   case nir_intrinsic_store_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+   case nir_intrinsic_get_ssbo_size:
+      state->failed = true;
+      return false;
+   default:
+      if (!strncmp(nir_intrinsic_infos[intr->intrinsic].name, "image_", 6))
+         state->failed = true;
+      return false;
+   }
 }
 
 static VkResult
-rd_gfx_compile(struct rd_device *device, struct rd_gfx_shader *shader,
+rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
+               struct rd_gfx_shader *shader,
                const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags)
 {
    const struct spirv_to_nir_options spirv_options = {
@@ -97,30 +116,51 @@ rd_gfx_compile(struct rd_device *device, struct rd_gfx_shader *shader,
       &spirv_options, ir3_get_compiler_options(device->compiler), NULL, &nir);
    if (result != VK_SUCCESS)
       return result;
+   shader->res = vk_zalloc(&device->vk.alloc, sizeof(struct rd_pipeline), 8,
+                           VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!shader->res) {
+      ralloc_free(nir);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   shader->res->layout = pipeline->layout;
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_lower_system_values);
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo | nir_var_mem_ssbo,
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
+            nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
-   if (rd_gfx_uses_resources(nir)) {
-      /* Descriptors and push constants in graphics stages come next. */
+   struct rd_gfx_lower lower = {0};
+   if (!rd_nir_lower_compute_resources(nir, rd_pipeline_resource, shader->res,
+                                       &shader->res->resource_usage) ||
+       !rd_lower_stage_buffers(nir, shader->res) ||
+       shader->res->resource_usage.image_count ||
+       shader->res->buffer_count > RD_GFX_MAX_BUFFERS) {
       ralloc_free(nir);
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   nir_shader_intrinsics_pass(nir, rd_gfx_lower_buffer, nir_metadata_control_flow, &lower);
+   if (lower.failed) {
+      ralloc_free(nir);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   NIR_PASS(_, nir, nir_opt_dce);
    ir3_nir_lower_io_vars_to_temporaries(nir);
    nir_assign_io_var_locations(nir, nir_var_shader_in);
    nir_assign_io_var_locations(nir, nir_var_shader_out);
    ir3_nir_lower_io(nir);
    struct ir3_shader_options options = {
       .nir_options.disable_optimizations = flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT,
+      .nir_options.a5xx_raw_global_loads = true,
       .api_wavesize = IR3_SINGLE_ONLY,
       .real_wavesize = IR3_SINGLE_ONLY,
       .push_consts_type = IR3_PUSH_CONSTS_PER_STAGE,
-      .push_consts_dwords = 32,
+      .push_consts_dwords = RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS,
       .const_allocs = {
-         .consts[IR3_CONST_ALLOC_PUSH_CONSTS] = { .offset_vec4 = 0, .size_vec4 = 8 },
-         .max_const_offset_vec4 = 8,
+         .consts[IR3_CONST_ALLOC_PUSH_CONSTS] = { .offset_vec4 = 0, .size_vec4 = RD_GFX_CONST_VEC4 },
+         .max_const_offset_vec4 = RD_GFX_CONST_VEC4,
       },
    };
    ir3_finalize_nir(device->compiler, &options.nir_options, nir);
@@ -148,6 +188,7 @@ rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline)
          fd_bo_del(shaders[i]->bo);
       if (shaders[i]->v)
          ralloc_free(shaders[i]->v);
+      vk_free(&device->vk.alloc, shaders[i]->res);
    }
    vk_free(&device->vk.alloc, gfx);
    pipeline->gfx = NULL;
@@ -186,9 +227,9 @@ rd_create_graphics_pipeline(struct rd_device *device, const VkGraphicsPipelineCr
    if (result == VK_SUCCESS && (!vs || !fs))
       result = VK_ERROR_FEATURE_NOT_PRESENT;
    if (result == VK_SUCCESS)
-      result = rd_gfx_compile(device, &gfx->vs, vs, info->flags);
+      result = rd_gfx_compile(device, pipeline, &gfx->vs, vs, info->flags);
    if (result == VK_SUCCESS)
-      result = rd_gfx_compile(device, &gfx->fs, fs, info->flags);
+      result = rd_gfx_compile(device, pipeline, &gfx->fs, fs, info->flags);
    if (result == VK_SUCCESS) {
       vk_dynamic_graphics_state_init(&gfx->dynamic);
       vk_dynamic_graphics_state_fill(&gfx->dynamic, &gfx->state);
@@ -226,6 +267,10 @@ rd_render_free(struct rd_command_buffer *command, struct rd_render *render)
 {
    if (!render)
       return;
+   util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
+      vk_free(&command->vk.pool->alloc, draw->descriptors[0]);
+      vk_free(&command->vk.pool->alloc, draw->descriptors[1]);
+   }
    util_dynarray_fini(&render->draws);
    vk_free(&command->vk.pool->alloc, render);
 }
@@ -282,28 +327,231 @@ rd_CmdEndRendering(VkCommandBuffer handle)
 }
 
 VKAPI_ATTR void VKAPI_CALL
-rd_CmdDraw(VkCommandBuffer handle, uint32_t vertex_count, uint32_t instance_count,
-           uint32_t first_vertex, uint32_t first_instance)
+rd_CmdBindVertexBuffers2(VkCommandBuffer handle, uint32_t first, uint32_t count,
+                         const VkBuffer *buffers, const VkDeviceSize *offsets,
+                         const VkDeviceSize *sizes, const VkDeviceSize *strides)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
-   struct rd_pipeline *pipeline = command->gfx_pipeline;
-   if (!command->render || !pipeline || !pipeline->gfx) {
+   if (first + count > 32 || strides) {
       vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (!vertex_count || !instance_count)
-      return;
+   for (uint32_t i = 0; i < count; i++) {
+      command->vertex_buffers[first + i] = rd_buffer_from_handle(buffers[i]);
+      command->vertex_offsets[first + i] = offsets[i];
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBindVertexBuffers(VkCommandBuffer handle, uint32_t first, uint32_t count,
+                        const VkBuffer *buffers, const VkDeviceSize *offsets)
+{
+   rd_CmdBindVertexBuffers2(handle, first, count, buffers, offsets, NULL, NULL);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBindIndexBuffer(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                      VkIndexType type)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   command->index_buffer = rd_buffer_from_handle(buffer);
+   command->index_offset = offset;
+   command->index_type = type;
+}
+
+static bool
+rd_copy_stage_descriptors(struct rd_command_buffer *command, const struct rd_pipeline *stage,
+                          struct rd_descriptor **out)
+{
+   *out = NULL;
+   if (!stage->resource_count)
+      return true;
+   struct rd_descriptor *copy = vk_zalloc(&command->vk.pool->alloc,
+      stage->resource_count * sizeof(*copy), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!copy)
+      return false;
+   const struct rd_bind_state *bound = &command->bind[1];
+   for (uint32_t i = 0; i < stage->resource_count; i++) {
+      const struct rd_nir_resource_binding *resource = &stage->resources[i];
+      const struct rd_descriptor_set *set = bound->sets[resource->descriptor_set];
+      if (!set) {
+         vk_free(&command->vk.pool->alloc, copy);
+         return false;
+      }
+      copy[i] = set->descriptors[resource->logical_slot];
+      if (copy[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+          copy[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+         copy[i].offset += bound->dynamic_offsets[resource->descriptor_set][resource->logical_slot];
+   }
+   *out = copy;
+   return true;
+}
+
+static struct rd_render *
+rd_render_new(struct rd_command_buffer *command)
+{
+   struct rd_render *render = vk_zalloc(&command->vk.pool->alloc, sizeof(*render), 8,
+                                        VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!render) {
+      vk_command_buffer_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return NULL;
+   }
+   util_dynarray_init(&render->draws, NULL);
+   struct rd_command *recorded = rd_command_append(command, RD_CMD_RENDER);
+   if (!recorded) {
+      rd_render_free(command, render);
+      return NULL;
+   }
+   recorded->render = render;
+   return render;
+}
+
+static struct rd_descriptor *
+rd_clone_descriptors(struct rd_command_buffer *command, const struct rd_descriptor *src,
+                     uint32_t count)
+{
+   if (!src || !count)
+      return NULL;
+   struct rd_descriptor *copy = vk_alloc(&command->vk.pool->alloc, count * sizeof(*copy), 8,
+                                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (copy)
+      memcpy(copy, src, count * sizeof(*copy));
+   return copy;
+}
+
+bool
+rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src)
+{
+   struct rd_render *dst = primary->render;
+   if (!src->continued) {
+      dst = rd_render_new(primary);
+      if (!dst)
+         return false;
+      struct util_dynarray draws = dst->draws;
+      *dst = *src;
+      dst->draws = draws;
+   } else if (!dst) {
+      vk_command_buffer_set_error(&primary->vk, VK_ERROR_UNKNOWN);
+      return false;
+   }
+   util_dynarray_foreach(&src->draws, struct rd_draw, draw) {
+      struct rd_draw copy = *draw;
+      copy.descriptors[0] = rd_clone_descriptors(primary, draw->descriptors[0],
+                                                 draw->pipeline->gfx->vs.res->resource_count);
+      copy.descriptors[1] = rd_clone_descriptors(primary, draw->descriptors[1],
+                                                 draw->pipeline->gfx->fs.res->resource_count);
+      util_dynarray_append(&dst->draws, copy);
+   }
+   return true;
+}
+
+static struct rd_draw *
+rd_record_draw(struct rd_command_buffer *command)
+{
+   struct rd_pipeline *pipeline = command->gfx_pipeline;
+   if (!command->render && command->render_continue) {
+      command->render = rd_render_new(command);
+      if (!command->render)
+         return NULL;
+      command->render->continued = true;
+   }
+   if (!command->render || !pipeline || !pipeline->gfx) {
+      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return NULL;
+   }
    const struct vk_dynamic_graphics_state *dyn = &command->vk.dynamic_graphics_state;
    struct rd_draw draw = {
       .pipeline = pipeline,
-      .vertex_count = vertex_count, .instance_count = instance_count,
-      .first_vertex = first_vertex, .first_instance = first_instance,
       .viewport = dyn->vp.viewports[0],
       .scissor = dyn->vp.scissors[0],
       .cull = dyn->rs.cull_mode,
       .front = dyn->rs.front_face,
+      .index_buffer = command->index_buffer,
+      .index_offset = command->index_offset,
+      .index_type = command->index_type,
    };
+   memcpy(draw.vertex_buffers, command->vertex_buffers, sizeof(draw.vertex_buffers));
+   memcpy(draw.vertex_offsets, command->vertex_offsets, sizeof(draw.vertex_offsets));
+   memcpy(draw.push, command->push, sizeof(draw.push));
+   if (!rd_copy_stage_descriptors(command, pipeline->gfx->vs.res, &draw.descriptors[0]) ||
+       !rd_copy_stage_descriptors(command, pipeline->gfx->fs.res, &draw.descriptors[1])) {
+      vk_free(&command->vk.pool->alloc, draw.descriptors[0]);
+      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return NULL;
+   }
    util_dynarray_append(&command->render->draws, draw);
+   return util_dynarray_top_ptr(&command->render->draws, struct rd_draw);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdDraw(VkCommandBuffer handle, uint32_t vertex_count, uint32_t instance_count,
+           uint32_t first_vertex, uint32_t first_instance)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   if (!vertex_count || !instance_count)
+      return;
+   struct rd_draw *draw = rd_record_draw(command);
+   if (!draw)
+      return;
+   draw->vertex_count = vertex_count;
+   draw->instance_count = instance_count;
+   draw->first_vertex = first_vertex;
+   draw->first_instance = first_instance;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdDrawIndexed(VkCommandBuffer handle, uint32_t index_count, uint32_t instance_count,
+                  uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   if (!index_count || !instance_count)
+      return;
+   if (!command->index_buffer) {
+      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+   struct rd_draw *draw = rd_record_draw(command);
+   if (!draw)
+      return;
+   draw->indexed = true;
+   draw->vertex_count = index_count;
+   draw->instance_count = instance_count;
+   draw->first_index = first_index;
+   draw->vertex_offset = vertex_offset;
+   draw->first_instance = first_instance;
+}
+
+static void
+rd_record_indirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                   uint32_t count, uint32_t stride, bool indexed)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   if (indexed && !command->index_buffer) {
+      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+   for (uint32_t i = 0; i < count; i++) {
+      struct rd_draw *draw = rd_record_draw(command);
+      if (!draw)
+         return;
+      draw->indexed = indexed;
+      draw->indirect = rd_buffer_from_handle(buffer);
+      draw->indirect_offset = offset + (VkDeviceSize)i * stride;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdDrawIndirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                   uint32_t count, uint32_t stride)
+{
+   rd_record_indirect(handle, buffer, offset, count, stride, false);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdDrawIndexedIndirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
+                          uint32_t count, uint32_t stride)
+{
+   rd_record_indirect(handle, buffer, offset, count, stride, true);
 }
 
 /* --- emission ------------------------------------------------------------- */
@@ -860,26 +1108,129 @@ rd_gfx_const(struct fd_ringbuffer *ring, enum a4xx_state_block sb, uint32_t cons
 }
 
 static void
-rd_gfx_consts(struct fd_ringbuffer *ring, const struct ir3_shader_variant *v,
-              enum a4xx_state_block sb, const struct rd_draw *draw)
+rd_gfx_consts(struct fd_ringbuffer *ring, struct rd_device *device,
+              const struct rd_gfx_shader *shader, enum a4xx_state_block sb,
+              const struct rd_draw *draw, const struct rd_descriptor *descriptors,
+              int32_t vertex_base)
 {
+   const struct ir3_shader_variant *v = shader->v;
    const struct ir3_const_state *state = ir3_const_state(v);
+   unsigned constlen = v->constlen * 4;
+   /* push constants */
+   rd_gfx_const(ring, sb, 0, MIN2(RD_GFX_PUSH_DWORDS, constlen), draw->push);
+   /* buffer addresses, two dwords each */
+   const struct rd_pipeline *res = shader->res;
+   if (res->buffer_count && RD_GFX_PUSH_DWORDS < constlen) {
+      unsigned count = res->buffer_count;
+      unsigned dwords = align(2 * count, 4);
+      OUT_PKT7(ring, CP_LOAD_STATE4, 3 + dwords);
+      OUT_RING(ring, CP_LOAD_STATE4_0_DST_OFF(RD_GFX_PUSH_DWORDS / 4) |
+                     CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) | CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                     CP_LOAD_STATE4_0_NUM_UNIT(dwords / 4));
+      OUT_RING(ring, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
+      OUT_RING(ring, 0);
+      for (unsigned i = 0; i < count; i++) {
+         const struct rd_descriptor *d = &descriptors[res->buffer_descriptors[i]];
+         if (d->buffer && d->buffer->memory)
+            OUT_RELOC(ring, d->buffer->memory->bo, d->buffer->offset + d->offset, 0, 0);
+         else
+            OUT_RELOC(ring, device->control, 0, 0, 0);
+      }
+      for (unsigned i = 2 * count; i < dwords; i++)
+         OUT_RING(ring, 0);
+   }
+   /* constant data (e.g. dynamically indexed constant arrays) */
+   if (v->constant_data_size) {
+      if (ir3_const_can_upload(&state->allocs, IR3_CONST_ALLOC_UBO_PTRS, v->constlen)) {
+         unsigned base = state->allocs.consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4;
+         unsigned count = align(state->num_ubos, 2);
+         OUT_PKT7(ring, CP_LOAD_STATE4, 3 + 2 * count);
+         OUT_RING(ring, CP_LOAD_STATE4_0_DST_OFF(base) | CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                        CP_LOAD_STATE4_0_STATE_BLOCK(sb) | CP_LOAD_STATE4_0_NUM_UNIT(count / 2));
+         OUT_RING(ring, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
+         OUT_RING(ring, 0);
+         for (unsigned i = 0; i < count; i++) {
+            if (i == (unsigned)state->consts_ubo.idx) {
+               OUT_RELOC(ring, shader->bo, v->info.constant_data_offset, 0, 0);
+            } else {
+               OUT_RING(ring, 0);
+               OUT_RING(ring, 0);
+            }
+         }
+      }
+      for (unsigned i = 0; i < state->ubo_state.num_enabled; i++) {
+         const struct ir3_ubo_range *range = &state->ubo_state.range[i];
+         if (range->ubo.block != (uint32_t)state->consts_ubo.idx || range->offset >= 16 * v->constlen)
+            continue;
+         unsigned size = MIN2(range->end - range->start, 16 * v->constlen - range->offset);
+         if (size)
+            rd_gfx_const(ring, sb, range->offset / 4, size / 4,
+                         (const uint32_t *)((const uint8_t *)v->bin +
+                                            v->info.constant_data_offset + range->start));
+      }
+   }
    unsigned base = state->allocs.max_const_offset_vec4 * 4;
-   if (v->imm_state.count && base < v->constlen * 4)
-      rd_gfx_const(ring, sb, base, MIN2(align(v->imm_state.count, 4), v->constlen * 4 - base),
+   if (v->imm_state.count && base < constlen)
+      rd_gfx_const(ring, sb, base, MIN2(align(v->imm_state.count, 4), constlen - base),
                    v->imm_state.values);
-   if (draw && v->need_driver_params) {
+   if (sb == SB4_VS_SHADER && v->need_driver_params) {
       struct ir3_driver_params_vs params = {
-         .vtxid_base = draw->first_vertex,
+         .vtxid_base = vertex_base,
          .instid_base = draw->first_instance,
+         .is_indexed_draw = draw->indexed ? ~0u : 0,
       };
       unsigned dp = state->allocs.consts[IR3_CONST_ALLOC_DRIVER_PARAMS].offset_vec4 * 4;
-      if (dp < v->constlen * 4) {
-         unsigned size = MIN2(state->num_driver_params, v->constlen * 4 - dp);
+      if (dp < constlen) {
+         unsigned size = MIN2(state->num_driver_params, constlen - dp);
          if (size)
             rd_gfx_const(ring, sb, dp, size, (const uint32_t *)&params);
       }
    }
+}
+
+static void
+rd_gfx_vertex_buffers(struct fd_ringbuffer *ring, struct rd_device *device,
+                      const struct rd_gfx_pipeline *gfx, const struct rd_draw *draw)
+{
+   const struct ir3_shader_variant *vs = gfx->vs.v;
+   const struct vk_vertex_input_state *vi = gfx->state.vi;
+   unsigned j = 0;
+   for (unsigned i = 0; i < vs->inputs_count; i++) {
+      if (vs->inputs[i].sysval || !vs->inputs[i].compmask)
+         continue;
+      unsigned location = vs->inputs[i].slot - VERT_ATTRIB_GENERIC0;
+      if (!vi || location >= MESA_VK_MAX_VERTEX_ATTRIBUTES ||
+          !(vi->attributes_valid & (1u << location)))
+         continue;
+      const struct vk_vertex_attribute_state *attr = &vi->attributes[location];
+      const struct vk_vertex_binding_state *binding = &vi->bindings[attr->binding];
+      enum pipe_format pfmt = vk_format_to_pipe_format(attr->format);
+      const struct rd_buffer *buffer = draw->vertex_buffers[attr->binding];
+      VkDeviceSize offset = draw->vertex_offsets[attr->binding] + attr->offset;
+      uint32_t size = 0;
+      OUT_PKT4(ring, REG_A5XX_VFD_FETCH(j), 4);
+      if (buffer && buffer->memory && offset < buffer->vk.size) {
+         size = MIN2(buffer->vk.size - offset, UINT32_MAX);
+         OUT_RELOC(ring, buffer->memory->bo, buffer->offset + offset, 0, 0);
+      } else {
+         OUT_RELOC(ring, device->control, 0, 0, 0);
+      }
+      OUT_RING(ring, size);
+      OUT_RING(ring, binding->stride);
+      OUT_PKT4(ring, REG_A5XX_VFD_DECODE(j), 2);
+      OUT_RING(ring, A5XX_VFD_DECODE_INSTR_IDX(j) | A5XX_VFD_DECODE_INSTR_FORMAT(rd5_pipe2vtx(pfmt)) |
+                     COND(binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE,
+                          A5XX_VFD_DECODE_INSTR_INSTANCED) |
+                     A5XX_VFD_DECODE_INSTR_SWAP(rd5_pipe2swap(pfmt)) | A5XX_VFD_DECODE_INSTR_UNK30 |
+                     COND(!util_format_is_pure_integer(pfmt), A5XX_VFD_DECODE_INSTR_FLOAT));
+      OUT_RING(ring, MAX2(1, binding->divisor));
+      OUT_PKT4(ring, REG_A5XX_VFD_DEST_CNTL(j), 1);
+      OUT_RING(ring, A5XX_VFD_DEST_CNTL_INSTR_WRITEMASK(vs->inputs[i].compmask) |
+                     A5XX_VFD_DEST_CNTL_INSTR_REGID(vs->inputs[i].regid));
+      j++;
+   }
+   OUT_PKT4(ring, REG_A5XX_VFD_CONTROL_0, 1);
+   OUT_RING(ring, A5XX_VFD_CONTROL_0_VTXCNT(j));
 }
 
 static enum pc_di_primtype
@@ -901,7 +1252,8 @@ rd_primtype(VkPrimitiveTopology topology)
 }
 
 static void
-rd_gfx_draw(struct fd_ringbuffer *ring, const struct rd_render *render, const struct rd_draw *draw)
+rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
+            const struct rd_render *render, const struct rd_draw *draw)
 {
    const struct rd_gfx_pipeline *gfx = draw->pipeline->gfx;
    const struct vk_dynamic_graphics_state *dyn = &gfx->dynamic;
@@ -976,9 +1328,7 @@ rd_gfx_draw(struct fd_ringbuffer *ring, const struct rd_render *render, const st
    OUT_RING(ring, 0);
    OUT_PKT4(ring, REG_A5XX_GRAS_CL_CNTL, 1);
    OUT_RING(ring, A5XX_GRAS_CL_CNTL_ZERO_GB_SCALE_Z);
-   /* Vulkan's provoking vertex is the first one. */
-   OUT_PKT4(ring, REG_A5XX_PC_PRIMITIVE_CNTL, 1);
-   OUT_RING(ring, A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(max_loc));
+   /* Vulkan's provoking vertex is the first one (PC_PRIMITIVE_CNTL below). */
 
    uint32_t posz_regid = ir3_find_output_regid(gfx->fs.v, FRAG_RESULT_DEPTH);
    OUT_PKT4(ring, REG_A5XX_RB_FS_OUTPUT_CNTL, 1);
@@ -989,8 +1339,9 @@ rd_gfx_draw(struct fd_ringbuffer *ring, const struct rd_render *render, const st
                   A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(posz_regid) |
                   A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
 
-   rd_gfx_consts(ring, gfx->vs.v, SB4_VS_SHADER, draw);
-   rd_gfx_consts(ring, gfx->fs.v, SB4_FS_SHADER, NULL);
+   int32_t vertex_base = draw->indexed ? draw->vertex_offset : (int32_t)draw->first_vertex;
+   rd_gfx_consts(ring, device, &gfx->vs, SB4_VS_SHADER, draw, draw->descriptors[0], vertex_base);
+   rd_gfx_consts(ring, device, &gfx->fs, SB4_FS_SHADER, draw, draw->descriptors[1], 0);
 
    for (unsigned i = 0; i < A5XX_MAX_RENDER_TARGETS; i++) {
       uint32_t mask = i < MESA_VK_MAX_COLOR_ATTACHMENTS ? dyn->cb.attachments[i].write_mask : 0;
@@ -1005,33 +1356,91 @@ rd_gfx_draw(struct fd_ringbuffer *ring, const struct rd_render *render, const st
    OUT_PKT4(ring, REG_A5XX_RB_BLEND_CNTL, 1);
    OUT_RING(ring, A5XX_RB_BLEND_CNTL_SAMPLE_MASK(0xffff));
 
+   const struct rd_pipeline *vres = gfx->vs.res, *fres = gfx->fs.res;
+   rd_emit_stage_textures(device, ring, SB4_VS_TEX, vres, draw->descriptors[0]);
+   rd_emit_stage_textures(device, ring, SB4_FS_TEX, fres, draw->descriptors[1]);
    OUT_PKT4(ring, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
-   OUT_RING(ring, 0);
+   OUT_RING(ring, MAX2(vres->resource_usage.texture_count, vres->resource_usage.sampler_count));
    OUT_PKT4(ring, REG_A5XX_TPL1_FS_TEX_COUNT, 1);
-   OUT_RING(ring, 0);
+   OUT_RING(ring, MAX2(fres->resource_usage.texture_count, fres->resource_usage.sampler_count));
    OUT_PKT4(ring, REG_A5XX_TPL1_CS_TEX_COUNT, 1);
    OUT_RING(ring, 0);
 
-   /* No vertex buffers yet: vertex shaders use gl_VertexIndex. */
-   OUT_PKT4(ring, REG_A5XX_VFD_CONTROL_0, 1);
-   OUT_RING(ring, A5XX_VFD_CONTROL_0_VTXCNT(0));
+   rd_gfx_vertex_buffers(ring, device, gfx, draw);
    OUT_PKT4(ring, REG_A5XX_VFD_INDEX_OFFSET, 2);
-   OUT_RING(ring, draw->first_vertex);
+   OUT_RING(ring, vertex_base);
    OUT_RING(ring, draw->first_instance);
+   uint32_t index_size = draw->index_type == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+   bool restart = dyn->ia.primitive_restart_enable && draw->indexed;
    OUT_PKT4(ring, REG_A5XX_PC_RESTART_INDEX, 1);
-   OUT_RING(ring, 0xffffffff);
+   OUT_RING(ring, restart ? (index_size == 2 ? 0xffff : 0xffffffff) : 0xffffffff);
+   OUT_PKT4(ring, REG_A5XX_PC_PRIMITIVE_CNTL, 1);
+   OUT_RING(ring, A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(max_loc) |
+                  COND(restart, A5XX_PC_PRIMITIVE_CNTL_PRIMITIVE_RESTART));
    OUT_PKT4(ring, REG_A5XX_RB_RENDER_CNTL, 1);
    OUT_RING(ring, 0x8);
    OUT_PKT4(ring, REG_A5XX_GRAS_SC_CNTL, 1);
    OUT_RING(ring, 0x8);
 
-   OUT_PKT7(ring, CP_DRAW_INDX_OFFSET, 3);
-   OUT_RING(ring, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(rd_primtype(dyn->ia.primitive_topology)) |
-                  CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
-                  CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY) |
-                  CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT));
-   OUT_RING(ring, draw->instance_count);
-   OUT_RING(ring, draw->vertex_count);
+   uint32_t initiator = CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(rd_primtype(dyn->ia.primitive_topology)) |
+                        CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY);
+   if (draw->indexed) {
+      const struct rd_buffer *ib = draw->index_buffer;
+      VkDeviceSize offset = draw->index_offset + (VkDeviceSize)draw->first_index * index_size;
+      uint32_t max_indices = offset < ib->vk.size ? (ib->vk.size - offset) / index_size : 0;
+      OUT_PKT7(ring, CP_DRAW_INDX_OFFSET, 7);
+      OUT_RING(ring, initiator | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_DMA) |
+                     CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(index_size == 2 ? INDEX4_SIZE_16_BIT :
+                                                                        INDEX4_SIZE_32_BIT));
+      OUT_RING(ring, draw->instance_count);
+      OUT_RING(ring, draw->vertex_count);
+      OUT_RING(ring, 0);
+      OUT_RELOC(ring, ib->memory->bo, ib->offset + offset, 0, 0);
+      OUT_RING(ring, max_indices);
+   } else {
+      OUT_PKT7(ring, CP_DRAW_INDX_OFFSET, 3);
+      OUT_RING(ring, initiator | CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
+                     CP_DRAW_INDX_OFFSET_0_INDEX_SIZE(INDEX4_SIZE_32_BIT));
+      OUT_RING(ring, draw->instance_count);
+      OUT_RING(ring, draw->vertex_count);
+   }
+}
+
+/* Indirect parameters are read on the CPU: commands run in order and each
+ * submission completes before the next, so earlier writes are visible. */
+static VkResult
+rd_resolve_draw_indirect(struct rd_device *device, struct rd_draw *draw)
+{
+   const struct rd_buffer *buffer = draw->indirect;
+   VkDeviceSize size = draw->indexed ? sizeof(VkDrawIndexedIndirectCommand) :
+                                       sizeof(VkDrawIndirectCommand);
+   if (!buffer || !buffer->memory || draw->indirect_offset > buffer->vk.size ||
+       size > buffer->vk.size - draw->indirect_offset)
+      return VK_ERROR_UNKNOWN;
+   if (fd_bo_cpu_prep(buffer->memory->bo, device->pipe, FD_BO_PREP_READ))
+      return VK_ERROR_DEVICE_LOST;
+   const uint8_t *map = fd_bo_map(buffer->memory->bo);
+   if (!map)
+      return VK_ERROR_MEMORY_MAP_FAILED;
+   map += buffer->offset + draw->indirect_offset;
+   if (draw->indexed) {
+      VkDrawIndexedIndirectCommand c;
+      memcpy(&c, map, sizeof(c));
+      draw->vertex_count = c.indexCount;
+      draw->instance_count = c.instanceCount;
+      draw->first_index = c.firstIndex;
+      draw->vertex_offset = c.vertexOffset;
+      draw->first_instance = c.firstInstance;
+   } else {
+      VkDrawIndirectCommand c;
+      memcpy(&c, map, sizeof(c));
+      draw->vertex_count = c.vertexCount;
+      draw->instance_count = c.instanceCount;
+      draw->first_vertex = c.firstVertex;
+      draw->first_instance = c.firstInstance;
+   }
+   draw->indirect = NULL;
+   return VK_SUCCESS;
 }
 
 VkResult
@@ -1065,10 +1474,25 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
    }
    rd_gfx_restore(ring, device);
    rd_gfx_sysmem_prep(ring, device, render, width, height);
-   util_dynarray_foreach(&render->draws, struct rd_draw, draw) {
-      fd_ringbuffer_attach_bo(ring, draw->pipeline->gfx->vs.bo);
-      fd_ringbuffer_attach_bo(ring, draw->pipeline->gfx->fs.bo);
-      rd_gfx_draw(ring, render, draw);
+   VkResult result = VK_SUCCESS;
+   util_dynarray_foreach(&render->draws, struct rd_draw, recorded) {
+      struct rd_draw draw = *recorded;
+      if (draw.indirect && (result = rd_resolve_draw_indirect(device, &draw)) != VK_SUCCESS)
+         break;
+      if (!draw.vertex_count || !draw.instance_count)
+         continue;
+      if (draw.indexed && (!draw.index_buffer || !draw.index_buffer->memory)) {
+         result = VK_ERROR_UNKNOWN;
+         break;
+      }
+      fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->vs.bo);
+      fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->fs.bo);
+      rd_gfx_draw(ring, device, render, &draw);
+   }
+   if (result != VK_SUCCESS) {
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return result;
    }
    OUT_PKT7(ring, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
    OUT_RING(ring, 0);

@@ -26,7 +26,7 @@ rd_shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *alig
    *alignment = component_size;
 }
 
-static const struct rd_nir_resource_binding *
+const struct rd_nir_resource_binding *
 rd_pipeline_resource(void *data, uint32_t set, uint32_t binding, uint32_t element)
 {
    struct rd_pipeline *pipeline = data;
@@ -668,4 +668,14 @@ rd_destroy_pipeline_public(struct rd_device *device, struct rd_pipeline *pipelin
                            const VkAllocationCallbacks *allocator)
 {
    rd_destroy_pipeline(device, pipeline, allocator);
+}
+
+/* Descriptor lowering of buffers (vulkan descriptors -> buffer slots, UBO
+ * loads as SSBO loads, push constants as const loads) for one graphics stage. */
+bool
+rd_lower_stage_buffers(nir_shader *nir, struct rd_pipeline *stage)
+{
+   struct rd_lower_state lower = { .pipeline = stage };
+   nir_shader_intrinsics_pass(nir, rd_lower_intrinsic, nir_metadata_control_flow, &lower);
+   return !lower.failed;
 }

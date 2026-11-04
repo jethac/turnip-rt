@@ -23,6 +23,7 @@
 #include "ir3/ir3_shader.h"
 #include "drm/freedreno_drmif.h"
 #include "common/freedreno_dev_info.h"
+#include "common/fd5_hw.h"
 
 struct fd_ringbuffer;
 struct fd_submit;
@@ -109,9 +110,12 @@ struct rd_descriptor_set {
    struct rd_set_layout *layout;
    struct rd_descriptor descriptors[];
 };
+struct rd_pipeline;
 struct rd_gfx_shader {
    struct ir3_shader_variant *v;
    struct fd_bo *bo;
+   /* per-stage resource slots (only the resource fields are used) */
+   struct rd_pipeline *res;
 };
 /* Graphics part of a pipeline (rd_graphics.c). */
 struct rd_gfx_pipeline {
@@ -188,16 +192,33 @@ struct rd_render_attachment {
 struct rd_draw {
    struct rd_pipeline *pipeline;
    uint32_t vertex_count, instance_count, first_vertex, first_instance;
+   /* indexed draws: vertex_count is the index count */
+   bool indexed;
+   uint32_t first_index;
+   int32_t vertex_offset;
+   struct rd_buffer *index_buffer;
+   VkDeviceSize index_offset;
+   VkIndexType index_type;
+   /* indirect draws: the parameters are read from this buffer at submit */
+   struct rd_buffer *indirect;
+   VkDeviceSize indirect_offset;
    VkViewport viewport;
    VkRect2D scissor;
    VkCullModeFlags cull;
    VkFrontFace front;
+   struct rd_buffer *vertex_buffers[32];
+   VkDeviceSize vertex_offsets[32];
+   uint32_t push[32];
+   /* descriptors of each stage's resources, copied when recorded */
+   struct rd_descriptor *descriptors[2];
 };
 /* One dynamic-rendering instance: its attachments and its draws. */
 struct rd_render {
    VkRect2D area;
    uint32_t layers, view_mask, color_count;
    struct rd_render_attachment color[RD_MAX_RTS], depth, stencil;
+   /* draws of a secondary command buffer recorded inside a render pass */
+   bool continued;
    struct util_dynarray draws;
 };
 struct rd_query_command {
@@ -238,9 +259,18 @@ struct rd_command_buffer {
    struct rd_pipeline *pipeline;
    struct rd_pipeline *gfx_pipeline;
    struct rd_render *render;
-   struct rd_descriptor_set *sets[RD_MAX_SETS];
-   uint32_t dynamic_offsets[RD_MAX_SETS][RD_MAX_BINDINGS];
-   uint8_t set_compatibility[RD_MAX_SETS][RD_MAX_SETS][BLAKE3_OUT_LEN];
+   bool render_continue;
+   /* bound descriptor sets: [0] compute, [1] graphics */
+   struct rd_bind_state {
+      struct rd_descriptor_set *sets[RD_MAX_SETS];
+      uint32_t dynamic_offsets[RD_MAX_SETS][RD_MAX_BINDINGS];
+      uint8_t set_compatibility[RD_MAX_SETS][RD_MAX_SETS][BLAKE3_OUT_LEN];
+   } bind[2];
+   struct rd_buffer *vertex_buffers[32];
+   VkDeviceSize vertex_offsets[32];
+   struct rd_buffer *index_buffer;
+   VkDeviceSize index_offset;
+   VkIndexType index_type;
    uint32_t push[32];
    struct util_dynarray commands;
 };
@@ -265,10 +295,17 @@ struct rd_submit_profile;
 VkResult rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
                           struct fd_ringbuffer *ring, struct rd_submit_profile *profile,
                           struct rd_gpu_elapsed *sample);
+void rd_emit_stage_textures(struct rd_device *device, struct fd_ringbuffer *ring,
+                            enum a4xx_state_block sb, const struct rd_pipeline *stage,
+                            const struct rd_descriptor *descriptors);
+const struct rd_nir_resource_binding *rd_pipeline_resource(void *data, uint32_t set,
+                                                           uint32_t binding, uint32_t element);
+bool rd_lower_stage_buffers(struct nir_shader *nir, struct rd_pipeline *stage);
 /* rd_graphics.c */
 bool rd_graphics_enabled(void);
 VkResult rd_execute_render(struct rd_device *device, const struct rd_render *render);
 void rd_render_free(struct rd_command_buffer *command, struct rd_render *render);
+bool rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *render);
 void rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline);
 void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4]);
 bool rd_descriptor_ready(const struct rd_descriptor *descriptor);
