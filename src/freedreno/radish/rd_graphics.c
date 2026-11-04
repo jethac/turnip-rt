@@ -1661,13 +1661,15 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    /* Vulkan's provoking vertex is the first one (PC_PRIMITIVE_CNTL below). */
 
    uint32_t posz_regid = ir3_find_output_regid(gfx->fs.v, FRAG_RESULT_DEPTH);
+   uint32_t smask_regid = ir3_find_output_regid(gfx->fs.v, FRAG_RESULT_SAMPLE_MASK);
    OUT_PKT4(ring, REG_A5XX_RB_FS_OUTPUT_CNTL, 1);
    OUT_RING(ring, A5XX_RB_FS_OUTPUT_CNTL_MRT(nr) |
-                  COND(gfx->fs.v->writes_pos, A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_Z));
+                  COND(gfx->fs.v->writes_pos, A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_Z) |
+                  COND(VALIDREG(smask_regid), A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_SAMPMASK));
    OUT_PKT4(ring, REG_A5XX_SP_FS_OUTPUT_CNTL, 1);
    OUT_RING(ring, A5XX_SP_FS_OUTPUT_CNTL_MRT(nr) |
                   A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(posz_regid) |
-                  A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
+                  A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(smask_regid));
 
    int32_t vertex_base = draw->indexed ? draw->vertex_offset : (int32_t)draw->first_vertex;
    rd_gfx_consts(ring, device, &gfx->vs, SB4_VS_SHADER, draw, draw->descriptors[0], vertex_base,
