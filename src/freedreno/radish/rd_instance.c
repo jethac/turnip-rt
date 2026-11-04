@@ -223,8 +223,8 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .nonCoherentAtomSize = 64,
       .maxComputeSharedMemorySize = RD_MAX_SHARED_SIZE,
       .maxComputeWorkGroupCount = {65535, 65535, 65535},
-      .maxComputeWorkGroupInvocations = 128,
-      .maxComputeWorkGroupSize = {128, 128, 64},
+      .maxComputeWorkGroupInvocations = RD_MAX_WORKGROUP_INVOCATIONS,
+      .maxComputeWorkGroupSize = {RD_MAX_WORKGROUP_INVOCATIONS, RD_MAX_WORKGROUP_INVOCATIONS, 64},
    };
    fd_get_device_uuid(properties.deviceUUID, &dev_id);
    fd_get_driver_uuid(properties.driverUUID);

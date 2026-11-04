@@ -314,7 +314,7 @@ rd_compile_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
       pipeline->logical_local_size[i] = nir->info.workgroup_size[i];
       local_count *= nir->info.workgroup_size[i];
    }
-   if (nir->info.workgroup_size_variable || !local_count || local_count > 128) {
+   if (nir->info.workgroup_size_variable || !local_count || local_count > RD_MAX_WORKGROUP_INVOCATIONS) {
       ralloc_free(nir);
       return rd_pipeline_unsupported(__LINE__);
    }
@@ -438,7 +438,7 @@ rd_upload_pipeline(struct rd_device *device, struct rd_pipeline *pipeline)
    if (v->image_mapping.tex_base + v->image_mapping.num_tex > 32 ||
        pipeline->buffer_count + pipeline->resource_usage.image_count > 32 ||
        !v->local_size[0] || !v->local_size[1] || !v->local_size[2] ||
-       (uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] > 128)
+       (uint64_t)v->local_size[0] * v->local_size[1] * v->local_size[2] > RD_MAX_WORKGROUP_INVOCATIONS)
       return rd_pipeline_unsupported(__LINE__);
    unsigned local_size = v->local_size[0] * v->local_size[1] * v->local_size[2];
    unsigned wave_size = device->info.threadsize_base *

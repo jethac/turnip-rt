@@ -74,6 +74,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(rd_buffer, vk.base, VkBuffer, VK_OBJECT_TYPE_BUFF
 #define RD_MAX_ACTIVE_RESOURCES 64
 #define RD_MAX_SETS 4
 #define RD_MAX_SHARED_SIZE 16384
+/* Workgroup invocation limit (barrier shaders must keep the whole group
+ * resident: ir3 RA bounds their register footprint accordingly). */
+#define RD_MAX_WORKGROUP_INVOCATIONS 256
 struct rd_binding { uint32_t binding, count, slot; VkDescriptorType type; VkShaderStageFlags stages; uint32_t immutable_offset; };
 struct rd_set_layout {
    struct vk_descriptor_set_layout vk;
