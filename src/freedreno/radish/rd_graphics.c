@@ -110,11 +110,15 @@ rd_gfx_lower_buffer(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                                         .align_mul = nir_intrinsic_align_mul(intr),
                                         .align_offset = nir_intrinsic_align_offset(intr));
       } else {
-         /* a dynamic offset (indexed uniform arrays): add it to the address */
-         nir_def *va = nir_iadd(b, nir_pack_64_2x32(b, address), nir_u2u64(b, intr->src[1].ssa));
-         value = nir_load_global(b, intr->def.num_components, 32, va,
-                                 .align_mul = nir_intrinsic_align_mul(intr),
-                                 .align_offset = nir_intrinsic_align_offset(intr));
+         /* a dynamic offset (indexed uniform arrays): add it to the address
+          * in 32-bit halves with the carry */
+         nir_def *lo = nir_channel(b, address, 0), *hi = nir_channel(b, address, 1);
+         nir_def *sum = nir_iadd(b, lo, intr->src[1].ssa);
+         hi = nir_iadd(b, hi, nir_b2i32(b, nir_ult(b, sum, lo)));
+         value = nir_load_global_offset(b, intr->def.num_components, 32,
+                                        nir_pack_64_2x32_split(b, sum, hi), nir_imm_int(b, 0),
+                                        .align_mul = nir_intrinsic_align_mul(intr),
+                                        .align_offset = nir_intrinsic_align_offset(intr));
       }
       nir_def_replace(&intr->def, value);
       return true;
@@ -1349,6 +1353,25 @@ rd_gfx_program(struct fd_ringbuffer *ring, const struct rd_gfx_pipeline *gfx)
    for (int j = -1; (j = ir3_next_varying(fs, j)) < (int)fs->inputs_count;) {
       unsigned compmask = fs->inputs[j].compmask;
       uint32_t loc = fs->inputs[j].inloc;
+      if (fs->inputs[j].slot == VARYING_SLOT_PNTC) {
+         /* gl_PointCoord: S and T replaced by the point sprite coordinate
+          * (upper-left origin, as Vulkan wants: '01' S, '10' T), z = 0, w = 1 */
+         if (compmask & 0x1) {
+            vpsrepl[loc / 16] |= 0x1 << ((loc % 16) * 2);
+            loc++;
+         }
+         if (compmask & 0x2) {
+            vpsrepl[loc / 16] |= 0x2 << ((loc % 16) * 2);
+            loc++;
+         }
+         if (compmask & 0x4) {
+            vinterp[loc / 16] |= 0x2 << ((loc % 16) * 2);
+            loc++;
+         }
+         if (compmask & 0x8)
+            vinterp[loc / 16] |= 0x3 << ((loc % 16) * 2);
+         continue;
+      }
       if (fs->inputs[j].flat) {
          for (unsigned i = 0; i < 4; i++) {
             if (compmask & (1 << i)) {
