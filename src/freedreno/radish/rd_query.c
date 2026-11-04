@@ -244,7 +244,12 @@ rd_CmdBeginQuery(VkCommandBuffer handle, VkQueryPool pool_handle,
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   rd_record_query(command, RD_CMD_QUERY_BEGIN, pool, query, 1);
+   if (!rd_query_range(pool, query, 1)) {
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+   if (!rd_render_query(command, pool, query, false))
+      rd_record_query(command, RD_CMD_QUERY_BEGIN, pool, query, 1);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -262,7 +267,8 @@ rd_CmdEndQuery(VkCommandBuffer handle, VkQueryPool pool_handle, uint32_t query)
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   rd_record_query(command, RD_CMD_QUERY_END, pool, query, 1);
+   if (!rd_render_query(command, pool, query, true))
+      rd_record_query(command, RD_CMD_QUERY_END, pool, query, 1);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -394,4 +400,24 @@ rd_execute_query(struct rd_device *device, enum rd_command_type type,
    }
    mtx_unlock(&pool->mutex);
    return result;
+}
+
+/* VK_EXT_host_query_reset */
+VKAPI_ATTR void VKAPI_CALL
+rd_ResetQueryPool(VkDevice handle, VkQueryPool pool_handle, uint32_t first, uint32_t count)
+{
+   VK_FROM_HANDLE(rd_query_pool, pool, pool_handle);
+   if (!rd_query_range(pool, first, count))
+      return;
+   mtx_lock(&pool->mutex);
+   for (uint32_t i = 0; i < count; i++) {
+      struct rd_query_slot *slot = &pool->slots[first + i];
+      if (slot->active) {
+         list_delinit(&slot->active_link);
+         slot->active = false;
+      }
+      memset(slot->values, 0, sizeof(slot->values));
+      slot->available = false;
+   }
+   mtx_unlock(&pool->mutex);
 }

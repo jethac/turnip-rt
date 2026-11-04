@@ -238,6 +238,7 @@ struct rd_render_query {
    struct rd_query_pool *pool;
    uint32_t query;
    bool end;
+   uint32_t draw_index; /* takes effect before this draw of the render */
 };
 /* One dynamic-rendering instance: its attachments and its draws. */
 struct rd_render {
@@ -358,6 +359,9 @@ bool rd_render_execute(struct rd_command_buffer *primary, const struct rd_render
 void rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline);
 void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4]);
 bool rd_descriptor_ready(const struct rd_descriptor *descriptor);
+void rd_emit_stage_ibos(struct rd_device *device, struct fd_ringbuffer *ring,
+                        const struct rd_pipeline *stage, const struct ir3_shader_variant *v,
+                        const struct rd_descriptor *descriptors);
 void rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ring,
                               const struct rd_dispatch *dispatch);
 void rd_emit_image_constants(struct fd_ringbuffer *ring,

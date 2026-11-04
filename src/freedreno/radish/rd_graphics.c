@@ -68,12 +68,15 @@ rd_gfx_upload(struct rd_device *device, struct rd_gfx_shader *shader)
 #define RD_GFX_VIEW_DWORD (RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS)
 #define RD_GFX_CONST_VEC4 ((RD_GFX_VIEW_DWORD + 4) / 4)
 
-struct rd_gfx_lower { bool failed; };
+struct rd_gfx_lower { bool failed; bool ibo; };
 
 static bool
 rd_gfx_lower_buffer(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    struct rd_gfx_lower *state = data;
+   /* fragment shaders keep SSBO and image access on the IBO path */
+   if (state->ibo)
+      return false;
    switch (intr->intrinsic) {
    case nir_intrinsic_load_ssbo: {
       if (!nir_src_is_const(intr->src[0]) || intr->def.bit_size != 32 ||
@@ -174,8 +177,11 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    nir_shader *nir = NULL;
    VkResult result = vk_pipeline_shader_stage_to_nir(&device->vk, flags, stage,
       &spirv_options, ir3_get_compiler_options(device->compiler), NULL, &nir);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
+         fprintf(stderr, "radish: shader to NIR failed (%d)\n", result);
       return result;
+   }
    shader->res = vk_zalloc(&device->vk.alloc, sizeof(struct rd_pipeline), 8,
                            VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!shader->res) {
@@ -198,11 +204,12 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
-   struct rd_gfx_lower lower = {0};
+   struct rd_gfx_lower lower = { .ibo = nir->info.stage == MESA_SHADER_FRAGMENT };
    bool lowered = rd_nir_lower_compute_resources(nir, rd_pipeline_resource, shader->res,
                                                  &shader->res->resource_usage);
    bool buffers = lowered && rd_lower_stage_buffers(nir, shader->res);
-   if (!lowered || !buffers || shader->res->resource_usage.image_count ||
+   bool fragment = nir->info.stage == MESA_SHADER_FRAGMENT;
+   if (!lowered || !buffers || (!fragment && shader->res->resource_usage.image_count) ||
        shader->res->buffer_count > RD_GFX_MAX_BUFFERS) {
       if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
          fprintf(stderr, "radish: %s shader refused: resources %d buffers %d images %u buffer count %u\n",
@@ -216,10 +223,17 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    NIR_PASS(_, nir, nir_opt_constant_folding);
    nir_shader_intrinsics_pass(nir, rd_gfx_lower_buffer, nir_metadata_control_flow, &lower);
    if (lower.failed) {
+      if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
+         fprintf(stderr, "radish: %s shader refused: buffer access (store, atomic or size)\n",
+                 mesa_shader_stage_name(nir->info.stage));
       ralloc_free(nir);
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
    NIR_PASS(_, nir, nir_opt_dce);
+   if (lower.ibo) {
+      nir->info.num_ubos = 0;
+      nir->info.num_ssbos = shader->res->buffer_count;
+   }
    ir3_nir_lower_io_vars_to_temporaries(nir);
    nir_assign_io_var_locations(nir, nir_var_shader_in);
    nir_assign_io_var_locations(nir, nir_var_shader_out);
@@ -576,8 +590,13 @@ rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src
                                                  draw->pipeline->gfx->fs.res->resource_count);
       util_dynarray_append(&dst->draws, copy);
    }
-   util_dynarray_foreach(&src->queries, struct rd_render_query, query)
-      util_dynarray_append(&dst->queries, *query);
+   unsigned base = util_dynarray_num_elements(&dst->draws, struct rd_draw) -
+                   util_dynarray_num_elements(&src->draws, struct rd_draw);
+   util_dynarray_foreach(&src->queries, struct rd_render_query, query) {
+      struct rd_render_query copy = *query;
+      copy.draw_index += base;
+      util_dynarray_append(&dst->queries, copy);
+   }
    return true;
 }
 
@@ -596,7 +615,8 @@ rd_render_query(struct rd_command_buffer *command, struct rd_query_pool *pool,
    }
    if (!command->render)
       return false;
-   struct rd_render_query op = { pool, query, end };
+   struct rd_render_query op = { pool, query, end,
+      util_dynarray_num_elements(&command->render->draws, struct rd_draw) };
    util_dynarray_append(&command->render->queries, op);
    return true;
 }
@@ -1108,7 +1128,8 @@ rd_gfx_program(struct fd_ringbuffer *ring, const struct rd_gfx_pipeline *gfx)
    OUT_RING(ring, 0);
    OUT_PKT4(ring, REG_A5XX_HLSQ_VS_CNTL, 5);
    OUT_RING(ring, A5XX_HLSQ_VS_CNTL_INSTRLEN(vs_instrlen));
-   OUT_RING(ring, A5XX_HLSQ_FS_CNTL_INSTRLEN(fs_instrlen));
+   OUT_RING(ring, A5XX_HLSQ_FS_CNTL_INSTRLEN(fs_instrlen) |
+                  COND(gfx->fs.v->has_ssbo, A5XX_HLSQ_FS_CNTL_SSBO_ENABLE));
    OUT_RING(ring, 0);
    OUT_RING(ring, 0);
    OUT_RING(ring, 0);
@@ -1442,6 +1463,7 @@ rd_gfx_vertex_buffers(struct fd_ringbuffer *ring, struct rd_device *device,
       }
       OUT_RING(ring, size);
       OUT_RING(ring, binding->stride);
+
       OUT_PKT4(ring, REG_A5XX_VFD_DECODE(j), 2);
       OUT_RING(ring, A5XX_VFD_DECODE_INSTR_IDX(j) | A5XX_VFD_DECODE_INSTR_FORMAT(rd5_pipe2vtx(pfmt)) |
                      COND(binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE,
@@ -1695,6 +1717,8 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    const struct rd_pipeline *vres = gfx->vs.res, *fres = gfx->fs.res;
    rd_emit_stage_textures(device, ring, SB4_VS_TEX, vres, draw->descriptors[0]);
    rd_emit_stage_textures(device, ring, SB4_FS_TEX, fres, draw->descriptors[1]);
+   if (fres->buffer_count || fres->resource_usage.image_count)
+      rd_emit_stage_ibos(device, ring, fres, gfx->fs.v, draw->descriptors[1]);
    OUT_PKT4(ring, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
    OUT_RING(ring, MAX2(vres->resource_usage.texture_count, vres->resource_usage.sampler_count));
    OUT_PKT4(ring, REG_A5XX_TPL1_FS_TEX_COUNT, 1);
@@ -1792,32 +1816,88 @@ rd_sample_count(struct fd_ringbuffer *ring, struct rd_device *device, struct fd_
    OUT_WFI5(ring);
 }
 
+/* Queries inside a render take effect at their position among the draws.
+ * Occlusion queries count samples from the GPU counter copied around each
+ * draw; pipeline-statistics queries (begun before the render or inside it)
+ * count vertices, primitives and vertex-shader invocations from the draw
+ * parameters, and fragment-shader invocations from the sample counter. */
 static void
-rd_render_query_begins(const struct rd_render *render)
+rd_render_query_op(struct rd_device *device, const struct rd_render_query *op)
 {
-   util_dynarray_foreach(&render->queries, struct rd_render_query, op) {
-      if (op->end)
-         continue;
-      struct rd_query_slot *slot = &op->pool->slots[op->query];
-      mtx_lock(&op->pool->mutex);
+   struct rd_query_pool *pool = op->pool;
+   struct rd_query_slot *slot = &pool->slots[op->query];
+   bool stats = pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS;
+   mtx_lock(&pool->mutex);
+   if (!op->end) {
       memset(slot->values, 0, sizeof(slot->values));
       slot->available = false;
-      mtx_unlock(&op->pool->mutex);
+      if (stats && !slot->active) {
+         slot->active = true;
+         list_addtail(&slot->active_link, &device->active_queries);
+      }
+   } else {
+      if (stats && slot->active) {
+         list_delinit(&slot->active_link);
+         slot->active = false;
+      }
+      slot->available = true;
+      cnd_broadcast(&pool->condition);
+   }
+   mtx_unlock(&pool->mutex);
+}
+
+static uint64_t
+rd_primitive_count(VkPrimitiveTopology topology, uint32_t n, uint32_t patch)
+{
+   switch (topology) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return n;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return n / 2;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return n >= 2 ? n - 1 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return n / 3;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN: return n >= 3 ? n - 2 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: return n / 4;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: return n >= 4 ? n - 3 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY: return n / 6;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY: return n >= 6 ? (n - 4) / 2 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_PATCH_LIST: return patch ? n / patch : 0;
+   default: return 0;
    }
 }
 
 static void
-rd_render_query_ends(const struct rd_render *render)
+rd_account_draw(struct rd_device *device, const struct rd_draw *draw, uint64_t samples,
+                uint64_t fragments)
 {
-   util_dynarray_foreach(&render->queries, struct rd_render_query, op) {
-      if (!op->end)
-         continue;
-      struct rd_query_slot *slot = &op->pool->slots[op->query];
-      mtx_lock(&op->pool->mutex);
-      slot->available = true;
-      cnd_broadcast(&op->pool->condition);
-      mtx_unlock(&op->pool->mutex);
+   if (draw->occlusion_pool) {
+      mtx_lock(&draw->occlusion_pool->mutex);
+      draw->occlusion_pool->slots[draw->occlusion_query].values[0] += samples;
+      mtx_unlock(&draw->occlusion_pool->mutex);
    }
+   if (list_is_empty(&device->active_queries))
+      return;
+   const struct vk_dynamic_graphics_state *dyn = &draw->pipeline->gfx->dynamic;
+   uint64_t vertices = (uint64_t)draw->vertex_count * draw->instance_count;
+   uint64_t primitives = rd_primitive_count(dyn->ia.primitive_topology, draw->vertex_count,
+                                            dyn->ts.patch_control_points) * draw->instance_count;
+   list_for_each_entry(struct rd_query_slot, slot, &device->active_queries, active_link) {
+      struct rd_query_pool *pool = slot->pool;
+      mtx_lock(&pool->mutex);
+      slot->values[0] += vertices;   /* input assembly vertices */
+      slot->values[1] += primitives; /* input assembly primitives */
+      slot->values[2] += vertices;   /* vertex shader invocations */
+      slot->values[5] += primitives; /* clipping invocations */
+      slot->values[6] += primitives; /* clipping primitives */
+      slot->values[7] += fragments;  /* fragment shader invocations */
+      mtx_unlock(&pool->mutex);
+   }
+}
+
+static bool
+rd_stats_need_fragments(const struct rd_query_pool *pool)
+{
+   return pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS &&
+          (pool->vk.pipeline_statistics & VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT);
 }
 
 static VkResult rd_render_resolves(struct rd_device *device, const struct rd_render *render);
@@ -1888,7 +1968,7 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
          if (op->end ? !last : !first)
             continue;
          for (unsigned i = 0; i < util_bitcount(render->view_mask); i++) {
-            struct rd_render_query q = { op->pool, op->query + i, op->end };
+            struct rd_render_query q = { op->pool, op->query + i, op->end, op->draw_index };
             if (q.query < q.pool->vk.query_count)
                util_dynarray_append(&queries, q);
          }
@@ -1929,9 +2009,14 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          height = MAX2(height, a->view->vk.extent.height);
       }
    }
+   if (!width) {
+      /* a render without attachments rasterizes over its area */
+      width = render->area.offset.x + render->area.extent.width;
+      height = render->area.offset.y + render->area.extent.height;
+   }
    if (!width || !util_dynarray_num_elements(&render->draws, struct rd_draw)) {
-      rd_render_query_begins(render);
-      rd_render_query_ends(render);
+      util_dynarray_foreach(&render->queries, struct rd_render_query, op)
+         rd_render_query_op(device, op);
       return width ? rd_render_resolves(device, render) : VK_SUCCESS;
    }
    struct fd_submit *submit = fd_submit_new(device->pipe);
@@ -1946,26 +2031,56 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    rd_gfx_restore(ring, device);
    rd_gfx_sysmem_prep(ring, device, render, width, height, render->samples);
    VkResult result = VK_SUCCESS;
-   /* occlusion: the sample counter is copied before and after each counted
-    * draw (16-byte aligned 64-bit values); the CPU adds the differences to
-    * the query once the submit is done */
+   /* which draws need the sample counter: occlusion, or a statistics query
+    * counting fragment-shader invocations active at that draw */
+   unsigned ndraws = util_dynarray_num_elements(&render->draws, struct rd_draw);
+   int *slots = calloc(ndraws ? ndraws : 1, sizeof(int));
+   bool *coverage = calloc(ndraws ? ndraws : 1, sizeof(bool));
+   struct rd_draw *resolved = calloc(ndraws ? ndraws : 1, sizeof(struct rd_draw));
+   if (!slots || !resolved || !coverage) {
+      free(slots);
+      free(resolved);
+      free(coverage);
+      fd_ringbuffer_del(ring);
+      fd_submit_del(submit);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   int fragments = 0;
+   list_for_each_entry(struct rd_query_slot, slot, &device->active_queries, active_link)
+      fragments += rd_stats_need_fragments(slot->pool);
    unsigned counted = 0;
-   util_dynarray_foreach(&render->draws, struct rd_draw, recorded)
-      counted += recorded->occlusion_pool != NULL;
+   {
+      const struct rd_render_query *op = util_dynarray_begin(&render->queries);
+      const struct rd_render_query *op_end = util_dynarray_end(&render->queries);
+      for (unsigned i = 0; i < ndraws; i++) {
+         for (; op < op_end && op->draw_index <= i; op++)
+            if (rd_stats_need_fragments(op->pool))
+               fragments += op->end ? -1 : 1;
+         const struct rd_draw *d = util_dynarray_element(&render->draws, struct rd_draw, i);
+         slots[i] = d->occlusion_pool || fragments > 0 ? (int)counted : -1;
+         coverage[i] = fragments > 0 && !d->pipeline->gfx->fs.v->has_ssbo &&
+                       !debug_get_bool_option("RADISH_NO_COVERAGE_PASS", false);
+         /* two counter pairs: the draw itself, and a coverage pass */
+         counted += slots[i] >= 0 ? 2 : 0;
+      }
+   }
    struct fd_bo *counters = NULL;
    if (counted) {
-      counters = fd_bo_new(device->fd, align(counted * 32, 4096), 0, "radish-occlusion");
+      counters = fd_bo_new(device->fd, align(counted * 32, 4096), 0, "radish-sample-counts");
       if (!counters) {
+         free(slots);
+         free(resolved);
+         free(coverage);
          fd_ringbuffer_del(ring);
          fd_submit_del(submit);
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
       }
       memset(fd_bo_map(counters), 0, counted * 32);
    }
-   rd_render_query_begins(render);
-   unsigned counter = 0;
-   util_dynarray_foreach(&render->draws, struct rd_draw, recorded) {
-      struct rd_draw draw = *recorded;
+   for (unsigned i = 0; i < ndraws; i++) {
+      struct rd_draw draw = *util_dynarray_element(&render->draws, struct rd_draw, i);
+      resolved[i] = draw;
+      resolved[i].vertex_count = 0;
       if (draw.indirect && (result = rd_resolve_draw_indirect(device, &draw)) != VK_SUCCESS)
          break;
       if (!draw.vertex_count || !draw.instance_count)
@@ -1974,6 +2089,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          result = VK_ERROR_UNKNOWN;
          break;
       }
+      resolved[i] = draw;
       fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->vs.bo);
       fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->fs.bo);
       if (draw.barrier) {
@@ -1983,22 +2099,36 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          rd_event(ring, device, CACHE_FLUSH_TS, true);
          OUT_WFI5(ring);
          OUT_PKT4(ring, REG_A5XX_UCHE_CACHE_INVALIDATE_MIN, 5);
-         for (unsigned i = 0; i < 4; i++)
+         for (unsigned j = 0; j < 4; j++)
             OUT_RING(ring, 0);
          OUT_RING(ring, 0x00000012);
          OUT_WFI5(ring);
       }
-      if (draw.occlusion_pool)
-         rd_sample_count(ring, device, counters, (counter * 2) * 16);
-      rd_gfx_draw(ring, device, render, &draw);
-      if (draw.occlusion_pool) {
-         rd_sample_count(ring, device, counters, (counter * 2 + 1) * 16);
-         counter++;
+      draw.occlusion_pool = slots[i] >= 0 ? (struct rd_query_pool *)1 : NULL; /* SAMPLES_PASSED */
+      if (coverage[i]) {
+         /* fragment-shader invocations: count the rasterized samples of the
+          * draw with depth/stencil tests off and nothing written (the shader
+          * has no side effects), before the draw itself */
+         struct rd_draw pass = draw;
+         memset(&pass.ds, 0, sizeof(pass.ds));
+         for (unsigned j = 0; j < ARRAY_SIZE(pass.cb.attachments); j++)
+            pass.cb.attachments[j].write_mask = 0;
+         rd_sample_count(ring, device, counters, ((slots[i] + 1) * 2) * 16);
+         rd_gfx_draw(ring, device, render, &pass);
+         rd_sample_count(ring, device, counters, ((slots[i] + 1) * 2 + 1) * 16);
       }
+      if (slots[i] >= 0)
+         rd_sample_count(ring, device, counters, (slots[i] * 2) * 16);
+      rd_gfx_draw(ring, device, render, &draw);
+      if (slots[i] >= 0)
+         rd_sample_count(ring, device, counters, (slots[i] * 2 + 1) * 16);
    }
    if (result != VK_SUCCESS) {
       if (counters)
          fd_bo_del(counters);
+      free(slots);
+      free(resolved);
+      free(coverage);
       fd_ringbuffer_del(ring);
       fd_submit_del(submit);
       return result;
@@ -2009,26 +2139,36 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
    rd_event(ring, device, PC_CCU_FLUSH_DEPTH_TS, true);
    rd_flush(device, ring);
    result = rd_finish_submit(device, submit, ring, NULL, NULL);
-   if (counters) {
-      if (result == VK_SUCCESS) {
-         const uint64_t *values = fd_bo_map(counters);
-         unsigned i = 0;
-         util_dynarray_foreach(&render->draws, struct rd_draw, recorded) {
-            if (!recorded->occlusion_pool)
-               continue;
-            struct rd_query_pool *pool = recorded->occlusion_pool;
-            if (recorded->vertex_count && recorded->instance_count) {
-               uint64_t passed = values[(i * 2 + 1) * 2] - values[(i * 2) * 2];
-               mtx_lock(&pool->mutex);
-               pool->slots[recorded->occlusion_query].values[0] += passed;
-               mtx_unlock(&pool->mutex);
-            }
-            i++;
-         }
+   if (result == VK_SUCCESS) {
+      const uint64_t *values = counters ? fd_bo_map(counters) : NULL;
+      const struct rd_render_query *op = util_dynarray_begin(&render->queries);
+      const struct rd_render_query *op_end = util_dynarray_end(&render->queries);
+      for (unsigned i = 0; i < ndraws; i++) {
+         for (; op < op_end && op->draw_index <= i; op++)
+            rd_render_query_op(device, op);
+         if (!resolved[i].vertex_count || !resolved[i].instance_count)
+            continue;
+         uint64_t samples = slots[i] >= 0 ?
+            values[(slots[i] * 2 + 1) * 2] - values[(slots[i] * 2) * 2] : 0;
+         uint64_t fragments = coverage[i] ?
+            values[((slots[i] + 1) * 2 + 1) * 2] - values[((slots[i] + 1) * 2) * 2] : samples;
+         if (debug_get_bool_option("RADISH_DEBUG_QUERIES", false))
+            fprintf(stderr, "radish: draw %u vertices %u instances %u samples %" PRIu64
+                    " fragments %" PRIu64 " raw %" PRIx64 " %" PRIx64 " %" PRIx64 " %" PRIx64 "\n",
+                    i, resolved[i].vertex_count,
+                    resolved[i].instance_count, samples, fragments,
+                    slots[i] >= 0 ? values[slots[i] * 4] : 0, slots[i] >= 0 ? values[slots[i] * 4 + 1] : 0,
+                    slots[i] >= 0 ? values[slots[i] * 4 + 2] : 0, slots[i] >= 0 ? values[slots[i] * 4 + 3] : 0);
+         rd_account_draw(device, &resolved[i], samples, fragments);
       }
-      fd_bo_del(counters);
+      for (; op < op_end; op++)
+         rd_render_query_op(device, op);
    }
-   rd_render_query_ends(render);
+   if (counters)
+      fd_bo_del(counters);
+   free(slots);
+   free(resolved);
+   free(coverage);
    if (result != VK_SUCCESS)
       return result;
    return rd_render_resolves(device, render);

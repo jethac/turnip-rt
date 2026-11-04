@@ -477,11 +477,11 @@ rd_storage_resource_format(enum a5xx_tex_fmt format, uint32_t cpp)
 }
 
 static void
-rd_emit_resource_image(struct fd_ringbuffer *ring, uint32_t slot,
-                        const struct rd_resource *resource)
+rd_emit_resource_image_sb(struct fd_ringbuffer *ring, uint32_t slot,
+                          const struct rd_resource *resource, enum a4xx_state_block sb)
 {
    enum a5xx_tex_fmt format = rd_storage_resource_format(resource->format, resource->cpp);
-   rd_resource_packet(ring, slot, SB4_CS_SSBO, ST4_CONSTANTS, 1, 2);
+   rd_resource_packet(ring, slot, sb, ST4_CONSTANTS, 1, 2);
    uint32_t width = resource->buffer ? (1u << 15) : resource->width;
    uint32_t height = resource->buffer ? resource->height + !!resource->width : resource->height;
    OUT_RING(ring, A5XX_SSBO_1_0_FMT(format) |
@@ -497,8 +497,15 @@ rd_emit_resource_image(struct fd_ringbuffer *ring, uint32_t slot,
          A5XX_SSBO_1_1_HEIGHT(height) | A5XX_SSBO_1_1_DEPTH(resource->depth),
          (uint32_t)address, (uint32_t)(address >> 32));
    }
-   rd_resource_packet(ring, slot, SB4_CS_SSBO, ST4_UBO, 1, 2);
+   rd_resource_packet(ring, slot, sb, ST4_UBO, 1, 2);
    OUT_RELOC(ring, resource->bo, resource->offset, 0, 0);
+}
+
+static void
+rd_emit_resource_image(struct fd_ringbuffer *ring, uint32_t slot,
+                        const struct rd_resource *resource)
+{
+   rd_emit_resource_image_sb(ring, slot, resource, SB4_CS_SSBO);
 }
 
 static enum a5xx_tex_clamp
@@ -598,12 +605,12 @@ rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ring,
    }
 }
 
-void
-rd_emit_image_constants(struct fd_ringbuffer *ring,
-                         const struct rd_dispatch *dispatch)
+static void
+rd_emit_image_constants_sb(struct fd_ringbuffer *ring, const struct rd_pipeline *pipeline,
+                           const struct ir3_shader_variant *v,
+                           const struct rd_descriptor *descriptors, bool sampling_metadata,
+                           enum a4xx_state_block sb)
 {
-   const struct rd_pipeline *pipeline = dispatch->pipeline;
-   const struct ir3_shader_variant *v = pipeline->variant;
    const struct ir3_const_state *state = ir3_const_state(v);
    if (!state->image_dims.count ||
        !ir3_const_can_upload(&state->allocs, IR3_CONST_ALLOC_IMAGE_DIMS, v->constlen))
@@ -614,12 +621,12 @@ rd_emit_image_constants(struct fd_ringbuffer *ring,
       if (!(state->image_dims.mask & (1u << i)))
          continue;
       struct rd_resource resource;
-      if (!rd_make_resource(&dispatch->descriptors[pipeline->image_descriptors[i]],
+      if (!rd_make_resource(&descriptors[pipeline->image_descriptors[i]],
                              &resource))
          continue;
       uint32_t offset = state->image_dims.off[i];
       values[offset] = resource.cpp;
-      const struct rd_descriptor *descriptor = &dispatch->descriptors[pipeline->image_descriptors[i]];
+      const struct rd_descriptor *descriptor = &descriptors[pipeline->image_descriptors[i]];
       values[offset + 1] = resource.buffer ? util_logbase2(resource.cpp) :
          descriptor->image_view->vk.view_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY ?
          resource.array_pitch : resource.row_pitch;
@@ -638,17 +645,81 @@ rd_emit_image_constants(struct fd_ringbuffer *ring,
       if (!(state->ssbo_size_mask & (1u << i)))
          continue;
       assert(i < pipeline->buffer_count);
-      bool metadata = dispatch->sampling_addresses && i == pipeline->sampling_buffer;
+      bool metadata = sampling_metadata && i == pipeline->sampling_buffer;
       const struct rd_descriptor *descriptor = metadata ? NULL :
-         &dispatch->descriptors[pipeline->buffer_descriptors[i]];
+         &descriptors[pipeline->buffer_descriptors[i]];
       values[state->ssbo_size_offset[i]] = metadata ? 128 :
          descriptor->buffer ? descriptor->range : 0;
    }
    uint32_t offset = state->allocs.consts[IR3_CONST_ALLOC_IMAGE_DIMS].offset_vec4;
    uint32_t count = MIN2(align(state->image_dims.count, 4), (v->constlen - offset) * 4);
-   rd_resource_packet(ring, offset, SB4_CS_SHADER, ST4_CONSTANTS, count / 4, count);
+   rd_resource_packet(ring, offset, sb, ST4_CONSTANTS, count / 4, count);
    for (uint32_t i = 0; i < count; i++)
       OUT_RING(ring, values[i]);
+}
+
+void
+rd_emit_image_constants(struct fd_ringbuffer *ring,
+                         const struct rd_dispatch *dispatch)
+{
+   rd_emit_image_constants_sb(ring, dispatch->pipeline, dispatch->pipeline->variant,
+                              dispatch->descriptors, dispatch->sampling_addresses != NULL,
+                              SB4_CS_SHADER);
+}
+
+/* Storage buffers and images of the fragment stage: the IBO state block
+ * (SB4_SSBO, as Freedreno's a5xx uses for fragment shaders), image
+ * dimension constants, and images read through the texture path. */
+void
+rd_emit_stage_ibos(struct rd_device *device, struct fd_ringbuffer *ring,
+                   const struct rd_pipeline *stage, const struct ir3_shader_variant *v,
+                   const struct rd_descriptor *descriptors)
+{
+   unsigned count = stage->buffer_count;
+   if (count) {
+      OUT_PKT7(ring, CP_LOAD_STATE4, 3 + 2 * count);
+      OUT_RING(ring, CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+         CP_LOAD_STATE4_0_STATE_BLOCK(SB4_SSBO) | CP_LOAD_STATE4_0_NUM_UNIT(count));
+      OUT_RING(ring, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS));
+      OUT_RING(ring, 0);
+      for (unsigned i = 0; i < count; i++) {
+         const struct rd_descriptor *desc = &descriptors[stage->buffer_descriptors[i]];
+         uint32_t bytes = desc->buffer ? desc->range : 0;
+         OUT_RING(ring, A5XX_SSBO_1_0_WIDTH(bytes & 0xffff));
+         OUT_RING(ring, A5XX_SSBO_1_1_HEIGHT(bytes >> 16));
+      }
+      OUT_PKT7(ring, CP_LOAD_STATE4, 3 + 2 * count);
+      OUT_RING(ring, CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+         CP_LOAD_STATE4_0_STATE_BLOCK(SB4_SSBO) | CP_LOAD_STATE4_0_NUM_UNIT(count));
+      OUT_RING(ring, CP_LOAD_STATE4_1_STATE_TYPE(ST4_UBO));
+      OUT_RING(ring, 0);
+      for (unsigned i = 0; i < count; i++) {
+         const struct rd_descriptor *desc = &descriptors[stage->buffer_descriptors[i]];
+         if (desc->buffer && desc->buffer->memory)
+            OUT_RELOC(ring, desc->buffer->memory->bo, desc->buffer->offset + desc->offset, 0, 0);
+         else
+            OUT_RELOC(ring, device->control, 0, 0, 0);
+      }
+   }
+   const struct rd_nir_resource_usage *usage = &stage->resource_usage;
+   for (uint32_t i = 0; i < usage->image_count; i++) {
+      if (!(usage->images & (1u << i)))
+         continue;
+      struct rd_resource resource;
+      if (rd_make_resource(&descriptors[stage->image_descriptors[i]], &resource))
+         rd_emit_resource_image_sb(ring, v->num_ssbos + i, &resource, SB4_SSBO);
+   }
+   const struct ir3_ibo_mapping *mapping = &v->image_mapping;
+   for (uint32_t i = 0; i < mapping->num_tex; i++) {
+      uint32_t resource_index = mapping->tex_to_image[i];
+      uint32_t slot = resource_index & UAV_SSBO ?
+         stage->buffer_descriptors[resource_index & ~UAV_SSBO] :
+         stage->image_descriptors[resource_index];
+      struct rd_resource resource;
+      if (rd_make_resource(&descriptors[slot], &resource))
+         rd_emit_resource_texture_sb(ring, mapping->tex_base + i, &resource, SB4_FS_TEX);
+   }
+   rd_emit_image_constants_sb(ring, stage, v, descriptors, false, SB4_FS_SHADER);
 }
 
 /* Samplers and textures of one graphics stage (state block VS/FS_TEX). */

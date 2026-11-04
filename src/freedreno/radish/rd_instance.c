@@ -61,6 +61,7 @@ static const struct vk_device_extension_table rd_device_extensions = {
    .KHR_shader_float16_int8 = true,
    .KHR_relaxed_block_layout = true,
    .KHR_sampler_mirror_clamp_to_edge = true,
+   .EXT_host_query_reset = true,
 };
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -250,7 +251,7 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    extensions.KHR_timeline_semaphore = timeline;
    properties.maxTimelineSemaphoreValueDifference = timeline ? UINT64_MAX : 0;
    const struct vk_features features = { .pipelineStatisticsQuery = true, .robustBufferAccess = true,
-      .multiview = true, .occlusionQueryPrecise = true,
+      .multiview = true, .occlusionQueryPrecise = true, .hostQueryReset = true,
       .textureCompressionETC2 = true,
       .storageBuffer16BitAccess = true, .storageBuffer8BitAccess = true, .shaderInt8 = true, .timelineSemaphore = timeline };
    VkResult result = vk_physical_device_init(&physical->vk, instance, &extensions,
