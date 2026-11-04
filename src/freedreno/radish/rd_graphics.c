@@ -29,10 +29,12 @@ void rd_destroy_pipeline_public(struct rd_device *device, struct rd_pipeline *pi
 #include "vk_util.h"
 #include "util/u_debug.h"
 
+/* The queue family has VK_QUEUE_GRAPHICS_BIT and graphics pipelines are
+ * accepted unless RADISH_GRAPHICS=0. */
 bool
 rd_graphics_enabled(void)
 {
-   return debug_get_bool_option("RADISH_GRAPHICS", false);
+   return debug_get_bool_option("RADISH_GRAPHICS", true);
 }
 
 /* --- pipelines ------------------------------------------------------------ */
@@ -62,7 +64,9 @@ rd_gfx_upload(struct rd_device *device, struct rd_gfx_shader *shader)
  */
 #define RD_GFX_PUSH_DWORDS 32
 #define RD_GFX_MAX_BUFFERS 16
-#define RD_GFX_CONST_VEC4 ((RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS) / 4)
+/* one vec4 after the buffer addresses: x = view index (multiview replay) */
+#define RD_GFX_VIEW_DWORD (RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS)
+#define RD_GFX_CONST_VEC4 ((RD_GFX_VIEW_DWORD + 4) / 4)
 
 struct rd_gfx_lower { bool failed; };
 
@@ -121,11 +125,14 @@ rd_lower_subpass_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *pos = nir_f2i32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
    pos = nir_iadd(b, pos, nir_trim_vector(b, intr->src[1].ssa, 2));
-   nir_tex_instr *tex = nir_tex_instr_create(b->shader, ms ? 3 : 3);
+   /* the layer is the view (multiview), 0 otherwise */
+   pos = nir_vec3(b, nir_channel(b, pos, 0), nir_channel(b, pos, 1), nir_load_view_index(b));
+   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 3);
    tex->op = ms ? nir_texop_txf_ms : nir_texop_txf;
    tex->sampler_dim = ms ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D;
+   tex->is_array = true;
    tex->dest_type = nir_intrinsic_dest_type(intr);
-   tex->coord_components = 2;
+   tex->coord_components = 3;
    tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, pos);
    tex->src[1] = ms ? nir_tex_src_for_ssa(nir_tex_src_ms_index, intr->src[2].ssa) :
                       nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
@@ -136,6 +143,18 @@ rd_lower_subpass_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (intr->def.num_components != 4)
       result = nir_trim_vector(b, result, intr->def.num_components);
    nir_def_replace(&intr->def, result);
+   return true;
+}
+
+/* gl_ViewIndex: the driver constant the multiview replay sets per view */
+static bool
+rd_lower_view_index(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_view_index)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_load_const_ir3(b, 1, 32, nir_imm_int(b, 0),
+                                                  .base = RD_GFX_VIEW_DWORD));
    return true;
 }
 
@@ -172,6 +191,7 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
                nir_metadata_control_flow, NULL);
    }
    NIR_PASS(_, nir, nir_lower_system_values);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, rd_lower_view_index, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
@@ -210,7 +230,7 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
       .api_wavesize = IR3_SINGLE_ONLY,
       .real_wavesize = IR3_SINGLE_ONLY,
       .push_consts_type = IR3_PUSH_CONSTS_PER_STAGE,
-      .push_consts_dwords = RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS,
+      .push_consts_dwords = RD_GFX_VIEW_DWORD + 4,
       .const_allocs = {
          .consts[IR3_CONST_ALLOC_PUSH_CONSTS] = { .offset_vec4 = 0, .size_vec4 = RD_GFX_CONST_VEC4 },
          .max_const_offset_vec4 = RD_GFX_CONST_VEC4,
@@ -280,7 +300,8 @@ rd_create_graphics_pipeline(struct rd_device *device, const VkGraphicsPipelineCr
        gfx->state.ms->rasterization_samples != VK_SAMPLE_COUNT_4_BIT)
       result = VK_ERROR_FEATURE_NOT_PRESENT;
    if (result == VK_SUCCESS && gfx->state.ms &&
-       (gfx->state.ms->sample_shading_enable || gfx->state.ms->alpha_to_one_enable))
+       ((gfx->state.ms->sample_shading_enable && gfx->state.ms->rasterization_samples > 1) ||
+        gfx->state.ms->alpha_to_one_enable))
       result = VK_ERROR_FEATURE_NOT_PRESENT; /* sampleRateShading, alphaToOne: not advertised */
    /* A pipeline without a fragment shader (depth only) gets an empty one. */
    nir_shader *empty_fs = NULL;
@@ -615,7 +636,9 @@ rd_record_draw(struct rd_command_buffer *command)
       .index_type = command->index_type,
       .occlusion_pool = command->occlusion_pool,
       .occlusion_query = command->occlusion_query,
+      .barrier = command->render_barrier,
    };
+   command->render_barrier = false;
    memcpy(draw.vertex_buffers, command->vertex_buffers, sizeof(draw.vertex_buffers));
    memcpy(draw.vertex_offsets, command->vertex_offsets, sizeof(draw.vertex_offsets));
    memcpy(draw.push, command->push, sizeof(draw.push));
@@ -1309,13 +1332,17 @@ static void
 rd_gfx_consts(struct fd_ringbuffer *ring, struct rd_device *device,
               const struct rd_gfx_shader *shader, enum a4xx_state_block sb,
               const struct rd_draw *draw, const struct rd_descriptor *descriptors,
-              int32_t vertex_base)
+              int32_t vertex_base, uint32_t view_index)
 {
    const struct ir3_shader_variant *v = shader->v;
    const struct ir3_const_state *state = ir3_const_state(v);
    unsigned constlen = v->constlen * 4;
    /* push constants */
    rd_gfx_const(ring, sb, 0, MIN2(RD_GFX_PUSH_DWORDS, constlen), draw->push);
+   if (RD_GFX_VIEW_DWORD < constlen) {
+      const uint32_t view[4] = { view_index };
+      rd_gfx_const(ring, sb, RD_GFX_VIEW_DWORD, 4, view);
+   }
    /* buffer addresses, two dwords each */
    const struct rd_pipeline *res = shader->res;
    if (res->buffer_count && RD_GFX_PUSH_DWORDS < constlen) {
@@ -1614,8 +1641,10 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
                   A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(regid(63, 0)));
 
    int32_t vertex_base = draw->indexed ? draw->vertex_offset : (int32_t)draw->first_vertex;
-   rd_gfx_consts(ring, device, &gfx->vs, SB4_VS_SHADER, draw, draw->descriptors[0], vertex_base);
-   rd_gfx_consts(ring, device, &gfx->fs, SB4_FS_SHADER, draw, draw->descriptors[1], 0);
+   rd_gfx_consts(ring, device, &gfx->vs, SB4_VS_SHADER, draw, draw->descriptors[0], vertex_base,
+                 render->view_index);
+   rd_gfx_consts(ring, device, &gfx->fs, SB4_FS_SHADER, draw, draw->descriptors[1], 0,
+                 render->view_index);
 
    /* blending */
    uint32_t mrt_blend = 0;
@@ -1797,19 +1826,85 @@ static VkResult rd_execute_render_tiled_ds(struct rd_device *device, const struc
 static VkResult
 rd_execute_render_direct(struct rd_device *device, const struct rd_render *render);
 
-VkResult
-rd_execute_render(struct rd_device *device, const struct rd_render *render)
+static VkResult
+rd_execute_render_view(struct rd_device *device, const struct rd_render *render)
 {
    if (render->depth.view || render->stencil.view)
       return rd_execute_render_tiled_ds(device, render);
    return rd_execute_render_direct(device, render);
 }
 
+static void
+rd_view_layer(struct rd_image_view *out, const struct rd_image_view *view, uint32_t layer)
+{
+   *out = *view;
+   out->vk.base_array_layer += layer;
+   out->vk.layer_count = 1;
+}
+
+/* Multiview: the render is replayed once per view in the mask, each time
+ * on layer <view> of every attachment, with gl_ViewIndex = view. */
+VkResult
+rd_execute_render(struct rd_device *device, const struct rd_render *render)
+{
+   if (!render->view_mask)
+      return rd_execute_render_view(device, render);
+   VkResult result = VK_SUCCESS;
+   u_foreach_bit(view, render->view_mask) {
+      struct rd_render copy = *render;
+      struct rd_image_view color[RD_MAX_RTS], resolve[RD_MAX_RTS], depth, stencil;
+      for (unsigned i = 0; i < render->color_count; i++) {
+         if (render->color[i].view) {
+            rd_view_layer(&color[i], render->color[i].view, view);
+            copy.color[i].view = &color[i];
+         }
+         if (render->color[i].resolve) {
+            rd_view_layer(&resolve[i], render->color[i].resolve, view);
+            copy.color[i].resolve = &resolve[i];
+         }
+      }
+      if (render->depth.view) {
+         rd_view_layer(&depth, render->depth.view, view);
+         copy.depth.view = &depth;
+      }
+      if (render->stencil.view) {
+         if (render->stencil.view == render->depth.view) {
+            copy.stencil.view = &depth;
+         } else {
+            rd_view_layer(&stencil, render->stencil.view, view);
+            copy.stencil.view = &stencil;
+         }
+      }
+      copy.view_mask = 0;
+      copy.view_index = view;
+      /* queries begin with the first view and end with the last; all views
+       * count into the first of the view count's consecutive queries, the
+       * others end up available and zero */
+      bool first = view == (unsigned)ffs(render->view_mask) - 1;
+      bool last = view == (unsigned)util_last_bit(render->view_mask) - 1;
+      struct util_dynarray queries;
+      util_dynarray_init(&queries, NULL);
+      util_dynarray_foreach(&render->queries, struct rd_render_query, op) {
+         if (op->end ? !last : !first)
+            continue;
+         for (unsigned i = 0; i < util_bitcount(render->view_mask); i++) {
+            struct rd_render_query q = { op->pool, op->query + i, op->end };
+            if (q.query < q.pool->vk.query_count)
+               util_dynarray_append(&queries, q);
+         }
+      }
+      copy.queries = queries;
+      result = rd_execute_render_view(device, &copy);
+      util_dynarray_fini(&queries);
+      if (result != VK_SUCCESS)
+         break;
+   }
+   return result;
+}
+
 static VkResult
 rd_execute_render_direct(struct rd_device *device, const struct rd_render *render)
 {
-   if (render->view_mask)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
    for (const struct rd_render_attachment *a = &render->depth; a <= &render->stencil; a++) {
       if (!a->view)
          continue;
@@ -1834,10 +1929,11 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          height = MAX2(height, a->view->vk.extent.height);
       }
    }
-   if (!width)
-      return VK_SUCCESS;
-   if (!util_dynarray_num_elements(&render->draws, struct rd_draw))
-      return rd_render_resolves(device, render);
+   if (!width || !util_dynarray_num_elements(&render->draws, struct rd_draw)) {
+      rd_render_query_begins(render);
+      rd_render_query_ends(render);
+      return width ? rd_render_resolves(device, render) : VK_SUCCESS;
+   }
    struct fd_submit *submit = fd_submit_new(device->pipe);
    if (!submit)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1880,6 +1976,18 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       }
       fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->vs.bo);
       fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->fs.bo);
+      if (draw.barrier) {
+         /* make the colour writes so far visible to texture fetches */
+         rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
+         rd_event(ring, device, PC_CCU_FLUSH_DEPTH_TS, true);
+         rd_event(ring, device, CACHE_FLUSH_TS, true);
+         OUT_WFI5(ring);
+         OUT_PKT4(ring, REG_A5XX_UCHE_CACHE_INVALIDATE_MIN, 5);
+         for (unsigned i = 0; i < 4; i++)
+            OUT_RING(ring, 0);
+         OUT_RING(ring, 0x00000012);
+         OUT_WFI5(ring);
+      }
       if (draw.occlusion_pool)
          rd_sample_count(ring, device, counters, (counter * 2) * 16);
       rd_gfx_draw(ring, device, render, &draw);
@@ -2719,14 +2827,16 @@ rd_ds_scratch_init(struct rd_device *device, struct rd_ds_scratch *scratch,
    tiled->vk.format = image->vk.format;
    tiled->vk.image_type = VK_IMAGE_TYPE_2D;
    tiled->vk.samples = image->vk.samples;
-   tiled->vk.extent = (VkExtent3D) { extent.width, extent.height, 1 };
+   tiled->vk.extent = (VkExtent3D) { MAX2(extent.width, FDL_LINEAR_FALLBACK_THRESHOLD), extent.height, 1 };
    tiled->vk.mip_levels = 1;
    tiled->vk.array_layers = 1;
    tiled->texel_size = image->texel_size;
    const struct fdl_image_params params = {
       .format = vk_format_to_pipe_format(image->vk.format), .nr_samples = image->vk.samples,
-      .width0 = extent.width, .height0 = extent.height, .depth0 = 1, .mip_levels = 1,
-      .array_size = 1, .tile_mode = TILE5_3,
+      /* at least 16 wide: narrower levels fall back to linear in fdl, but the
+       * depth unit tiles anyway */
+      .width0 = MAX2(extent.width, FDL_LINEAR_FALLBACK_THRESHOLD), .height0 = extent.height,
+      .depth0 = 1, .mip_levels = 1, .array_size = 1, .tile_mode = TILE5_3,
    };
    fdl5_layout_image(&tiled->native_layout, &params);
    tiled->native_layout.mip_levels = 1;
@@ -2852,7 +2962,7 @@ rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *ren
    if (result == VK_SUCCESS) {
       struct rd_image_view tiled_view;
       rd_internal_view(&tiled_view, &scratch.image, VK_IMAGE_VIEW_TYPE_2D, view->vk.aspects, 0, 0);
-      tiled_view.vk.extent = view->vk.extent;
+      tiled_view.vk.extent.height = view->vk.extent.height;
       struct rd_render tiled_render = *render;
       if (tiled_render.depth.view)
          tiled_render.depth.view = &tiled_view;

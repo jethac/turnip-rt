@@ -275,8 +275,11 @@ rd_CmdWriteTimestamp2(VkCommandBuffer handle, VkPipelineStageFlags2 stage,
       rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
+   /* in a multiview render pass a timestamp fills one query per view */
+   uint32_t count = command->render && command->render->view_mask ?
+      util_bitcount(command->render->view_mask) : 1;
    struct rd_query_command *recorded =
-      rd_record_query(command, RD_CMD_QUERY_TIMESTAMP, pool, query, 1);
+      rd_record_query(command, RD_CMD_QUERY_TIMESTAMP, pool, query, count);
    if (recorded)
       recorded->stage = stage;
 }
@@ -354,8 +357,10 @@ rd_execute_query(struct rd_device *device, enum rd_command_type type,
       if (result != VK_SUCCESS)
          return result;
       mtx_lock(&pool->mutex);
-      pool->slots[command->first].values[0] = value;
-      pool->slots[command->first].available = true;
+      for (uint32_t i = 0; i < command->count; i++) {
+         pool->slots[command->first + i].values[0] = value;
+         pool->slots[command->first + i].available = true;
+      }
       cnd_broadcast(&pool->condition);
       mtx_unlock(&pool->mutex);
       return VK_SUCCESS;

@@ -230,6 +230,8 @@ struct rd_draw {
    /* the occlusion query active when the draw was recorded */
    struct rd_query_pool *occlusion_pool;
    uint32_t occlusion_query;
+   /* a pipeline barrier inside the render pass precedes this draw */
+   bool barrier;
 };
 /* vkCmdBeginQuery/vkCmdEndQuery of an occlusion query inside a render */
 struct rd_render_query {
@@ -241,6 +243,7 @@ struct rd_render_query {
 struct rd_render {
    VkRect2D area;
    uint32_t layers, view_mask, color_count, samples;
+   uint32_t view_index; /* during a multiview replay */
    struct rd_render_attachment color[RD_MAX_RTS], depth, stencil;
    /* draws of a secondary command buffer recorded inside a render pass */
    bool continued;
@@ -301,6 +304,7 @@ struct rd_command_buffer {
    bool render_continue;
    struct rd_query_pool *occlusion_pool;
    uint32_t occlusion_query;
+   bool render_barrier;
    /* bound descriptor sets: [0] compute, [1] graphics */
    struct rd_bind_state {
       struct rd_descriptor_set *sets[RD_MAX_SETS];

@@ -225,6 +225,9 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
       .maxComputeWorkGroupCount = {65535, 65535, 65535},
       .maxComputeWorkGroupInvocations = RD_MAX_WORKGROUP_INVOCATIONS,
       .maxComputeWorkGroupSize = {RD_MAX_WORKGROUP_INVOCATIONS, RD_MAX_WORKGROUP_INVOCATIONS, 64},
+      /* multiview: renders replay once per view */
+      .maxMultiviewViewCount = 6,
+      .maxMultiviewInstanceIndex = (1u << 27) - 1,
    };
    fd_get_device_uuid(properties.deviceUUID, &dev_id);
    fd_get_driver_uuid(properties.driverUUID);
@@ -247,6 +250,7 @@ rd_try_create_physical(struct vk_instance *instance, drmDevicePtr drm,
    extensions.KHR_timeline_semaphore = timeline;
    properties.maxTimelineSemaphoreValueDifference = timeline ? UINT64_MAX : 0;
    const struct vk_features features = { .pipelineStatisticsQuery = true, .robustBufferAccess = true,
+      .multiview = true, .occlusionQueryPrecise = true,
       .textureCompressionETC2 = true,
       .storageBuffer16BitAccess = true, .storageBuffer8BitAccess = true, .shaderInt8 = true, .timelineSemaphore = timeline };
    VkResult result = vk_physical_device_init(&physical->vk, instance, &extensions,
