@@ -149,6 +149,21 @@ rd_lower_subpass_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* dFdxFine/dFdyFine: the a5xx has no dsxpp/dsypp (a6xx instructions);
+ * its dsx/dsy differences are taken within the quad row/column of each
+ * pixel, which is what the fine derivatives need. */
+static bool
+rd_lower_fine_derivatives(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic == nir_intrinsic_ddx_fine)
+      intr->intrinsic = nir_intrinsic_ddx;
+   else if (intr->intrinsic == nir_intrinsic_ddy_fine)
+      intr->intrinsic = nir_intrinsic_ddy;
+   else
+      return false;
+   return true;
+}
+
 /* gl_ViewIndex: the driver constant the multiview replay sets per view */
 static bool
 rd_lower_view_index(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -198,6 +213,7 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    }
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, rd_lower_view_index, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, rd_lower_fine_derivatives, nir_metadata_all, NULL);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
