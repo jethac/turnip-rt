@@ -512,6 +512,47 @@ rd_lower_resource(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* Atomic loads and stores of image texels (OpAtomicLoad/OpAtomicStore on an
+ * image) become atomic add-zero and exchange: a plain ldib/stib pair is not
+ * ordered against another wave's access by a fence (memory_model
+ * message_passing with an image guard and atomicwrite failed across waves),
+ * while the atomics go to memory. */
+static bool
+rd_lower_atomic_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if ((intr->intrinsic != nir_intrinsic_image_deref_load &&
+        intr->intrinsic != nir_intrinsic_image_deref_store) ||
+       !(nir_intrinsic_access(intr) & ACCESS_ATOMIC))
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_variable *variable = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+   enum pipe_format format = nir_intrinsic_format(intr);
+   if (format == PIPE_FORMAT_NONE && variable)
+      format = variable->data.image.format;
+   if (format != PIPE_FORMAT_R32_UINT && format != PIPE_FORMAT_R32_SINT)
+      return false;
+   if (intr->intrinsic == nir_intrinsic_image_deref_load) {
+      if (intr->def.bit_size != 32)
+         return false;
+      nir_def *value = nir_image_deref_atomic(b, 32, intr->src[0].ssa, intr->src[1].ssa,
+         intr->src[2].ssa, nir_imm_int(b, 0), .image_dim = nir_intrinsic_image_dim(intr),
+         .image_array = nir_intrinsic_image_array(intr), .format = format,
+         .access = nir_intrinsic_access(intr), .atomic_op = nir_atomic_op_iadd);
+      nir_def *result = intr->def.num_components == 1 ? value :
+         nir_vec4(b, value, nir_imm_int(b, 0), nir_imm_int(b, 0), nir_imm_int(b, 1));
+      nir_def_replace(&intr->def, nir_trim_vector(b, result, intr->def.num_components));
+   } else {
+      if (nir_src_bit_size(intr->src[3]) != 32)
+         return false;
+      nir_image_deref_atomic(b, 32, intr->src[0].ssa, intr->src[1].ssa, intr->src[2].ssa,
+         nir_channel(b, intr->src[3].ssa, 0), .image_dim = nir_intrinsic_image_dim(intr),
+         .image_array = nir_intrinsic_image_array(intr), .format = format,
+         .access = nir_intrinsic_access(intr), .atomic_op = nir_atomic_op_xchg);
+      nir_instr_remove(&intr->instr);
+   }
+   return true;
+}
+
 bool
 rd_nir_lower_compute_resources(nir_shader *shader,
    rd_nir_resource_resolver resolve, void *data,
@@ -526,6 +567,8 @@ rd_nir_lower_compute_resources(nir_shader *shader,
       .fragment = shader->info.stage == MESA_SHADER_FRAGMENT,
       .resolve = resolve, .data = data, .usage = usage,
    };
+   nir_shader_intrinsics_pass(shader, rd_lower_atomic_image_access,
+                              nir_metadata_control_flow, NULL);
    nir_shader_instructions_pass(shader, rd_lower_resource,
                                 nir_metadata_control_flow, &state);
    if (state.failed && debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {

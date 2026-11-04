@@ -3108,7 +3108,53 @@ rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *ren
          tiled_render.depth.view = &tiled_view;
       if (tiled_render.stencil.view)
          tiled_render.stencil.view = &tiled_view;
-      result = rd_execute_render_direct(device, &tiled_render);
+      /* A pipeline barrier inside the render (feedback through an input
+       * attachment) splits it: the draws before it are rendered and the
+       * tiled depth/stencil is stored to the image, so later draws read
+       * it, then rendering continues in the same scratch. */
+      unsigned ndraws = util_dynarray_num_elements(&render->draws, struct rd_draw);
+      const struct rd_draw *draws = util_dynarray_begin(&render->draws);
+      unsigned start = 0;
+      while (result == VK_SUCCESS && start <= ndraws) {
+         unsigned end = start + 1;
+         while (end < ndraws && !draws[end].barrier)
+            end++;
+         if (end > ndraws)
+            end = ndraws;
+         bool last = end >= ndraws;
+         struct rd_render segment = tiled_render;
+         segment.draws.data = (void *)(draws + start);
+         segment.draws.size = segment.draws.capacity = (end - start) * sizeof(struct rd_draw);
+         struct util_dynarray queries;
+         util_dynarray_init(&queries, NULL);
+         util_dynarray_foreach(&render->queries, struct rd_render_query, op) {
+            if (op->draw_index < start || (op->draw_index >= end && !last))
+               continue;
+            struct rd_render_query q = *op;
+            q.draw_index -= start;
+            util_dynarray_append(&queries, q);
+         }
+         segment.queries = queries;
+         if (start) {
+            /* continue from what the scratch holds */
+            segment.depth.load = segment.stencil.load = VK_ATTACHMENT_LOAD_OP_LOAD;
+            for (unsigned i = 0; i < segment.color_count; i++)
+               segment.color[i].load = VK_ATTACHMENT_LOAD_OP_LOAD;
+         }
+         if (!last) {
+            for (unsigned i = 0; i < segment.color_count; i++)
+               segment.color[i].resolve = NULL;
+         }
+         result = rd_execute_render_direct(device, &segment);
+         util_dynarray_fini(&queries);
+         if (result == VK_SUCCESS && !last && area.extent.width && area.extent.height)
+            result = rd_copy_texels(device, &tiled_alias, 0, 0, &linear_alias, level, layer, area,
+                                    has_depth && has_stencil && image->vk.samples == VK_SAMPLE_COUNT_1_BIT ?
+                                    (depth ? 0x7 : 0) | (stencil ? 0x8 : 0) : 0xf);
+         if (last)
+            break;
+         start = end;
+      }
    }
    if (result == VK_SUCCESS && store_mask && area.extent.width && area.extent.height)
       result = rd_copy_texels(device, &tiled_alias, 0, 0, &linear_alias, level, layer, area, store_mask);
