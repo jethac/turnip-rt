@@ -1744,11 +1744,13 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_PKT4(ring, REG_A5XX_PC_PRIMITIVE_CNTL, 1);
    OUT_RING(ring, A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(max_loc) |
                   COND(restart, A5XX_PC_PRIMITIVE_CNTL_PRIMITIVE_RESTART));
-   bool samples_passed = draw->occlusion_pool != NULL;
+   /* No SAMPLES_PASSED bits: the sample counter counts without them in
+    * bypass mode, and with them set a draw stopped rasterizing after its
+    * first 12 vertices (probe: tests/gfx/triangle vbo, TRI_QUADS+TRI_STATS). */
    OUT_PKT4(ring, REG_A5XX_RB_RENDER_CNTL, 1);
-   OUT_RING(ring, 0x8 | COND(samples_passed, A5XX_RB_RENDER_CNTL_SAMPLES_PASSED));
+   OUT_RING(ring, 0x8);
    OUT_PKT4(ring, REG_A5XX_GRAS_SC_CNTL, 1);
-   OUT_RING(ring, 0x8 | COND(samples_passed, A5XX_GRAS_SC_CNTL_SAMPLES_PASSED));
+   OUT_RING(ring, 0x8);
 
    uint32_t initiator = CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(rd_primtype(dyn->ia.primitive_topology)) |
                         CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY);
@@ -2016,10 +2018,17 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          height = MAX2(height, a->view->vk.extent.height);
       }
    }
+   uint32_t samples = render->samples;
    if (!width) {
-      /* a render without attachments rasterizes over its area */
+      /* a render without attachments rasterizes over its area, with the
+       * pipelines' sample count */
       width = render->area.offset.x + render->area.extent.width;
       height = render->area.offset.y + render->area.extent.height;
+      util_dynarray_foreach(&render->draws, struct rd_draw, d) {
+         const struct vk_multisample_state *ms = d->pipeline->gfx->state.ms;
+         if (ms)
+            samples = MAX2(samples, ms->rasterization_samples);
+      }
    }
    if (!width || !util_dynarray_num_elements(&render->draws, struct rd_draw)) {
       util_dynarray_foreach(&render->queries, struct rd_render_query, op)
@@ -2036,7 +2045,7 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    rd_gfx_restore(ring, device);
-   rd_gfx_sysmem_prep(ring, device, render, width, height, render->samples);
+   rd_gfx_sysmem_prep(ring, device, render, width, height, samples);
    VkResult result = VK_SUCCESS;
    /* which draws need the sample counter: occlusion, or a statistics query
     * counting fragment-shader invocations active at that draw */
@@ -2111,7 +2120,6 @@ rd_execute_render_direct(struct rd_device *device, const struct rd_render *rende
          OUT_RING(ring, 0x00000012);
          OUT_WFI5(ring);
       }
-      draw.occlusion_pool = slots[i] >= 0 ? (struct rd_query_pool *)1 : NULL; /* SAMPLES_PASSED */
       if (coverage[i]) {
          /* fragment-shader invocations: count the rasterized samples of the
           * draw with depth/stencil tests off and nothing written (the shader
