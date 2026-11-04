@@ -1,4 +1,5 @@
 #include "rd_private.h"
+#include "util/u_debug.h"
 #include "vk_format.h"
 #include "vk_format_info.h"
 #include "vk_util.h"
@@ -543,6 +544,11 @@ rd_image_layout(struct rd_image *image)
       if (!image->native_layout.size || image->native_layout.size > limit)
          return false;
       image->size = image->native_layout.size;
+      /* The texture unit fetches past the end of small 3D images (IOMMU
+       * faults a few pages after the BO in pipeline.monolithic.image 3d
+       * sampling); give 3D images slack so those reads stay mapped. */
+      if (image->vk.image_type == VK_IMAGE_TYPE_3D)
+         image->size += 64 * 1024;
       for (uint32_t level = 0; level < image->vk.mip_levels; level++) {
          VkExtent3D extent = vk_image_mip_level_extent(&image->vk, level);
          struct rd_image_level *layout = &image->levels[level];
@@ -873,8 +879,16 @@ rd_CreateSampler(VkDevice handle, const VkSamplerCreateInfo *info,
        info->borderColor > VK_BORDER_COLOR_INT_OPAQUE_WHITE ||
        info->compareOp > VK_COMPARE_OP_ALWAYS || info->minLod > info->maxLod ||
        fabsf(info->mipLodBias) > 16.0f ||
-       !isfinite(info->minLod) || !isfinite(info->maxLod) || !isfinite(info->mipLodBias))
+       isnan(info->minLod) || isnan(info->maxLod) || !isfinite(info->mipLodBias)) {
+      /* infinite LOD limits are fine: the descriptor clamps them */
+      if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
+         fprintf(stderr, "radish: sampler refused: flags %x aniso %d filters %d %d mip %d address %d %d %d "
+                 "border %d compare %d lod %f..%f bias %f\n", info->flags, info->anisotropyEnable,
+                 info->magFilter, info->minFilter, info->mipmapMode, info->addressModeU,
+                 info->addressModeV, info->addressModeW, info->borderColor, info->compareOp,
+                 info->minLod, info->maxLod, info->mipLodBias);
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
    struct rd_sampler *sampler = vk_sampler_create(&device->vk, info, allocator, sizeof(*sampler));
    if (!sampler)
       return VK_ERROR_OUT_OF_HOST_MEMORY;

@@ -68,7 +68,7 @@ rd_gfx_upload(struct rd_device *device, struct rd_gfx_shader *shader)
 #define RD_GFX_VIEW_DWORD (RD_GFX_PUSH_DWORDS + 2 * RD_GFX_MAX_BUFFERS)
 #define RD_GFX_CONST_VEC4 ((RD_GFX_VIEW_DWORD + 4) / 4)
 
-struct rd_gfx_lower { bool failed; bool ibo; };
+struct rd_gfx_lower { bool failed; bool ibo; unsigned buffer_count; };
 
 static bool
 rd_gfx_lower_buffer(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -79,19 +79,43 @@ rd_gfx_lower_buffer(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return false;
    switch (intr->intrinsic) {
    case nir_intrinsic_load_ssbo: {
-      if (!nir_src_is_const(intr->src[0]) || intr->def.bit_size != 32 ||
-          nir_src_as_uint(intr->src[0]) >= RD_GFX_MAX_BUFFERS) {
+      if (intr->def.bit_size != 32 ||
+          (nir_src_is_const(intr->src[0]) && nir_src_as_uint(intr->src[0]) >= RD_GFX_MAX_BUFFERS)) {
+         if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
+            fprintf(stderr, "radish: graphics buffer load: bits %u\n", intr->def.bit_size);
          state->failed = true;
          return false;
       }
       b->cursor = nir_before_instr(&intr->instr);
-      unsigned slot = nir_src_as_uint(intr->src[0]);
-      nir_def *address = nir_load_const_ir3(b, 2, 32, nir_imm_int(b, 0),
+      nir_def *address;
+      if (nir_src_is_const(intr->src[0])) {
+         unsigned slot = nir_src_as_uint(intr->src[0]);
+         address = nir_load_const_ir3(b, 2, 32, nir_imm_int(b, 0),
+                                      .base = RD_GFX_PUSH_DWORDS + 2 * slot);
+      } else {
+         /* an index the optimizer could not fold (e.g. through a loop):
+          * select among the buffer addresses */
+         nir_def *index = intr->src[0].ssa;
+         address = nir_load_const_ir3(b, 2, 32, nir_imm_int(b, 0), .base = RD_GFX_PUSH_DWORDS);
+         for (unsigned slot = 1; slot < state->buffer_count; slot++) {
+            nir_def *a = nir_load_const_ir3(b, 2, 32, nir_imm_int(b, 0),
                                             .base = RD_GFX_PUSH_DWORDS + 2 * slot);
-      nir_def *value = nir_load_global_offset(b, intr->def.num_components, 32,
-                                              nir_pack_64_2x32(b, address), intr->src[1].ssa,
-                                              .align_mul = nir_intrinsic_align_mul(intr),
-                                              .align_offset = nir_intrinsic_align_offset(intr));
+            address = nir_bcsel(b, nir_ieq_imm(b, index, slot), a, address);
+         }
+      }
+      nir_def *value;
+      if (nir_src_is_const(intr->src[1])) {
+         value = nir_load_global_offset(b, intr->def.num_components, 32,
+                                        nir_pack_64_2x32(b, address), intr->src[1].ssa,
+                                        .align_mul = nir_intrinsic_align_mul(intr),
+                                        .align_offset = nir_intrinsic_align_offset(intr));
+      } else {
+         /* a dynamic offset (indexed uniform arrays): add it to the address */
+         nir_def *va = nir_iadd(b, nir_pack_64_2x32(b, address), nir_u2u64(b, intr->src[1].ssa));
+         value = nir_load_global(b, intr->def.num_components, 32, va,
+                                 .align_mul = nir_intrinsic_align_mul(intr),
+                                 .align_offset = nir_intrinsic_align_offset(intr));
+      }
       nir_def_replace(&intr->def, value);
       return true;
    }
@@ -220,7 +244,8 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
-   struct rd_gfx_lower lower = { .ibo = nir->info.stage == MESA_SHADER_FRAGMENT };
+   struct rd_gfx_lower lower = { .ibo = nir->info.stage == MESA_SHADER_FRAGMENT,
+                                 .buffer_count = shader->res->buffer_count };
    bool lowered = rd_nir_lower_compute_resources(nir, rd_pipeline_resource, shader->res,
                                                  &shader->res->resource_usage);
    bool buffers = lowered && rd_lower_stage_buffers(nir, shader->res);
