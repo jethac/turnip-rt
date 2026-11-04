@@ -524,12 +524,11 @@ rd_image_layout(struct rd_image *image)
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
    /* Blits and resolves sample the source and render the destination, so
-    * optimal transfer-only images of blittable formats get the native
-    * layout too. */
+    * optimal transfer-only images of any sampleable format (compressed
+    * blit sources included) get the native layout too. */
    if (image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
        (image->vk.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) &&
-       (rd_image_required_blit_src(image->vk.format) || rd_image_required_blit_dst(image->vk.format) ||
-        image->vk.samples != VK_SAMPLE_COUNT_1_BIT))
+       (rd_shader_format_supported(image->vk.format) || image->vk.samples != VK_SAMPLE_COUNT_1_BIT))
       shader = true;
    VkDeviceSize limit = RD_IMAGE_MAX_SIZE;
    if (shader) {
