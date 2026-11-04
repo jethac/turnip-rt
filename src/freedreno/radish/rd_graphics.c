@@ -466,6 +466,13 @@ rd_record_draw(struct rd_command_buffer *command)
       .scissor = dyn->vp.scissors[0],
       .cull = dyn->rs.cull_mode,
       .front = dyn->rs.front_face,
+      .ds = dyn->ds,
+      .cb = dyn->cb,
+      .bias_enable = dyn->rs.depth_bias.enable,
+      .bias_constant = dyn->rs.depth_bias.constant_factor,
+      .bias_clamp = dyn->rs.depth_bias.clamp,
+      .bias_slope = dyn->rs.depth_bias.slope_factor,
+      .line_width = dyn->rs.line.width,
       .index_buffer = command->index_buffer,
       .index_offset = command->index_offset,
       .index_type = command->index_type,
@@ -708,6 +715,66 @@ rd_gfx_restore(struct fd_ringbuffer *ring, struct rd_device *device)
    OUT_RING(ring, 0);
 }
 
+/* Depth (D16, D32F, D24S8 with its interleaved stencil) and a stencil-only
+ * S8 buffer (as a separate stencil). */
+static void
+rd_gfx_depth_buffer(struct fd_ringbuffer *ring, const struct rd_render *render)
+{
+   const struct rd_image_view *dview = render->depth.view ? render->depth.view : render->stencil.view;
+   enum a5xx_depth_format fmt = DEPTH5_NONE;
+   const struct rd_image *image = NULL;
+   const struct rd_image_level *level = NULL;
+   VkDeviceSize offset = 0;
+   bool separate_stencil = false;
+   if (dview) {
+      image = container_of(dview->vk.image, struct rd_image, vk);
+      level = &image->levels[dview->vk.base_mip_level];
+      offset = image->memory_offset + level->offset +
+               (VkDeviceSize)dview->vk.base_array_layer * level->array_pitch;
+      switch (dview->vk.format) {
+      case VK_FORMAT_D16_UNORM: fmt = DEPTH5_16; break;
+      case VK_FORMAT_D32_SFLOAT: fmt = DEPTH5_32; break;
+      case VK_FORMAT_D24_UNORM_S8_UINT:
+      case VK_FORMAT_X8_D24_UNORM_PACK32: fmt = DEPTH5_24_8; break;
+      case VK_FORMAT_S8_UINT: separate_stencil = true; break;
+      default: break;
+      }
+   }
+   OUT_PKT4(ring, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
+   OUT_RING(ring, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(fmt));
+   if (fmt != DEPTH5_NONE) {
+      OUT_RELOC(ring, image->memory->bo, offset, 0, 0);
+      OUT_RING(ring, A5XX_RB_DEPTH_BUFFER_PITCH(level->row_pitch));
+      OUT_RING(ring, A5XX_RB_DEPTH_BUFFER_ARRAY_PITCH(level->array_pitch));
+   } else {
+      for (unsigned i = 0; i < 4; i++)
+         OUT_RING(ring, 0);
+   }
+   OUT_PKT4(ring, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
+   OUT_RING(ring, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(fmt));
+   OUT_PKT4(ring, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
+   OUT_RING(ring, 0);
+   OUT_RING(ring, 0);
+   OUT_RING(ring, 0);
+   OUT_PKT4(ring, REG_A5XX_GRAS_LRZ_BUFFER_BASE, 3);
+   OUT_RING(ring, 0);
+   OUT_RING(ring, 0);
+   OUT_RING(ring, 0);
+   OUT_PKT4(ring, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE, 2);
+   OUT_RING(ring, 0);
+   OUT_RING(ring, 0);
+   if (separate_stencil) {
+      OUT_PKT4(ring, REG_A5XX_RB_STENCIL_INFO, 5);
+      OUT_RING(ring, A5XX_RB_STENCIL_INFO_SEPARATE_STENCIL);
+      OUT_RELOC(ring, image->memory->bo, offset, 0, 0);
+      OUT_RING(ring, A5XX_RB_STENCIL_PITCH(level->row_pitch));
+      OUT_RING(ring, A5XX_RB_STENCIL_ARRAY_PITCH(level->array_pitch));
+   } else {
+      OUT_PKT4(ring, REG_A5XX_RB_STENCIL_INFO, 1);
+      OUT_RING(ring, 0);
+   }
+}
+
 static void
 rd_gfx_sysmem_prep(struct fd_ringbuffer *ring, struct rd_device *device,
                    const struct rd_render *render, uint32_t width, uint32_t height)
@@ -739,19 +806,7 @@ rd_gfx_sysmem_prep(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_PKT7(ring, CP_SET_VISIBILITY_OVERRIDE, 1);
    OUT_RING(ring, 0x1);
 
-   /* No depth/stencil yet. */
-   OUT_PKT4(ring, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
-   OUT_RING(ring, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH5_NONE));
-   for (unsigned i = 0; i < 4; i++)
-      OUT_RING(ring, 0);
-   OUT_PKT4(ring, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO, 1);
-   OUT_RING(ring, A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH5_NONE));
-   OUT_PKT4(ring, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
-   OUT_RING(ring, 0);
-   OUT_RING(ring, 0);
-   OUT_RING(ring, 0);
-   OUT_PKT4(ring, REG_A5XX_RB_STENCIL_INFO, 1);
-   OUT_RING(ring, 0);
+   rd_gfx_depth_buffer(ring, render);
 
    for (unsigned i = 0; i < A5XX_MAX_RENDER_TARGETS; i++) {
       enum a5xx_color_fmt format = 0;
@@ -1233,6 +1288,46 @@ rd_gfx_vertex_buffers(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_RING(ring, A5XX_VFD_CONTROL_0_VTXCNT(j));
 }
 
+static enum adreno_rb_blend_factor
+rd_blend_factor(VkBlendFactor f)
+{
+   switch (f) {
+   case VK_BLEND_FACTOR_ZERO: return FACTOR_ZERO;
+   case VK_BLEND_FACTOR_ONE: return FACTOR_ONE;
+   case VK_BLEND_FACTOR_SRC_COLOR: return FACTOR_SRC_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR: return FACTOR_ONE_MINUS_SRC_COLOR;
+   case VK_BLEND_FACTOR_DST_COLOR: return FACTOR_DST_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR: return FACTOR_ONE_MINUS_DST_COLOR;
+   case VK_BLEND_FACTOR_SRC_ALPHA: return FACTOR_SRC_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return FACTOR_ONE_MINUS_SRC_ALPHA;
+   case VK_BLEND_FACTOR_DST_ALPHA: return FACTOR_DST_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return FACTOR_ONE_MINUS_DST_ALPHA;
+   case VK_BLEND_FACTOR_CONSTANT_COLOR: return FACTOR_CONSTANT_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR: return FACTOR_ONE_MINUS_CONSTANT_COLOR;
+   case VK_BLEND_FACTOR_CONSTANT_ALPHA: return FACTOR_CONSTANT_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA: return FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE: return FACTOR_SRC_ALPHA_SATURATE;
+   case VK_BLEND_FACTOR_SRC1_COLOR: return FACTOR_SRC1_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR: return FACTOR_ONE_MINUS_SRC1_COLOR;
+   case VK_BLEND_FACTOR_SRC1_ALPHA: return FACTOR_SRC1_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA: return FACTOR_ONE_MINUS_SRC1_ALPHA;
+   default: return FACTOR_ZERO;
+   }
+}
+
+static enum a3xx_rb_blend_opcode
+rd_blend_op(VkBlendOp op)
+{
+   switch (op) {
+   case VK_BLEND_OP_ADD: return BLEND_DST_PLUS_SRC;
+   case VK_BLEND_OP_SUBTRACT: return BLEND_SRC_MINUS_DST;
+   case VK_BLEND_OP_REVERSE_SUBTRACT: return BLEND_DST_MINUS_SRC;
+   case VK_BLEND_OP_MIN: return BLEND_MIN_DST_SRC;
+   case VK_BLEND_OP_MAX: return BLEND_MAX_DST_SRC;
+   default: return BLEND_DST_PLUS_SRC;
+   }
+}
+
 static enum pc_di_primtype
 rd_primtype(VkPrimitiveTopology topology)
 {
@@ -1267,16 +1362,50 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    }
    OUT_PKT4(ring, REG_A5XX_RB_RENDER_COMPONENTS, 1);
    OUT_RING(ring, components);
+   /* depth and stencil (VkCompareOp and VkStencilOp map 1:1) */
+   const struct vk_depth_stencil_state *ds = &draw->ds;
+   bool has_depth = render->depth.view && vk_format_has_depth(render->depth.view->vk.format);
+   const struct rd_image_view *sview = render->stencil.view;
+   bool has_stencil = sview && vk_format_has_stencil(sview->vk.format);
+   uint32_t depth_cntl = 0, stencil_cntl = 0, refmask = 0, refmask_bf = 0;
+   if (has_depth && ds->depth.test_enable)
+      depth_cntl |= A5XX_RB_DEPTH_CNTL_ZFUNC((enum adreno_compare_func)ds->depth.compare_op) |
+                    A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE | A5XX_RB_DEPTH_CNTL_Z_READ_ENABLE |
+                    COND(ds->depth.write_enable, A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE);
+   if (has_stencil && ds->stencil.test_enable) {
+      const struct vk_stencil_test_face_state *f = &ds->stencil.front, *b = &ds->stencil.back;
+      stencil_cntl = A5XX_RB_STENCIL_CONTROL_STENCIL_READ | A5XX_RB_STENCIL_CONTROL_STENCIL_ENABLE |
+                     A5XX_RB_STENCIL_CONTROL_STENCIL_ENABLE_BF |
+                     A5XX_RB_STENCIL_CONTROL_FUNC((enum adreno_compare_func)f->op.compare) | A5XX_RB_STENCIL_CONTROL_FAIL((enum adreno_stencil_op)f->op.fail) |
+                     A5XX_RB_STENCIL_CONTROL_ZPASS((enum adreno_stencil_op)f->op.pass) | A5XX_RB_STENCIL_CONTROL_ZFAIL((enum adreno_stencil_op)f->op.depth_fail) |
+                     A5XX_RB_STENCIL_CONTROL_FUNC_BF((enum adreno_compare_func)b->op.compare) | A5XX_RB_STENCIL_CONTROL_FAIL_BF((enum adreno_stencil_op)b->op.fail) |
+                     A5XX_RB_STENCIL_CONTROL_ZPASS_BF((enum adreno_stencil_op)b->op.pass) |
+                     A5XX_RB_STENCIL_CONTROL_ZFAIL_BF((enum adreno_stencil_op)b->op.depth_fail);
+      refmask = A5XX_RB_STENCILREFMASK_STENCILREF(f->reference) |
+                A5XX_RB_STENCILREFMASK_STENCILMASK(f->compare_mask) |
+                A5XX_RB_STENCILREFMASK_STENCILWRITEMASK(f->write_mask);
+      refmask_bf = A5XX_RB_STENCILREFMASK_BF_STENCILREF(b->reference) |
+                   A5XX_RB_STENCILREFMASK_BF_STENCILMASK(b->compare_mask) |
+                   A5XX_RB_STENCILREFMASK_BF_STENCILWRITEMASK(b->write_mask);
+   }
+   bool fragz = gfx->fs.v->no_earlyz || gfx->fs.v->has_kill || gfx->fs.v->writes_pos;
    OUT_PKT4(ring, REG_A5XX_RB_ALPHA_CONTROL, 1);
    OUT_RING(ring, 0);
    OUT_PKT4(ring, REG_A5XX_RB_STENCIL_CONTROL, 1);
-   OUT_RING(ring, 0);
+   OUT_RING(ring, stencil_cntl);
+   OUT_PKT4(ring, REG_A5XX_RB_STENCILREFMASK, 2);
+   OUT_RING(ring, refmask);
+   OUT_RING(ring, refmask_bf);
    OUT_PKT4(ring, REG_A5XX_RB_DEPTH_CNTL, 1);
+   OUT_RING(ring, depth_cntl);
+   OUT_PKT4(ring, REG_A5XX_GRAS_LRZ_CNTL, 1);
    OUT_RING(ring, 0);
    OUT_PKT4(ring, REG_A5XX_RB_DEPTH_PLANE_CNTL, 1);
-   OUT_RING(ring, 0);
+   OUT_RING(ring, COND(fragz, A5XX_RB_DEPTH_PLANE_CNTL_FRAG_WRITES_Z) |
+                  COND(fragz && gfx->fs.v->fragcoord_compmask, A5XX_RB_DEPTH_PLANE_CNTL_UNK1));
    OUT_PKT4(ring, REG_A5XX_GRAS_SU_DEPTH_PLANE_CNTL, 1);
-   OUT_RING(ring, 0);
+   OUT_RING(ring, COND(fragz, A5XX_GRAS_SU_DEPTH_PLANE_CNTL_FRAG_WRITES_Z) |
+                  COND(fragz && gfx->fs.v->fragcoord_compmask, A5XX_GRAS_SU_DEPTH_PLANE_CNTL_UNK1));
 
    /* Scissor: the dynamic or static scissor clipped to the render area. */
    int32_t minx = MAX2(draw->scissor.offset.x, render->area.offset.x);
@@ -1308,7 +1437,8 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
 
    unsigned max_loc = rd_gfx_program(ring, gfx);
 
-   uint32_t su_cntl = A5XX_GRAS_SU_CNTL_LINEHALFWIDTH(dyn->rs.line.width / 2.0f);
+   uint32_t su_cntl = A5XX_GRAS_SU_CNTL_LINEHALFWIDTH(draw->line_width / 2.0f) |
+                      COND(draw->bias_enable, A5XX_GRAS_SU_CNTL_POLY_OFFSET);
    if (draw->cull & VK_CULL_MODE_FRONT_BIT)
       su_cntl |= A5XX_GRAS_SU_CNTL_CULL_FRONT;
    if (draw->cull & VK_CULL_MODE_BACK_BIT)
@@ -1321,9 +1451,9 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_RING(ring, A5XX_GRAS_SU_POINT_MINMAX_MIN(1.0f) | A5XX_GRAS_SU_POINT_MINMAX_MAX(4092.0f));
    OUT_RING(ring, A5XX_GRAS_SU_POINT_SIZE(1.0f));
    OUT_PKT4(ring, REG_A5XX_GRAS_SU_POLY_OFFSET_SCALE, 3);
-   OUT_RING(ring, 0);
-   OUT_RING(ring, 0);
-   OUT_RING(ring, 0);
+   OUT_RING(ring, A5XX_GRAS_SU_POLY_OFFSET_SCALE(draw->bias_enable ? draw->bias_slope : 0));
+   OUT_RING(ring, A5XX_GRAS_SU_POLY_OFFSET_OFFSET(draw->bias_enable ? draw->bias_constant : 0));
+   OUT_RING(ring, A5XX_GRAS_SU_POLY_OFFSET_OFFSET_CLAMP(draw->bias_enable ? draw->bias_clamp : 0));
    OUT_PKT4(ring, REG_A5XX_PC_RASTER_CNTL, 1);
    OUT_RING(ring, 0);
    OUT_PKT4(ring, REG_A5XX_GRAS_CL_CNTL, 1);
@@ -1343,18 +1473,49 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    rd_gfx_consts(ring, device, &gfx->vs, SB4_VS_SHADER, draw, draw->descriptors[0], vertex_base);
    rd_gfx_consts(ring, device, &gfx->fs, SB4_FS_SHADER, draw, draw->descriptors[1], 0);
 
+   /* blending */
+   uint32_t mrt_blend = 0;
    for (unsigned i = 0; i < A5XX_MAX_RENDER_TARGETS; i++) {
-      uint32_t mask = i < MESA_VK_MAX_COLOR_ATTACHMENTS ? dyn->cb.attachments[i].write_mask : 0;
+      const struct vk_color_blend_attachment_state *a =
+         i < draw->cb.attachment_count ? &draw->cb.attachments[i] : NULL;
+      uint32_t mask = a ? a->write_mask : 0;
+      uint32_t control = A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
+                         A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(mask);
+      uint32_t blend = 0;
+      bool is_int = false, has_alpha = true;
+      if (i < render->color_count && render->color[i].view) {
+         enum pipe_format pf = vk_format_to_pipe_format(render->color[i].view->vk.format);
+         is_int = util_format_is_pure_integer(pf);
+         has_alpha = util_format_has_alpha(pf);
+      }
+      if (a && a->blend_enable && !is_int) {
+         blend = A5XX_RB_MRT_BLEND_CONTROL_RGB_SRC_FACTOR(rd_blend_factor(a->src_color_blend_factor)) |
+                 A5XX_RB_MRT_BLEND_CONTROL_RGB_BLEND_OPCODE(rd_blend_op(a->color_blend_op)) |
+                 A5XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR(rd_blend_factor(a->dst_color_blend_factor)) |
+                 A5XX_RB_MRT_BLEND_CONTROL_ALPHA_SRC_FACTOR(rd_blend_factor(a->src_alpha_blend_factor)) |
+                 A5XX_RB_MRT_BLEND_CONTROL_ALPHA_BLEND_OPCODE(rd_blend_op(a->alpha_blend_op)) |
+                 A5XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR(rd_blend_factor(a->dst_alpha_blend_factor));
+         control |= A5XX_RB_MRT_CONTROL_BLEND | COND(has_alpha, A5XX_RB_MRT_CONTROL_BLEND2);
+         mrt_blend |= 1u << i;
+      }
       OUT_PKT4(ring, REG_A5XX_RB_MRT_CONTROL(i), 1);
-      OUT_RING(ring, A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
-                     A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(mask));
+      OUT_RING(ring, control);
       OUT_PKT4(ring, REG_A5XX_RB_MRT_BLEND_CONTROL(i), 1);
-      OUT_RING(ring, 0);
+      OUT_RING(ring, blend);
    }
    OUT_PKT4(ring, REG_A5XX_SP_BLEND_CNTL, 1);
-   OUT_RING(ring, 0);
+   OUT_RING(ring, A5XX_SP_BLEND_CNTL_ENABLE_BLEND(mrt_blend) | A5XX_SP_BLEND_CNTL_UNK8);
    OUT_PKT4(ring, REG_A5XX_RB_BLEND_CNTL, 1);
-   OUT_RING(ring, A5XX_RB_BLEND_CNTL_SAMPLE_MASK(0xffff));
+   OUT_RING(ring, A5XX_RB_BLEND_CNTL_ENABLE_BLEND(mrt_blend) | A5XX_RB_BLEND_CNTL_INDEPENDENT_BLEND |
+                  A5XX_RB_BLEND_CNTL_SAMPLE_MASK(0xffff));
+   const float *bc = draw->cb.blend_constants;
+   OUT_PKT4(ring, REG_A5XX_RB_BLEND_RED, 8);
+   for (unsigned c = 0; c < 4; c++) {
+      OUT_RING(ring, A5XX_RB_BLEND_RED_FLOAT(bc[c]) |
+                     A5XX_RB_BLEND_RED_UINT(CLAMP(bc[c], 0.f, 1.f) * 0xff) |
+                     A5XX_RB_BLEND_RED_SINT(CLAMP(bc[c], -1.f, 1.f) * 0x7f));
+      OUT_RING(ring, A5XX_RB_BLEND_RED_F32(bc[c]));
+   }
 
    const struct rd_pipeline *vres = gfx->vs.res, *fres = gfx->fs.res;
    rd_emit_stage_textures(device, ring, SB4_VS_TEX, vres, draw->descriptors[0]);
@@ -1446,8 +1607,17 @@ rd_resolve_draw_indirect(struct rd_device *device, struct rd_draw *draw)
 VkResult
 rd_execute_render(struct rd_device *device, const struct rd_render *render)
 {
-   if (render->view_mask || render->depth.view || render->stencil.view)
+   if (render->view_mask)
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   for (const struct rd_render_attachment *a = &render->depth; a <= &render->stencil; a++) {
+      if (!a->view)
+         continue;
+      if (a->load == VK_ATTACHMENT_LOAD_OP_CLEAR)
+         return VK_ERROR_FEATURE_NOT_PRESENT; /* load-op clears come with vk_meta */
+      const struct rd_image *image = container_of(a->view->vk.image, struct rd_image, vk);
+      if (!image->memory || image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
    uint32_t width = 0, height = 0;
    for (unsigned i = 0; i < render->color_count; i++) {
       const struct rd_render_attachment *a = &render->color[i];
@@ -1460,6 +1630,12 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
          return VK_ERROR_FEATURE_NOT_PRESENT;
       width = MAX2(width, a->view->vk.extent.width);
       height = MAX2(height, a->view->vk.extent.height);
+   }
+   for (const struct rd_render_attachment *a = &render->depth; a <= &render->stencil; a++) {
+      if (a->view) {
+         width = MAX2(width, a->view->vk.extent.width);
+         height = MAX2(height, a->view->vk.extent.height);
+      }
    }
    if (!width || !util_dynarray_num_elements(&render->draws, struct rd_draw))
       return VK_SUCCESS;

@@ -206,6 +206,10 @@ struct rd_draw {
    VkRect2D scissor;
    VkCullModeFlags cull;
    VkFrontFace front;
+   struct vk_depth_stencil_state ds;
+   struct vk_color_blend_state cb;
+   bool bias_enable;
+   float bias_constant, bias_clamp, bias_slope, line_width;
    struct rd_buffer *vertex_buffers[32];
    VkDeviceSize vertex_offsets[32];
    uint32_t push[32];
