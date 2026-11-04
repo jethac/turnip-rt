@@ -251,6 +251,9 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
       },
    };
    ir3_finalize_nir(device->compiler, &options.nir_options, nir);
+   /* derivatives and implicit-LOD sampling need quad helper invocations
+    * (SP_FS_CTRL_REG0.PIXLODENABLE): gather the info from the final NIR */
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    struct ir3_shader *ir3 = ir3_shader_from_nir(device->compiler, nir, &options);
    if (!ir3)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1243,7 +1246,7 @@ rd_gfx_program(struct fd_ringbuffer *ring, const struct rd_gfx_pipeline *gfx)
                   A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(fs->info.max_half_reg + 1) |
                   A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT(fs->info.max_reg + 1) |
                   A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(fs)) |
-                  COND(fs->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE));
+                  COND(fs->need_pixlod || fs->need_full_quad, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE));
    OUT_PKT4(ring, REG_A5XX_HLSQ_UPDATE_CNTL, 1);
    OUT_RING(ring, 0x020fffff);
    OUT_PKT4(ring, REG_A5XX_VPC_GS_SIV_CNTL, 1);
