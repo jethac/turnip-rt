@@ -505,6 +505,7 @@ static void
 rd_destroy_pipeline(struct rd_device *device, struct rd_pipeline *pipeline,
                      const VkAllocationCallbacks *allocator)
 {
+   rd_gfx_pipeline_destroy(device, pipeline);
    while (pipeline->sampling_variants) {
       struct rd_sampling_entry *entry = pipeline->sampling_variants;
       pipeline->sampling_variants = entry->next;
@@ -660,15 +661,11 @@ rd_DestroyPipeline(VkDevice handle, VkPipeline pipeline_handle,
       rd_destroy_pipeline(device, pipeline, allocator);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-rd_CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
-   const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *allocator,
-   VkPipeline *out)
+void rd_destroy_pipeline_public(struct rd_device *device, struct rd_pipeline *pipeline,
+                                const VkAllocationCallbacks *allocator);
+void
+rd_destroy_pipeline_public(struct rd_device *device, struct rd_pipeline *pipeline,
+                           const VkAllocationCallbacks *allocator)
 {
-   (void)device;
-   (void)cache;
-   (void)infos;
-   (void)allocator;
-   memset(out, 0, count * sizeof(*out));
-   return VK_ERROR_FEATURE_NOT_PRESENT;
+   rd_destroy_pipeline(device, pipeline, allocator);
 }

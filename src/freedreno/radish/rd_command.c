@@ -8,9 +8,13 @@ rd_command_reset(struct vk_command_buffer *base, VkCommandBufferResetFlags flags
    util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
       if (recorded->type == RD_CMD_UPDATE)
          vk_free(&base->pool->alloc, recorded->transfer.data);
+      else if (recorded->type == RD_CMD_RENDER)
+         rd_render_free(command, recorded->render);
    }
    vk_command_buffer_reset(base);
    command->pipeline = NULL;
+   command->gfx_pipeline = NULL;
+   command->render = NULL;
    memset(command->sets, 0, sizeof(command->sets));
    memset(command->dynamic_offsets, 0, sizeof(command->dynamic_offsets));
    memset(command->push, 0, sizeof(command->push));
@@ -25,6 +29,8 @@ rd_command_destroy(struct vk_command_buffer *base)
    util_dynarray_foreach(&command->commands, struct rd_command, recorded) {
       if (recorded->type == RD_CMD_UPDATE)
          vk_free(&base->pool->alloc, recorded->transfer.data);
+      else if (recorded->type == RD_CMD_RENDER)
+         rd_render_free(command, recorded->render);
    }
    util_dynarray_fini(&command->commands);
    vk_command_buffer_finish(base);
@@ -81,11 +87,17 @@ rd_CmdBindPipeline(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
                    VkPipeline pipeline)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
-   if (bind_point != VK_PIPELINE_BIND_POINT_COMPUTE) {
+   struct rd_pipeline *bound = rd_pipeline_from_handle(pipeline);
+   if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && bound->gfx) {
+      command->gfx_pipeline = bound;
+      vk_cmd_set_dynamic_graphics_state(&command->vk, &bound->gfx->dynamic);
+      return;
+   }
+   if (bind_point != VK_PIPELINE_BIND_POINT_COMPUTE || bound->gfx) {
       vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   command->pipeline = rd_pipeline_from_handle(pipeline);
+   command->pipeline = bound;
 }
 
 static void
@@ -326,17 +338,6 @@ rd_command_append(struct rd_command_buffer *command, enum rd_command_type type)
 }
 
 VKAPI_ATTR void VKAPI_CALL
-rd_CmdDraw(VkCommandBuffer commandBuffer,
-   uint32_t vertexCount,
-   uint32_t instanceCount,
-   uint32_t firstVertex,
-   uint32_t firstInstance)
-{
-   VK_FROM_HANDLE(rd_command_buffer, command, commandBuffer);
-   vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-}
-
-VKAPI_ATTR void VKAPI_CALL
 rd_CmdDrawIndexed(VkCommandBuffer commandBuffer,
    uint32_t indexCount,
    uint32_t instanceCount,
@@ -418,57 +419,6 @@ rd_CmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayou
 
 VKAPI_ATTR void VKAPI_CALL
 rd_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *pResolveImageInfo)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo *pRenderPassBegin,
-   VkSubpassContents contents)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo *pRenderPassBegin,
-   const VkSubpassBeginInfo *pSubpassBeginInfo)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdNextSubpass2(VkCommandBuffer commandBuffer, const VkSubpassBeginInfo *pSubpassBeginInfo,
-   const VkSubpassEndInfo *pSubpassEndInfo)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdEndRenderPass(VkCommandBuffer commandBuffer)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo *pSubpassEndInfo)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRenderingInfo)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdEndRendering(VkCommandBuffer commandBuffer)
 {
    RD_GRAPHICS_ONLY(commandBuffer);
 }

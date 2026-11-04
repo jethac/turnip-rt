@@ -323,7 +323,8 @@ rd_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice handle,
    VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out, properties, count);
    vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p) {
       p->queueFamilyProperties = (VkQueueFamilyProperties) {
-         .queueFlags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+         .queueFlags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
+                       (rd_graphics_enabled() ? VK_QUEUE_GRAPHICS_BIT : 0),
          .queueCount = 1,
          .timestampValidBits = 64,
          .minImageTransferGranularity = {1, 1, 1},

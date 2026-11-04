@@ -460,7 +460,7 @@ rd_emit_driver_params(struct fd_ringbuffer *ring, const struct rd_dispatch *disp
    }
 }
 
-static void
+void
 rd_flush(struct rd_device *device, struct fd_ringbuffer *ring)
 {
    uint32_t seqno = ++device->seqno;
@@ -478,7 +478,7 @@ rd_flush(struct rd_device *device, struct fd_ringbuffer *ring)
    rd_trace_submit_end(device, ring);
 }
 
-static VkResult
+VkResult
 rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
                   struct fd_ringbuffer *ring, struct rd_submit_profile *profile,
                   struct rd_gpu_elapsed *sample)
@@ -1480,6 +1480,8 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             result = rd_execute_event(device, recorded->type, &recorded->event);
          } else if (recorded->type >= RD_CMD_QUERY_RESET && recorded->type <= RD_CMD_QUERY_COPY) {
             result = rd_execute_query(device, recorded->type, &recorded->query);
+         } else if (recorded->type == RD_CMD_RENDER) {
+            result = rd_execute_render(device, recorded->render);
          } else {
             result = VK_ERROR_UNKNOWN;
          }

@@ -19,11 +19,13 @@
 #include "vk_pipeline_layout.h"
 #include "vk_command_buffer.h"
 #include "vk_command_pool.h"
+#include "vk_graphics_state.h"
 #include "ir3/ir3_shader.h"
 #include "drm/freedreno_drmif.h"
 #include "common/freedreno_dev_info.h"
 
 struct fd_ringbuffer;
+struct fd_submit;
 
 struct rd_instance { struct vk_instance vk; };
 struct rd_physical_device {
@@ -107,8 +109,20 @@ struct rd_descriptor_set {
    struct rd_set_layout *layout;
    struct rd_descriptor descriptors[];
 };
+struct rd_gfx_shader {
+   struct ir3_shader_variant *v;
+   struct fd_bo *bo;
+};
+/* Graphics part of a pipeline (rd_graphics.c). */
+struct rd_gfx_pipeline {
+   struct rd_gfx_shader vs, fs;
+   struct vk_graphics_pipeline_all_state all;
+   struct vk_graphics_pipeline_state state;
+   struct vk_dynamic_graphics_state dynamic;
+};
 struct rd_pipeline {
    struct vk_object_base base;
+   struct rd_gfx_pipeline *gfx;
    struct vk_pipeline_layout *layout;
    struct ir3_shader_variant *variant;
    struct fd_bo *bo, *private_bo;
@@ -164,6 +178,28 @@ struct rd_query_pool {
    struct rd_query_slot slots[];
 };
 struct rd_event_command { struct rd_event *event; };
+#define RD_MAX_RTS 8
+struct rd_render_attachment {
+   struct rd_image_view *view;
+   VkAttachmentLoadOp load;
+   VkAttachmentStoreOp store;
+   VkClearValue clear;
+};
+struct rd_draw {
+   struct rd_pipeline *pipeline;
+   uint32_t vertex_count, instance_count, first_vertex, first_instance;
+   VkViewport viewport;
+   VkRect2D scissor;
+   VkCullModeFlags cull;
+   VkFrontFace front;
+};
+/* One dynamic-rendering instance: its attachments and its draws. */
+struct rd_render {
+   VkRect2D area;
+   uint32_t layers, view_mask, color_count;
+   struct rd_render_attachment color[RD_MAX_RTS], depth, stencil;
+   struct util_dynarray draws;
+};
 struct rd_query_command {
    struct rd_query_pool *pool;
    struct rd_buffer *dst;
@@ -178,6 +214,7 @@ enum rd_command_type {
    RD_CMD_EVENT_SET, RD_CMD_EVENT_RESET, RD_CMD_EVENT_WAIT,
    RD_CMD_QUERY_RESET, RD_CMD_QUERY_BEGIN, RD_CMD_QUERY_END,
    RD_CMD_QUERY_TIMESTAMP, RD_CMD_QUERY_COPY,
+   RD_CMD_RENDER,
 };
 struct rd_transfer {
    struct rd_buffer *src, *dst;
@@ -193,11 +230,14 @@ struct rd_command {
       struct rd_image_transfer image_transfer;
       struct rd_event_command event;
       struct rd_query_command query;
+      struct rd_render *render;
    };
 };
 struct rd_command_buffer {
    struct vk_command_buffer vk;
    struct rd_pipeline *pipeline;
+   struct rd_pipeline *gfx_pipeline;
+   struct rd_render *render;
    struct rd_descriptor_set *sets[RD_MAX_SETS];
    uint32_t dynamic_offsets[RD_MAX_SETS][RD_MAX_BINDINGS];
    uint8_t set_compatibility[RD_MAX_SETS][RD_MAX_SETS][BLAKE3_OUT_LEN];
@@ -218,6 +258,18 @@ bool rd_shader_format_supported(VkFormat format);
 bool rd_storage_shader_format_supported(VkFormat format);
 bool rd_shader_format_filterable(VkFormat format);
 VkResult rd_init_border_colors(struct rd_device *device);
+/* rd_queue.c, shared with rd_graphics.c */
+void rd_flush(struct rd_device *device, struct fd_ringbuffer *ring);
+struct rd_gpu_elapsed;
+struct rd_submit_profile;
+VkResult rd_finish_submit(struct rd_device *device, struct fd_submit *submit,
+                          struct fd_ringbuffer *ring, struct rd_submit_profile *profile,
+                          struct rd_gpu_elapsed *sample);
+/* rd_graphics.c */
+bool rd_graphics_enabled(void);
+VkResult rd_execute_render(struct rd_device *device, const struct rd_render *render);
+void rd_render_free(struct rd_command_buffer *command, struct rd_render *render);
+void rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline);
 void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4]);
 bool rd_descriptor_ready(const struct rd_descriptor *descriptor);
 void rd_emit_shader_resources(struct rd_device *device, struct fd_ringbuffer *ring,
