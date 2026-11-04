@@ -19,6 +19,9 @@
 #include "compiler/spirv/nir_spirv.h"
 
 #define A5XX_MAX_RENDER_TARGETS 8
+
+void rd_destroy_pipeline_public(struct rd_device *device, struct rd_pipeline *pipeline,
+                                const VkAllocationCallbacks *allocator);
 #include "ir3/ir3_nir.h"
 #include "vk_pipeline.h"
 #include "vk_render_pass.h"
@@ -194,8 +197,7 @@ rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline)
    pipeline->gfx = NULL;
 }
 
-void rd_destroy_pipeline_public(struct rd_device *device, struct rd_pipeline *pipeline,
-                                const VkAllocationCallbacks *allocator);
+
 
 static VkResult
 rd_create_graphics_pipeline(struct rd_device *device, const VkGraphicsPipelineCreateInfo *info,
@@ -286,6 +288,10 @@ rd_render_attachment(struct rd_render_attachment *out, const VkRenderingAttachme
    out->clear = info->clearValue;
 }
 
+static bool rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
+                                VkRect2D rect, int color, VkImageAspectFlags aspects,
+                                VkClearValue value);
+
 VKAPI_ATTR void VKAPI_CALL
 rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
 {
@@ -317,6 +323,23 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
    }
    recorded->render = render;
    command->render = render;
+   /* load-op clears: internal clear draws at the start of the render */
+   for (uint32_t i = 0; i < render->color_count; i++) {
+      if (render->color[i].view && render->color[i].load == VK_ATTACHMENT_LOAD_OP_CLEAR)
+         rd_render_add_clear(command, render, render->area, i, 0, render->color[i].clear);
+   }
+   VkImageAspectFlags ds_aspects = 0;
+   VkClearValue ds_value = {0};
+   if (render->depth.view && render->depth.load == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      ds_aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      ds_value.depthStencil.depth = render->depth.clear.depthStencil.depth;
+   }
+   if (render->stencil.view && render->stencil.load == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      ds_aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+      ds_value.depthStencil.stencil = render->stencil.clear.depthStencil.stencil;
+   }
+   if (ds_aspects)
+      rd_render_add_clear(command, render, render->area, -1, ds_aspects, ds_value);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1612,8 +1635,6 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
    for (const struct rd_render_attachment *a = &render->depth; a <= &render->stencil; a++) {
       if (!a->view)
          continue;
-      if (a->load == VK_ATTACHMENT_LOAD_OP_CLEAR)
-         return VK_ERROR_FEATURE_NOT_PRESENT; /* load-op clears come with vk_meta */
       const struct rd_image *image = container_of(a->view->vk.image, struct rd_image, vk);
       if (!image->memory || image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
          return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -1623,8 +1644,6 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
       const struct rd_render_attachment *a = &render->color[i];
       if (!a->view)
          continue;
-      if (a->load == VK_ATTACHMENT_LOAD_OP_CLEAR)
-         return VK_ERROR_FEATURE_NOT_PRESENT; /* load-op clears come with vk_meta */
       const struct rd_image *image = container_of(a->view->vk.image, struct rd_image, vk);
       if (!image->memory || image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
          return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -1676,4 +1695,198 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
    rd_event(ring, device, PC_CCU_FLUSH_DEPTH_TS, true);
    rd_flush(device, ring);
    return rd_finish_submit(device, submit, ring, NULL, NULL);
+}
+
+/* --- internal clears ------------------------------------------------------ */
+
+/* A clear is an ordinary draw of a rectangle with an internal pipeline: the
+ * vertex shader places the rectangle (push dwords 4..7, NDC) at depth z
+ * (dword 8), the fragment shader writes push dwords 0..3, raw, to every
+ * colour output; write masks, depth and stencil state of the draw pick what
+ * is cleared. Used for load-op clears and vkCmdClearAttachments.
+ */
+static nir_shader *
+rd_clear_vs(struct rd_device *device)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX,
+      ir3_get_compiler_options(device->compiler), "radish-clear-vs");
+   nir_variable *pos = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "pos");
+   pos->data.location = VARYING_SLOT_POS;
+   nir_def *id = nir_load_vertex_id(&b);
+   nir_def *rect = nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 16), .base = 0, .range = 36);
+   nir_def *z = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 32), .base = 0, .range = 36);
+   nir_def *x = nir_bcsel(&b, nir_i2b(&b, nir_iand_imm(&b, id, 1)), nir_channel(&b, rect, 2),
+                          nir_channel(&b, rect, 0));
+   nir_def *y = nir_bcsel(&b, nir_i2b(&b, nir_iand_imm(&b, id, 2)), nir_channel(&b, rect, 3),
+                          nir_channel(&b, rect, 1));
+   nir_store_var(&b, pos, nir_vec4(&b, x, y, z, nir_imm_float(&b, 1.0f)), 0xf);
+   return b.shader;
+}
+
+static nir_shader *
+rd_clear_fs(struct rd_device *device)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      ir3_get_compiler_options(device->compiler), "radish-clear-fs");
+   nir_def *color = nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 0), .base = 0, .range = 36);
+   for (unsigned i = 0; i < RD_MAX_RTS; i++) {
+      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out, glsl_uvec4_type(), "color");
+      out->data.location = FRAG_RESULT_DATA0 + i;
+      out->data.driver_location = i;
+      nir_store_var(&b, out, color, 0xf);
+   }
+   return b.shader;
+}
+
+static struct rd_pipeline *
+rd_clear_pipeline(struct rd_device *device)
+{
+   simple_mtx_lock(&device->meta_mutex);
+   if (!device->clear_pipeline) {
+      VkPipelineShaderStageNirCreateInfoMESA nir_info[2] = {
+         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA, .nir = rd_clear_vs(device) },
+         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA, .nir = rd_clear_fs(device) },
+      };
+      VkPipelineShaderStageCreateInfo stages[2] = {
+         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &nir_info[0],
+           .stage = VK_SHADER_STAGE_VERTEX_BIT, .pName = "main" },
+         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &nir_info[1],
+           .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .pName = "main" },
+      };
+      VkFormat formats[RD_MAX_RTS];
+      VkPipelineColorBlendAttachmentState blend[RD_MAX_RTS];
+      for (unsigned i = 0; i < RD_MAX_RTS; i++) {
+         formats[i] = VK_FORMAT_R8G8B8A8_UNORM;
+         blend[i] = (VkPipelineColorBlendAttachmentState) { .colorWriteMask = 0xf };
+      }
+      VkPipelineRenderingCreateInfo rendering = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+         .colorAttachmentCount = RD_MAX_RTS, .pColorAttachmentFormats = formats,
+         .depthAttachmentFormat = VK_FORMAT_D24_UNORM_S8_UINT,
+         .stencilAttachmentFormat = VK_FORMAT_D24_UNORM_S8_UINT };
+      VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+      VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+      VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+         .viewportCount = 1, .scissorCount = 1 };
+      VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+         .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
+      VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+      VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+      VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+         .attachmentCount = RD_MAX_RTS, .pAttachments = blend };
+      const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+      VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+         .dynamicStateCount = ARRAY_SIZE(dynamic), .pDynamicStates = dynamic };
+      VkPushConstantRange range = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36 };
+      VkPipelineLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+         .pushConstantRangeCount = 1, .pPushConstantRanges = &range };
+      VkPipelineLayout layout;
+      if (device->vk.dispatch_table.CreatePipelineLayout(rd_device_to_handle(device), &lci, NULL,
+                                                         &layout) == VK_SUCCESS) {
+         VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .pNext = &rendering, .stageCount = 2, .pStages = stages, .pVertexInputState = &vi,
+            .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
+            .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
+            .pDynamicState = &dy, .layout = layout };
+         VkPipeline handle;
+         if (rd_create_graphics_pipeline(device, &info, NULL, &handle) == VK_SUCCESS)
+            device->clear_pipeline = rd_pipeline_from_handle(handle);
+         device->vk.dispatch_table.DestroyPipelineLayout(rd_device_to_handle(device), layout, NULL);
+      }
+      ralloc_free(nir_info[0].nir);
+      ralloc_free(nir_info[1].nir);
+   }
+   simple_mtx_unlock(&device->meta_mutex);
+   return device->clear_pipeline;
+}
+
+void
+rd_meta_finish(struct rd_device *device)
+{
+   if (device->clear_pipeline)
+      rd_destroy_pipeline_public(device, device->clear_pipeline, NULL);
+   device->clear_pipeline = NULL;
+}
+
+/* Append a clear of one colour attachment (color >= 0) or of depth/stencil
+ * aspects (color < 0) over rect to the render. */
+static bool
+rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
+                    VkRect2D rect, int color, VkImageAspectFlags aspects, VkClearValue value)
+{
+   struct rd_device *device = container_of(command->vk.base.device, struct rd_device, vk);
+   struct rd_pipeline *pipeline = rd_clear_pipeline(device);
+   if (!pipeline) {
+      vk_command_buffer_set_error(&command->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   if (!rect.extent.width || !rect.extent.height)
+      return true;
+   struct rd_draw draw = {
+      .pipeline = pipeline,
+      .vertex_count = 4, .instance_count = 1,
+      .viewport = { rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height, 0, 1 },
+      .scissor = rect,
+      .cull = VK_CULL_MODE_NONE, .front = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+      .line_width = 1.0f,
+   };
+   draw.cb.attachment_count = RD_MAX_RTS;
+   if (color >= 0) {
+      draw.cb.attachments[color].write_mask = 0xf;
+      memcpy(draw.push, value.color.uint32, 16);
+   }
+   float rect_ndc[4] = { -1, -1, 1, 1 };
+   memcpy(&draw.push[4], rect_ndc, sizeof(rect_ndc));
+   float z = 0;
+   if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+      z = value.depthStencil.depth;
+      draw.ds.depth.test_enable = true;
+      draw.ds.depth.write_enable = true;
+      draw.ds.depth.compare_op = VK_COMPARE_OP_ALWAYS;
+   }
+   memcpy(&draw.push[8], &z, sizeof(z));
+   if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+      draw.ds.stencil.test_enable = true;
+      struct vk_stencil_test_face_state face = {
+         .op = { .fail = VK_STENCIL_OP_REPLACE, .pass = VK_STENCIL_OP_REPLACE,
+                 .depth_fail = VK_STENCIL_OP_REPLACE, .compare = VK_COMPARE_OP_ALWAYS },
+         .compare_mask = 0xff, .write_mask = 0xff, .reference = value.depthStencil.stencil,
+      };
+      draw.ds.stencil.front = draw.ds.stencil.back = face;
+   }
+   util_dynarray_append(&render->draws, draw);
+   return true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdClearAttachments(VkCommandBuffer handle, uint32_t count, const VkClearAttachment *attachments,
+                       uint32_t rect_count, const VkClearRect *rects)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   struct rd_render *render = command->render;
+   if (!render && command->render_continue) {
+      render = command->render = rd_render_new(command);
+      if (!render)
+         return;
+      render->continued = true;
+   }
+   if (!render) {
+      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+   for (uint32_t r = 0; r < rect_count; r++) {
+      if (rects[r].baseArrayLayer || rects[r].layerCount != 1) {
+         /* layered clears come with layered rendering */
+         vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      for (uint32_t i = 0; i < count; i++) {
+         const VkClearAttachment *a = &attachments[i];
+         if (a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
+            rd_render_add_clear(command, render, rects[r].rect, a->colorAttachment, 0, a->clearValue);
+         else
+            rd_render_add_clear(command, render, rects[r].rect, -1, a->aspectMask, a->clearValue);
+      }
+   }
 }

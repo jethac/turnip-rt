@@ -126,6 +126,7 @@ rd_CreateDevice(VkPhysicalDevice handle, const VkDeviceCreateInfo *info,
       goto fail;
    }
    device->compiler->nir_options.lower_device_index_to_zero = true;
+   simple_mtx_init(&device->meta_mutex, mtx_plain);
    rd_trace_init(device);
    result = rd_init_border_colors(device);
    if (result == VK_SUCCESS)
@@ -154,6 +155,8 @@ rd_DestroyDevice(VkDevice handle, const VkAllocationCallbacks *allocator)
    if (!device)
       return;
    vk_queue_finish(&device->queue);
+   rd_meta_finish(device);
+   simple_mtx_destroy(&device->meta_mutex);
    rd_trace_finish(device);
    fd_bo_del(device->border_colors);
    fd_bo_del(device->control);

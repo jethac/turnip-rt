@@ -367,17 +367,6 @@ rd_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
    vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 }
 
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdClearAttachments(VkCommandBuffer commandBuffer,
-   uint32_t attachmentCount,
-   const VkClearAttachment* pAttachments,
-   uint32_t rectCount,
-   const VkClearRect* pRects)
-{
-   VK_FROM_HANDLE(rd_command_buffer, command, commandBuffer);
-   vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-}
-
 /* Graphics-only commands. The only queue family has no VK_QUEUE_GRAPHICS_BIT,
  * so recording any of these is invalid usage. They exist so that a caller
  * that records one anyway gets VK_ERROR_FEATURE_NOT_PRESENT from

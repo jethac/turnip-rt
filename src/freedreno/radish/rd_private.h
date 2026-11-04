@@ -15,6 +15,7 @@
 #include "vk_queue.h"
 #include "vk_query_pool.h"
 #include "util/u_thread.h"
+#include "util/simple_mtx.h"
 #include "vk_descriptor_set_layout.h"
 #include "vk_pipeline_layout.h"
 #include "vk_command_buffer.h"
@@ -55,6 +56,8 @@ struct rd_device {
    struct list_head active_queries;
    uint32_t queue_priority;
    struct rd_trace *trace;
+   simple_mtx_t meta_mutex;
+   struct rd_pipeline *clear_pipeline;
 };
 struct rd_memory {
    struct vk_device_memory vk;
@@ -307,6 +310,7 @@ const struct rd_nir_resource_binding *rd_pipeline_resource(void *data, uint32_t 
 bool rd_lower_stage_buffers(struct nir_shader *nir, struct rd_pipeline *stage);
 /* rd_graphics.c */
 bool rd_graphics_enabled(void);
+void rd_meta_finish(struct rd_device *device);
 VkResult rd_execute_render(struct rd_device *device, const struct rd_render *render);
 void rd_render_free(struct rd_command_buffer *command, struct rd_render *render);
 bool rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *render);
