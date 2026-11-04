@@ -5,7 +5,7 @@ rd_transfer_range(struct rd_command_buffer *command, struct rd_buffer *buffer,
                    VkDeviceSize offset, VkDeviceSize size)
 {
    if (!buffer || offset > buffer->vk.size || size > buffer->vk.size - offset) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return false;
    }
    return true;
@@ -41,7 +41,7 @@ rd_CmdFillBuffer(VkCommandBuffer handle, VkBuffer dst_handle, VkDeviceSize offse
    if (size == VK_WHOLE_SIZE && offset <= dst->vk.size)
       size = (dst->vk.size - offset) & ~3ull;
    if ((offset & 3) || (size & 3)) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
    if (!rd_transfer_range(command, dst, offset, size))
@@ -61,7 +61,7 @@ rd_CmdUpdateBuffer(VkCommandBuffer handle, VkBuffer dst_handle,
    VK_FROM_HANDLE(rd_buffer, dst, dst_handle);
    if (size > 65536 || (offset & 3) || (size & 3) ||
        !rd_transfer_range(command, dst, offset, size)) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
    struct rd_command *recorded = rd_command_append(command, RD_CMD_UPDATE);
@@ -70,7 +70,7 @@ rd_CmdUpdateBuffer(VkCommandBuffer handle, VkBuffer dst_handle,
    void *copy = vk_alloc(&command->vk.pool->alloc, size, 8,
                          VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
    if (!copy) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      rd_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
    memcpy(copy, data, size);

@@ -523,6 +523,14 @@ rd_image_layout(struct rd_image *image)
    bool shader = image->vk.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+   /* Blits and resolves sample the source and render the destination, so
+    * optimal transfer-only images of blittable formats get the native
+    * layout too. */
+   if (image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+       (image->vk.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) &&
+       (rd_image_required_blit_src(image->vk.format) || rd_image_required_blit_dst(image->vk.format) ||
+        image->vk.samples != VK_SAMPLE_COUNT_1_BIT))
+      shader = true;
    VkDeviceSize limit = RD_IMAGE_MAX_SIZE;
    if (shader) {
       const struct fdl_image_params parameters = {
@@ -900,51 +908,10 @@ rd_image_range(const struct rd_image *image, const VkImageSubresourceRange *rang
 bool
 rd_image_barrier_valid(const VkImageMemoryBarrier2 *barrier)
 {
+   /* Images have one layout whatever the Vulkan layout says, so a
+    * transition is only checked for a valid subresource range. */
    VK_FROM_HANDLE(rd_image, image, barrier->image);
-   if (!rd_image_range(image, &barrier->subresourceRange))
-      return false;
-   switch (barrier->oldLayout) {
-   case VK_IMAGE_LAYOUT_UNDEFINED:
-   case VK_IMAGE_LAYOUT_PREINITIALIZED:
-   case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-   case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-   case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-   case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL:
-   case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL:
-   case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
-   case VK_IMAGE_LAYOUT_GENERAL:
-   case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-   case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-      break;
-   default:
-      return false;
-   }
-   if (barrier->newLayout != VK_IMAGE_LAYOUT_GENERAL &&
-       barrier->newLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
-       barrier->newLayout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
-       barrier->newLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL &&
-       barrier->newLayout != VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL &&
-       barrier->newLayout != VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL &&
-       barrier->newLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL &&
-       barrier->newLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
-       barrier->newLayout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-      return false;
-   if ((barrier->srcQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED && barrier->srcQueueFamilyIndex != 0) ||
-       (barrier->dstQueueFamilyIndex != VK_QUEUE_FAMILY_IGNORED && barrier->dstQueueFamilyIndex != 0))
-      return false;
-   return ((barrier->newLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL &&
-            barrier->newLayout != VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL &&
-            barrier->newLayout != VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL) ||
-           (vk_format_is_depth_or_stencil(image->vk.format) &&
-            (image->vk.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) &&
-          (barrier->newLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
-           (image->vk.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
-          (barrier->newLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
-           (image->vk.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))) &&
-          (barrier->newLayout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
-           (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) &&
-          (barrier->newLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL || (image->vk.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) &&
-          (barrier->newLayout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL || (image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT));
+   return rd_image_range(image, &barrier->subresourceRange);
 }
 
 static bool
@@ -995,7 +962,7 @@ static bool
 rd_image_command_valid(struct rd_command_buffer *command, bool valid)
 {
    if (!valid)
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
    return valid;
 }
 

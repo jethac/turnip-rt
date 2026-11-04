@@ -15,6 +15,7 @@ rd_command_reset(struct vk_command_buffer *base, VkCommandBufferResetFlags flags
    command->pipeline = NULL;
    command->gfx_pipeline = NULL;
    command->render = NULL;
+   command->occlusion_pool = NULL;
    for (unsigned i = 0; i < 2; i++) {
       memset(command->bind[i].sets, 0, sizeof(command->bind[i].sets));
       memset(command->bind[i].dynamic_offsets, 0, sizeof(command->bind[i].dynamic_offsets));
@@ -100,7 +101,7 @@ rd_CmdBindPipeline(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
       return;
    }
    if (bind_point != VK_PIPELINE_BIND_POINT_COMPUTE || bound->gfx) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    command->pipeline = bound;
@@ -144,7 +145,7 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
    if ((bind_point != VK_PIPELINE_BIND_POINT_COMPUTE &&
         bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS) ||
        first > RD_MAX_SETS || count > RD_MAX_SETS - first) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, layout);
@@ -174,7 +175,7 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
              binding->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
             continue;
          if (binding->count > dynamic_count - dynamic) {
-            vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+            rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
             return;
          }
          for (uint32_t k = 0; k < binding->count; k++)
@@ -182,7 +183,7 @@ rd_CmdBindDescriptorSets(VkCommandBuffer handle, VkPipelineBindPoint bind_point,
       }
    }
    if (dynamic != dynamic_count)
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -191,7 +192,7 @@ rd_CmdPushConstants(VkCommandBuffer handle, VkPipelineLayout layout,
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    if (offset > 128 || size > 128 - offset) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    /* Push constant values are shared by every stage and bind point. */
@@ -203,7 +204,7 @@ static struct rd_dispatch *
 rd_record_dispatch(struct rd_command_buffer *command)
 {
    if (!command->pipeline) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return NULL;
    }
    struct rd_command *recorded = rd_command_append(command, RD_CMD_DISPATCH);
@@ -221,7 +222,7 @@ rd_record_dispatch(struct rd_command_buffer *command)
       uint32_t index = resource->descriptor_set;
       struct rd_descriptor_set *set = command->bind[0].sets[index];
       if (!set || memcmp(command->bind[0].set_compatibility[index][index], compatibility[index], BLAKE3_OUT_LEN)) {
-         vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+         rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
          return NULL;
       }
       dispatch->sets[index] = set;
@@ -237,7 +238,7 @@ rd_CmdDispatch(VkCommandBuffer handle, uint32_t x, uint32_t y, uint32_t z)
    if (!x || !y || !z)
       return;
    if (x > 65535 || y > 65535 || z > 65535) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    struct rd_dispatch *dispatch = rd_record_dispatch(command);
@@ -255,7 +256,7 @@ rd_CmdDispatchBase(VkCommandBuffer handle, uint32_t bx, uint32_t by, uint32_t bz
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    if (bx >= 65535 || by >= 65535 || bz >= 65535 ||
        x > 65535 - bx || y > 65535 - by || z > 65535 - bz) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    if (!x || !y || !z)
@@ -294,7 +295,7 @@ rd_CmdExecuteCommands(VkCommandBuffer handle, uint32_t count,
             destination->transfer.data = vk_alloc(&primary->vk.pool->alloc,
                source->transfer.size, 8, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
             if (!destination->transfer.data) {
-               vk_command_buffer_set_error(&primary->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+               rd_set_error(&primary->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
                return;
             }
             memcpy(destination->transfer.data, source->transfer.data,
@@ -319,7 +320,7 @@ rd_CmdDispatchIndirect(VkCommandBuffer handle, VkBuffer buffer_handle,
        !(buffer->vk.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) ||
        offset > buffer->vk.size ||
        sizeof(VkDispatchIndirectCommand) > buffer->vk.size - offset) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
    struct rd_dispatch *dispatch = rd_record_dispatch(command);
@@ -335,7 +336,7 @@ rd_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       if (!rd_image_barrier_valid(&info->pImageMemoryBarriers[i])) {
-         vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
    }
@@ -347,59 +348,10 @@ rd_command_append(struct rd_command_buffer *command, enum rd_command_type type)
    struct rd_command *recorded = util_dynarray_grow_bytes(&command->commands,
       1, sizeof(struct rd_command));
    if (!recorded) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      rd_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return NULL;
    }
    memset(recorded, 0, sizeof(*recorded));
    recorded->type = type;
    return recorded;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
-   VkImage image,
-   VkImageLayout imageLayout,
-   const VkClearDepthStencilValue* pDepthStencil,
-   uint32_t rangeCount,
-   const VkImageSubresourceRange* pRanges)
-{
-   VK_FROM_HANDLE(rd_command_buffer, command, commandBuffer);
-   vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-}
-
-/* Graphics-only commands. The only queue family has no VK_QUEUE_GRAPHICS_BIT,
- * so recording any of these is invalid usage. They exist so that a caller
- * that records one anyway gets VK_ERROR_FEATURE_NOT_PRESENT from
- * vkEndCommandBuffer instead of a call through a null pointer.
- */
-#define RD_GRAPHICS_ONLY(cmd) \
-   vk_command_buffer_set_error(&rd_command_buffer_from_handle(cmd)->vk, \
-                               VK_ERROR_FEATURE_NOT_PRESENT)
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
-   VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount,
-   const VkImageBlit *pRegions, VkFilter filter)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdBlitImage2(VkCommandBuffer commandBuffer, const VkBlitImageInfo2 *pBlitImageInfo)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
-   VkImage dstImage, VkImageLayout dstImageLayout, uint32_t regionCount,
-   const VkImageResolve *pRegions)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-rd_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *pResolveImageInfo)
-{
-   RD_GRAPHICS_ONLY(commandBuffer);
 }

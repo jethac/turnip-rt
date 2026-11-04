@@ -1,3 +1,5 @@
+#include "util/u_debug.h"
+#include <stdio.h>
 #include <math.h>
 #include "rd_nir_resources.h"
 #include "compiler/nir/nir_builder.h"
@@ -110,7 +112,8 @@ rd_lower_texture(nir_tex_instr *tex, struct rd_resource_lower *state)
       nir_src_as_deref(tex->src[texture].src), &element);
    if (!entry || (entry->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
                   entry->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
-                  entry->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER))
+                  entry->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
+                  entry->type != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT))
       return false;
    if ((tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) !=
        (entry->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER))
@@ -525,6 +528,22 @@ rd_nir_lower_compute_resources(nir_shader *shader,
    };
    nir_shader_instructions_pass(shader, rd_lower_resource,
                                 nir_metadata_control_flow, &state);
+   if (state.failed && debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
+      nir_foreach_function_impl(impl, shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   !strncmp(nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].name, "image", 5))
+                  fprintf(stderr, "radish: resource lowering left %s\n",
+                          nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].name);
+               else if (instr->type == nir_instr_type_tex)
+                  fprintf(stderr, "radish: resource lowering left tex op %d dim %d array %d\n",
+                          nir_instr_as_tex(instr)->op, nir_instr_as_tex(instr)->sampler_dim,
+                          nir_instr_as_tex(instr)->is_array);
+            }
+         }
+      }
+   }
    if (state.failed)
       return false;
    BITSET_ZERO(shader->info.textures_used);

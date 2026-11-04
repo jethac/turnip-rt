@@ -252,7 +252,8 @@ rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out
       VkExtent3D extent = view->extent;
       out->bo = image->memory->bo;
       out->offset = image->memory_offset + level->offset +
-                    view->base_array_layer * level->array_pitch;
+                    view->base_array_layer *
+                    (image->vk.image_type == VK_IMAGE_TYPE_3D ? level->depth_pitch : level->array_pitch);
       format = view->format;
       samples = image->vk.samples == VK_SAMPLE_COUNT_4_BIT ? MSAA_FOUR : MSAA_ONE;
       out->format = rd_resource_format(format);
@@ -343,6 +344,10 @@ rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out
       A5XX_TEX_CONST_0_SWIZ_Z(rd_resource_swizzle(swizzle[2])) |
       A5XX_TEX_CONST_0_SWIZ_W(rd_resource_swizzle(swizzle[3])) |
       COND(vk_format_is_srgb(format), A5XX_TEX_CONST_0_SRGB);
+   if (descriptor->image_view) {
+      const struct rd_image *image = container_of(descriptor->image_view->vk.image, struct rd_image, vk);
+      out->format_word |= A5XX_TEX_CONST_0_TILE_MODE(image->native_layout.tile_mode);
+   }
    return out->format != TFMT5_NONE;
 }
 
@@ -357,6 +362,7 @@ rd_descriptor_ready(const struct rd_descriptor *descriptor)
          return false;
       FALLTHROUGH;
    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {

@@ -1482,6 +1482,8 @@ rd_queue_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
             result = rd_execute_query(device, recorded->type, &recorded->query);
          } else if (recorded->type == RD_CMD_RENDER) {
             result = rd_execute_render(device, recorded->render);
+         } else if (recorded->type == RD_CMD_BLIT) {
+            result = rd_execute_blit(device, &recorded->blit);
          } else {
             result = VK_ERROR_UNKNOWN;
          }

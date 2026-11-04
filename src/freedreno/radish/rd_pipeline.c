@@ -53,7 +53,8 @@ rd_pipeline_resource(void *data, uint32_t set, uint32_t binding, uint32_t elemen
       found->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
    bool texture = found->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
       found->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
-      found->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+      found->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+      found->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
    bool sampler = found->type == VK_DESCRIPTOR_TYPE_SAMPLER ||
       found->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
    bool image = found->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||

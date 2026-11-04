@@ -95,10 +95,48 @@ rd_gfx_lower_buffer(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       state->failed = true;
       return false;
    default:
-      if (!strncmp(nir_intrinsic_infos[intr->intrinsic].name, "image_", 6))
+      if (!strncmp(nir_intrinsic_infos[intr->intrinsic].name, "image_", 6)) {
+         if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
+            fprintf(stderr, "radish: graphics shader uses %s\n",
+                    nir_intrinsic_infos[intr->intrinsic].name);
          state->failed = true;
+      }
       return false;
    }
+}
+
+/* subpassLoad(ia[, sample]) -> texelFetch(ia, ivec2(gl_FragCoord.xy) + offset[, sample])
+ * on a non-arrayed 2D (or 2D multisample) texture. */
+static bool
+rd_lower_subpass_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_image_deref_load &&
+       intr->intrinsic != nir_intrinsic_image_deref_input_attachment_load)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   enum glsl_sampler_dim dim = glsl_get_sampler_dim(deref->type);
+   if (dim != GLSL_SAMPLER_DIM_SUBPASS && dim != GLSL_SAMPLER_DIM_SUBPASS_MS)
+      return false;
+   bool ms = dim == GLSL_SAMPLER_DIM_SUBPASS_MS;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *pos = nir_f2i32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
+   pos = nir_iadd(b, pos, nir_trim_vector(b, intr->src[1].ssa, 2));
+   nir_tex_instr *tex = nir_tex_instr_create(b->shader, ms ? 3 : 3);
+   tex->op = ms ? nir_texop_txf_ms : nir_texop_txf;
+   tex->sampler_dim = ms ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D;
+   tex->dest_type = nir_intrinsic_dest_type(intr);
+   tex->coord_components = 2;
+   tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, pos);
+   tex->src[1] = ms ? nir_tex_src_for_ssa(nir_tex_src_ms_index, intr->src[2].ssa) :
+                      nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
+   tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(b, &tex->instr);
+   nir_def *result = &tex->def;
+   if (intr->def.num_components != 4)
+      result = nir_trim_vector(b, result, intr->def.num_components);
+   nir_def_replace(&intr->def, result);
+   return true;
 }
 
 static VkResult
@@ -127,6 +165,12 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    }
    shader->res->layout = pipeline->layout;
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      /* subpassLoad: a texel fetch of the input attachment's view at the
+       * fragment's position */
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, rd_lower_subpass_load,
+               nir_metadata_control_flow, NULL);
+   }
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
@@ -135,11 +179,17 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
    struct rd_gfx_lower lower = {0};
-   if (!rd_nir_lower_compute_resources(nir, rd_pipeline_resource, shader->res,
-                                       &shader->res->resource_usage) ||
-       !rd_lower_stage_buffers(nir, shader->res) ||
-       shader->res->resource_usage.image_count ||
+   bool lowered = rd_nir_lower_compute_resources(nir, rd_pipeline_resource, shader->res,
+                                                 &shader->res->resource_usage);
+   bool buffers = lowered && rd_lower_stage_buffers(nir, shader->res);
+   if (!lowered || !buffers || shader->res->resource_usage.image_count ||
        shader->res->buffer_count > RD_GFX_MAX_BUFFERS) {
+      if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
+         fprintf(stderr, "radish: %s shader refused: resources %d buffers %d images %u buffer count %u\n",
+                 mesa_shader_stage_name(nir->info.stage), lowered, buffers,
+                 shader->res->resource_usage.image_count, shader->res->buffer_count);
+         nir_print_shader(nir, stderr);
+      }
       ralloc_free(nir);
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
@@ -225,18 +275,46 @@ rd_create_graphics_pipeline(struct rd_device *device, const VkGraphicsPipelineCr
       else
          result = VK_ERROR_FEATURE_NOT_PRESENT;
    }
-   /* Fragment-less pipelines (depth-only) come later. */
+   if (result == VK_SUCCESS && gfx->state.ms &&
+       gfx->state.ms->rasterization_samples != VK_SAMPLE_COUNT_1_BIT &&
+       gfx->state.ms->rasterization_samples != VK_SAMPLE_COUNT_4_BIT)
+      result = VK_ERROR_FEATURE_NOT_PRESENT;
+   if (result == VK_SUCCESS && gfx->state.ms &&
+       (gfx->state.ms->sample_shading_enable || gfx->state.ms->alpha_to_one_enable))
+      result = VK_ERROR_FEATURE_NOT_PRESENT; /* sampleRateShading, alphaToOne: not advertised */
+   /* A pipeline without a fragment shader (depth only) gets an empty one. */
+   nir_shader *empty_fs = NULL;
+   VkPipelineShaderStageNirCreateInfoMESA empty_nir;
+   VkPipelineShaderStageCreateInfo empty_stage;
+   if (result == VK_SUCCESS && vs && !fs) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+         ir3_get_compiler_options(device->compiler), "radish-empty-fs");
+      empty_fs = b.shader;
+      empty_nir = (VkPipelineShaderStageNirCreateInfoMESA) {
+         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA, .nir = empty_fs };
+      empty_stage = (VkPipelineShaderStageCreateInfo) {
+         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &empty_nir,
+         .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .pName = "main" };
+      fs = &empty_stage;
+   }
    if (result == VK_SUCCESS && (!vs || !fs))
       result = VK_ERROR_FEATURE_NOT_PRESENT;
    if (result == VK_SUCCESS)
       result = rd_gfx_compile(device, pipeline, &gfx->vs, vs, info->flags);
    if (result == VK_SUCCESS)
       result = rd_gfx_compile(device, pipeline, &gfx->fs, fs, info->flags);
+   ralloc_free(empty_fs);
    if (result == VK_SUCCESS) {
       vk_dynamic_graphics_state_init(&gfx->dynamic);
       vk_dynamic_graphics_state_fill(&gfx->dynamic, &gfx->state);
    }
    if (result != VK_SUCCESS) {
+      if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
+         fprintf(stderr, "radish: graphics pipeline refused (%d): stages %u vs %d fs %d samples %d "
+                 "sample shading %d alpha to one %d\n", result, info->stageCount, vs != NULL,
+                 fs != NULL, gfx && gfx->state.ms ? gfx->state.ms->rasterization_samples : 0,
+                 gfx && gfx->state.ms ? gfx->state.ms->sample_shading_enable : 0,
+                 gfx && gfx->state.ms ? gfx->state.ms->alpha_to_one_enable : 0);
       rd_destroy_pipeline_public(device, pipeline, allocator);
       return result;
    }
@@ -274,6 +352,7 @@ rd_render_free(struct rd_command_buffer *command, struct rd_render *render)
       vk_free(&command->vk.pool->alloc, draw->descriptors[1]);
    }
    util_dynarray_fini(&render->draws);
+   util_dynarray_fini(&render->queries);
    vk_free(&command->vk.pool->alloc, render);
 }
 
@@ -283,6 +362,10 @@ rd_render_attachment(struct rd_render_attachment *out, const VkRenderingAttachme
    if (!info || !info->imageView)
       return;
    out->view = rd_image_view_from_handle(info->imageView);
+   if (info->resolveMode != VK_RESOLVE_MODE_NONE && info->resolveImageView) {
+      out->resolve = rd_image_view_from_handle(info->resolveImageView);
+      out->resolve_mode = info->resolveMode;
+   }
    out->load = info->loadOp;
    out->store = info->storeOp;
    out->clear = info->clearValue;
@@ -298,13 +381,13 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    if (command->render || info->colorAttachmentCount > RD_MAX_RTS ||
        (info->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT))) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    struct rd_render *render = vk_zalloc(&command->vk.pool->alloc, sizeof(*render), 8,
                                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!render) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      rd_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
    util_dynarray_init(&render->draws, NULL);
@@ -316,6 +399,11 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
       rd_render_attachment(&render->color[i], &info->pColorAttachments[i]);
    rd_render_attachment(&render->depth, info->pDepthAttachment);
    rd_render_attachment(&render->stencil, info->pStencilAttachment);
+   render->samples = 1;
+   for (const struct rd_render_attachment *a = render->color; a <= &render->stencil; a++) {
+      if (a->view && (a < render->color + render->color_count || a >= &render->depth))
+         render->samples = MAX2(render->samples, a->view->vk.image->samples);
+   }
    struct rd_command *recorded = rd_command_append(command, RD_CMD_RENDER);
    if (!recorded) {
       rd_render_free(command, render);
@@ -356,7 +444,7 @@ rd_CmdBindVertexBuffers2(VkCommandBuffer handle, uint32_t first, uint32_t count,
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    if (first + count > 32 || strides) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    for (uint32_t i = 0; i < count; i++) {
@@ -416,10 +504,11 @@ rd_render_new(struct rd_command_buffer *command)
    struct rd_render *render = vk_zalloc(&command->vk.pool->alloc, sizeof(*render), 8,
                                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!render) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      rd_set_error(&command->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return NULL;
    }
    util_dynarray_init(&render->draws, NULL);
+   util_dynarray_init(&render->queries, NULL);
    struct rd_command *recorded = rd_command_append(command, RD_CMD_RENDER);
    if (!recorded) {
       rd_render_free(command, render);
@@ -450,11 +539,12 @@ rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src
       dst = rd_render_new(primary);
       if (!dst)
          return false;
-      struct util_dynarray draws = dst->draws;
+      struct util_dynarray draws = dst->draws, queries = dst->queries;
       *dst = *src;
       dst->draws = draws;
+      dst->queries = queries;
    } else if (!dst) {
-      vk_command_buffer_set_error(&primary->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&primary->vk, VK_ERROR_UNKNOWN);
       return false;
    }
    util_dynarray_foreach(&src->draws, struct rd_draw, draw) {
@@ -465,6 +555,28 @@ rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *src
                                                  draw->pipeline->gfx->fs.res->resource_count);
       util_dynarray_append(&dst->draws, copy);
    }
+   util_dynarray_foreach(&src->queries, struct rd_render_query, query)
+      util_dynarray_append(&dst->queries, *query);
+   return true;
+}
+
+/* Occlusion query begin/end recorded inside a render pass: kept with the
+ * render, so the slot is reset before its draws run and made available
+ * after. Returns false outside a render. */
+bool
+rd_render_query(struct rd_command_buffer *command, struct rd_query_pool *pool,
+                uint32_t query, bool end)
+{
+   if (!command->render && command->render_continue) {
+      command->render = rd_render_new(command);
+      if (!command->render)
+         return true;
+      command->render->continued = true;
+   }
+   if (!command->render)
+      return false;
+   struct rd_render_query op = { pool, query, end };
+   util_dynarray_append(&command->render->queries, op);
    return true;
 }
 
@@ -479,7 +591,7 @@ rd_record_draw(struct rd_command_buffer *command)
       command->render->continued = true;
    }
    if (!command->render || !pipeline || !pipeline->gfx) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return NULL;
    }
    const struct vk_dynamic_graphics_state *dyn = &command->vk.dynamic_graphics_state;
@@ -496,9 +608,13 @@ rd_record_draw(struct rd_command_buffer *command)
       .bias_clamp = dyn->rs.depth_bias.clamp,
       .bias_slope = dyn->rs.depth_bias.slope_factor,
       .line_width = dyn->rs.line.width,
+      .sample_mask = dyn->ms.sample_mask,
+      .alpha_to_coverage = dyn->ms.alpha_to_coverage_enable,
       .index_buffer = command->index_buffer,
       .index_offset = command->index_offset,
       .index_type = command->index_type,
+      .occlusion_pool = command->occlusion_pool,
+      .occlusion_query = command->occlusion_query,
    };
    memcpy(draw.vertex_buffers, command->vertex_buffers, sizeof(draw.vertex_buffers));
    memcpy(draw.vertex_offsets, command->vertex_offsets, sizeof(draw.vertex_offsets));
@@ -506,7 +622,7 @@ rd_record_draw(struct rd_command_buffer *command)
    if (!rd_copy_stage_descriptors(command, pipeline->gfx->vs.res, &draw.descriptors[0]) ||
        !rd_copy_stage_descriptors(command, pipeline->gfx->fs.res, &draw.descriptors[1])) {
       vk_free(&command->vk.pool->alloc, draw.descriptors[0]);
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return NULL;
    }
    util_dynarray_append(&command->render->draws, draw);
@@ -537,7 +653,7 @@ rd_CmdDrawIndexed(VkCommandBuffer handle, uint32_t index_count, uint32_t instanc
    if (!index_count || !instance_count)
       return;
    if (!command->index_buffer) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
    struct rd_draw *draw = rd_record_draw(command);
@@ -557,7 +673,7 @@ rd_record_indirect(VkCommandBuffer handle, VkBuffer buffer, VkDeviceSize offset,
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    if (indexed && !command->index_buffer) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
    for (uint32_t i = 0; i < count; i++) {
@@ -800,7 +916,8 @@ rd_gfx_depth_buffer(struct fd_ringbuffer *ring, const struct rd_render *render)
 
 static void
 rd_gfx_sysmem_prep(struct fd_ringbuffer *ring, struct rd_device *device,
-                   const struct rd_render *render, uint32_t width, uint32_t height)
+                   const struct rd_render *render, uint32_t width, uint32_t height,
+                   uint32_t nr_samples)
 {
    OUT_PKT7(ring, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
    OUT_RING(ring, 0);
@@ -851,11 +968,12 @@ rd_gfx_sysmem_prep(struct fd_ringbuffer *ring, struct rd_device *device,
          stride = level->row_pitch;
          size = level->array_pitch;
          offset = image->memory_offset + level->offset +
-                  (VkDeviceSize)view->base_array_layer * level->array_pitch;
+                  (VkDeviceSize)view->base_array_layer *
+                  (image->vk.image_type == VK_IMAGE_TYPE_3D ? level->depth_pitch : level->array_pitch);
       }
       OUT_PKT4(ring, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
       OUT_RING(ring, A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(format) |
-                     A5XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE(TILE5_LINEAR) |
+                     A5XX_RB_MRT_BUF_INFO_COLOR_TILE_MODE(image ? image->native_layout.tile_mode : TILE5_LINEAR) |
                      A5XX_RB_MRT_BUF_INFO_COLOR_SWAP(swap) |
                      COND(srgb, A5XX_RB_MRT_BUF_INFO_COLOR_SRGB));
       OUT_RING(ring, A5XX_RB_MRT_PITCH(stride));
@@ -876,18 +994,20 @@ rd_gfx_sysmem_prep(struct fd_ringbuffer *ring, struct rd_device *device,
          OUT_RING(ring, 0);
    }
 
-   enum a3xx_msaa_samples samples = MSAA_ONE;
+   enum a3xx_msaa_samples samples = nr_samples == 4 ? MSAA_FOUR : MSAA_ONE;
+   bool single = samples == MSAA_ONE;
    OUT_PKT4(ring, REG_A5XX_TPL1_TP_RAS_MSAA_CNTL, 2);
    OUT_RING(ring, A5XX_TPL1_TP_RAS_MSAA_CNTL_SAMPLES(samples));
    OUT_RING(ring, A5XX_TPL1_TP_DEST_MSAA_CNTL_SAMPLES(samples) |
-                  A5XX_TPL1_TP_DEST_MSAA_CNTL_MSAA_DISABLE);
+                  COND(single, A5XX_TPL1_TP_DEST_MSAA_CNTL_MSAA_DISABLE));
    OUT_PKT4(ring, REG_A5XX_RB_RAS_MSAA_CNTL, 2);
    OUT_RING(ring, A5XX_RB_RAS_MSAA_CNTL_SAMPLES(samples));
-   OUT_RING(ring, A5XX_RB_DEST_MSAA_CNTL_SAMPLES(samples) | A5XX_RB_DEST_MSAA_CNTL_MSAA_DISABLE);
+   OUT_RING(ring, A5XX_RB_DEST_MSAA_CNTL_SAMPLES(samples) |
+                  COND(single, A5XX_RB_DEST_MSAA_CNTL_MSAA_DISABLE));
    OUT_PKT4(ring, REG_A5XX_GRAS_SC_RAS_MSAA_CNTL, 2);
    OUT_RING(ring, A5XX_GRAS_SC_RAS_MSAA_CNTL_SAMPLES(samples));
    OUT_RING(ring, A5XX_GRAS_SC_DEST_MSAA_CNTL_SAMPLES(samples) |
-                  A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE);
+                  COND(single, A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE));
 }
 
 static void
@@ -1461,7 +1581,8 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    unsigned max_loc = rd_gfx_program(ring, gfx);
 
    uint32_t su_cntl = A5XX_GRAS_SU_CNTL_LINEHALFWIDTH(draw->line_width / 2.0f) |
-                      COND(draw->bias_enable, A5XX_GRAS_SU_CNTL_POLY_OFFSET);
+                      COND(draw->bias_enable, A5XX_GRAS_SU_CNTL_POLY_OFFSET) |
+                      A5XX_GRAS_SU_CNTL_LINE_MODE(render->samples > 1 ? RECTANGULAR : BRESENHAM);
    if (draw->cull & VK_CULL_MODE_FRONT_BIT)
       su_cntl |= A5XX_GRAS_SU_CNTL_CULL_FRONT;
    if (draw->cull & VK_CULL_MODE_BACK_BIT)
@@ -1527,10 +1648,12 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
       OUT_RING(ring, blend);
    }
    OUT_PKT4(ring, REG_A5XX_SP_BLEND_CNTL, 1);
-   OUT_RING(ring, A5XX_SP_BLEND_CNTL_ENABLE_BLEND(mrt_blend) | A5XX_SP_BLEND_CNTL_UNK8);
+   OUT_RING(ring, A5XX_SP_BLEND_CNTL_ENABLE_BLEND(mrt_blend) | A5XX_SP_BLEND_CNTL_UNK8 |
+                  COND(draw->alpha_to_coverage, A5XX_SP_BLEND_CNTL_ALPHA_TO_COVERAGE));
    OUT_PKT4(ring, REG_A5XX_RB_BLEND_CNTL, 1);
    OUT_RING(ring, A5XX_RB_BLEND_CNTL_ENABLE_BLEND(mrt_blend) | A5XX_RB_BLEND_CNTL_INDEPENDENT_BLEND |
-                  A5XX_RB_BLEND_CNTL_SAMPLE_MASK(0xffff));
+                  COND(draw->alpha_to_coverage, A5XX_RB_BLEND_CNTL_ALPHA_TO_COVERAGE) |
+                  A5XX_RB_BLEND_CNTL_SAMPLE_MASK(render->samples > 1 ? draw->sample_mask : 0xffff));
    const float *bc = draw->cb.blend_constants;
    OUT_PKT4(ring, REG_A5XX_RB_BLEND_RED, 8);
    for (unsigned c = 0; c < 4; c++) {
@@ -1561,10 +1684,11 @@ rd_gfx_draw(struct fd_ringbuffer *ring, struct rd_device *device,
    OUT_PKT4(ring, REG_A5XX_PC_PRIMITIVE_CNTL, 1);
    OUT_RING(ring, A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(max_loc) |
                   COND(restart, A5XX_PC_PRIMITIVE_CNTL_PRIMITIVE_RESTART));
+   bool samples_passed = draw->occlusion_pool != NULL;
    OUT_PKT4(ring, REG_A5XX_RB_RENDER_CNTL, 1);
-   OUT_RING(ring, 0x8);
+   OUT_RING(ring, 0x8 | COND(samples_passed, A5XX_RB_RENDER_CNTL_SAMPLES_PASSED));
    OUT_PKT4(ring, REG_A5XX_GRAS_SC_CNTL, 1);
-   OUT_RING(ring, 0x8);
+   OUT_RING(ring, 0x8 | COND(samples_passed, A5XX_GRAS_SC_CNTL_SAMPLES_PASSED));
 
    uint32_t initiator = CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(rd_primtype(dyn->ia.primitive_topology)) |
                         CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY);
@@ -1627,8 +1751,62 @@ rd_resolve_draw_indirect(struct rd_device *device, struct rd_draw *draw)
    return VK_SUCCESS;
 }
 
+static void
+rd_sample_count(struct fd_ringbuffer *ring, struct rd_device *device, struct fd_bo *bo,
+                uint32_t offset)
+{
+   OUT_PKT4(ring, REG_A5XX_RB_SAMPLE_COUNT_CONTROL, 1);
+   OUT_RING(ring, A5XX_RB_SAMPLE_COUNT_CONTROL_COPY);
+   OUT_PKT4(ring, REG_A5XX_RB_SAMPLE_COUNT_ADDR, 2);
+   OUT_RELOC(ring, bo, offset, 0, 0);
+   rd_event(ring, device, ZPASS_DONE, false);
+   OUT_WFI5(ring);
+}
+
+static void
+rd_render_query_begins(const struct rd_render *render)
+{
+   util_dynarray_foreach(&render->queries, struct rd_render_query, op) {
+      if (op->end)
+         continue;
+      struct rd_query_slot *slot = &op->pool->slots[op->query];
+      mtx_lock(&op->pool->mutex);
+      memset(slot->values, 0, sizeof(slot->values));
+      slot->available = false;
+      mtx_unlock(&op->pool->mutex);
+   }
+}
+
+static void
+rd_render_query_ends(const struct rd_render *render)
+{
+   util_dynarray_foreach(&render->queries, struct rd_render_query, op) {
+      if (!op->end)
+         continue;
+      struct rd_query_slot *slot = &op->pool->slots[op->query];
+      mtx_lock(&op->pool->mutex);
+      slot->available = true;
+      cnd_broadcast(&op->pool->condition);
+      mtx_unlock(&op->pool->mutex);
+   }
+}
+
+static VkResult rd_render_resolves(struct rd_device *device, const struct rd_render *render);
+static VkResult rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *render);
+
+static VkResult
+rd_execute_render_direct(struct rd_device *device, const struct rd_render *render);
+
 VkResult
 rd_execute_render(struct rd_device *device, const struct rd_render *render)
+{
+   if (render->depth.view || render->stencil.view)
+      return rd_execute_render_tiled_ds(device, render);
+   return rd_execute_render_direct(device, render);
+}
+
+static VkResult
+rd_execute_render_direct(struct rd_device *device, const struct rd_render *render)
 {
    if (render->view_mask)
       return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -1636,7 +1814,7 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
       if (!a->view)
          continue;
       const struct rd_image *image = container_of(a->view->vk.image, struct rd_image, vk);
-      if (!image->memory || image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
+      if (!image->memory || image->vk.samples != render->samples)
          return VK_ERROR_FEATURE_NOT_PRESENT;
    }
    uint32_t width = 0, height = 0;
@@ -1645,7 +1823,7 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
       if (!a->view)
          continue;
       const struct rd_image *image = container_of(a->view->vk.image, struct rd_image, vk);
-      if (!image->memory || image->vk.samples != VK_SAMPLE_COUNT_1_BIT)
+      if (!image->memory || image->vk.samples != render->samples)
          return VK_ERROR_FEATURE_NOT_PRESENT;
       width = MAX2(width, a->view->vk.extent.width);
       height = MAX2(height, a->view->vk.extent.height);
@@ -1656,8 +1834,10 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
          height = MAX2(height, a->view->vk.extent.height);
       }
    }
-   if (!width || !util_dynarray_num_elements(&render->draws, struct rd_draw))
+   if (!width)
       return VK_SUCCESS;
+   if (!util_dynarray_num_elements(&render->draws, struct rd_draw))
+      return rd_render_resolves(device, render);
    struct fd_submit *submit = fd_submit_new(device->pipe);
    if (!submit)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1668,8 +1848,26 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    rd_gfx_restore(ring, device);
-   rd_gfx_sysmem_prep(ring, device, render, width, height);
+   rd_gfx_sysmem_prep(ring, device, render, width, height, render->samples);
    VkResult result = VK_SUCCESS;
+   /* occlusion: the sample counter is copied before and after each counted
+    * draw (16-byte aligned 64-bit values); the CPU adds the differences to
+    * the query once the submit is done */
+   unsigned counted = 0;
+   util_dynarray_foreach(&render->draws, struct rd_draw, recorded)
+      counted += recorded->occlusion_pool != NULL;
+   struct fd_bo *counters = NULL;
+   if (counted) {
+      counters = fd_bo_new(device->fd, align(counted * 32, 4096), 0, "radish-occlusion");
+      if (!counters) {
+         fd_ringbuffer_del(ring);
+         fd_submit_del(submit);
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
+      memset(fd_bo_map(counters), 0, counted * 32);
+   }
+   rd_render_query_begins(render);
+   unsigned counter = 0;
    util_dynarray_foreach(&render->draws, struct rd_draw, recorded) {
       struct rd_draw draw = *recorded;
       if (draw.indirect && (result = rd_resolve_draw_indirect(device, &draw)) != VK_SUCCESS)
@@ -1682,9 +1880,17 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
       }
       fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->vs.bo);
       fd_ringbuffer_attach_bo(ring, draw.pipeline->gfx->fs.bo);
+      if (draw.occlusion_pool)
+         rd_sample_count(ring, device, counters, (counter * 2) * 16);
       rd_gfx_draw(ring, device, render, &draw);
+      if (draw.occlusion_pool) {
+         rd_sample_count(ring, device, counters, (counter * 2 + 1) * 16);
+         counter++;
+      }
    }
    if (result != VK_SUCCESS) {
+      if (counters)
+         fd_bo_del(counters);
       fd_ringbuffer_del(ring);
       fd_submit_del(submit);
       return result;
@@ -1694,7 +1900,30 @@ rd_execute_render(struct rd_device *device, const struct rd_render *render)
    rd_event(ring, device, PC_CCU_FLUSH_COLOR_TS, true);
    rd_event(ring, device, PC_CCU_FLUSH_DEPTH_TS, true);
    rd_flush(device, ring);
-   return rd_finish_submit(device, submit, ring, NULL, NULL);
+   result = rd_finish_submit(device, submit, ring, NULL, NULL);
+   if (counters) {
+      if (result == VK_SUCCESS) {
+         const uint64_t *values = fd_bo_map(counters);
+         unsigned i = 0;
+         util_dynarray_foreach(&render->draws, struct rd_draw, recorded) {
+            if (!recorded->occlusion_pool)
+               continue;
+            struct rd_query_pool *pool = recorded->occlusion_pool;
+            if (recorded->vertex_count && recorded->instance_count) {
+               uint64_t passed = values[(i * 2 + 1) * 2] - values[(i * 2) * 2];
+               mtx_lock(&pool->mutex);
+               pool->slots[recorded->occlusion_query].values[0] += passed;
+               mtx_unlock(&pool->mutex);
+            }
+            i++;
+         }
+      }
+      fd_bo_del(counters);
+   }
+   rd_render_query_ends(render);
+   if (result != VK_SUCCESS)
+      return result;
+   return rd_render_resolves(device, render);
 }
 
 /* --- internal clears ------------------------------------------------------ */
@@ -1807,29 +2036,34 @@ rd_meta_finish(struct rd_device *device)
    if (device->clear_pipeline)
       rd_destroy_pipeline_public(device, device->clear_pipeline, NULL);
    device->clear_pipeline = NULL;
+   for (unsigned i = 0; i < ARRAY_SIZE(device->resolve_pipeline); i++) {
+      if (device->resolve_pipeline[i])
+         rd_destroy_pipeline_public(device, device->resolve_pipeline[i], NULL);
+      device->resolve_pipeline[i] = NULL;
+   }
+   if (device->copy_texel_pipeline)
+      rd_destroy_pipeline_public(device, device->copy_texel_pipeline, NULL);
+   device->copy_texel_pipeline = NULL;
+   for (unsigned i = 0; i < ARRAY_SIZE(device->blit_pipeline); i++) {
+      if (device->blit_pipeline[i])
+         rd_destroy_pipeline_public(device, device->blit_pipeline[i], NULL);
+      device->blit_pipeline[i] = NULL;
+   }
 }
 
 /* Append a clear of one colour attachment (color >= 0) or of depth/stencil
  * aspects (color < 0) over rect to the render. */
-static bool
-rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
-                    VkRect2D rect, int color, VkImageAspectFlags aspects, VkClearValue value)
+static void
+rd_clear_draw(struct rd_pipeline *pipeline, VkRect2D rect, int color, VkImageAspectFlags aspects,
+              VkClearValue value, struct rd_draw *out)
 {
-   struct rd_device *device = container_of(command->vk.base.device, struct rd_device, vk);
-   struct rd_pipeline *pipeline = rd_clear_pipeline(device);
-   if (!pipeline) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-      return false;
-   }
-   if (!rect.extent.width || !rect.extent.height)
-      return true;
    struct rd_draw draw = {
       .pipeline = pipeline,
       .vertex_count = 4, .instance_count = 1,
       .viewport = { rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height, 0, 1 },
       .scissor = rect,
       .cull = VK_CULL_MODE_NONE, .front = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-      .line_width = 1.0f,
+      .line_width = 1.0f, .sample_mask = 0xffff,
    };
    draw.cb.attachment_count = RD_MAX_RTS;
    if (color >= 0) {
@@ -1855,6 +2089,23 @@ rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
       };
       draw.ds.stencil.front = draw.ds.stencil.back = face;
    }
+   *out = draw;
+}
+
+static bool
+rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
+                    VkRect2D rect, int color, VkImageAspectFlags aspects, VkClearValue value)
+{
+   struct rd_device *device = container_of(command->vk.base.device, struct rd_device, vk);
+   struct rd_pipeline *pipeline = rd_clear_pipeline(device);
+   if (!pipeline) {
+      rd_set_error(&command->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   if (!rect.extent.width || !rect.extent.height)
+      return true;
+   struct rd_draw draw;
+   rd_clear_draw(pipeline, rect, color, aspects, value, &draw);
    util_dynarray_append(&render->draws, draw);
    return true;
 }
@@ -1872,13 +2123,13 @@ rd_CmdClearAttachments(VkCommandBuffer handle, uint32_t count, const VkClearAtta
       render->continued = true;
    }
    if (!render) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
    for (uint32_t r = 0; r < rect_count; r++) {
       if (rects[r].baseArrayLayer || rects[r].layerCount != 1) {
          /* layered clears come with layered rendering */
-         vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
       for (uint32_t i = 0; i < count; i++) {
@@ -1889,4 +2140,728 @@ rd_CmdClearAttachments(VkCommandBuffer handle, uint32_t count, const VkClearAtta
             rd_render_add_clear(command, render, rects[r].rect, -1, a->aspectMask, a->clearValue);
       }
    }
+}
+
+/* --- resolves --------------------------------------------------------------- */
+
+/* Resolve: an internal render of the destination view with one rectangle
+ * whose fragment shader fetches the samples of the source at its own pixel
+ * (texelFetch of a multisampled sampled image): the average for float and
+ * normalized formats, sample 0 for integers or SAMPLE_ZERO. Variants: 0
+ * float average, 1 float sample 0, 2 int, 3 uint. */
+static nir_shader *
+rd_resolve_fs(struct rd_device *device, unsigned variant)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      ir3_get_compiler_options(device->compiler), "radish-resolve-fs");
+   enum glsl_base_type base = variant == 2 ? GLSL_TYPE_INT : variant == 3 ? GLSL_TYPE_UINT :
+                              GLSL_TYPE_FLOAT;
+   nir_alu_type dest = variant == 2 ? nir_type_int32 : variant == 3 ? nir_type_uint32 :
+                       nir_type_float32;
+   const struct glsl_type *ttype = glsl_texture_type(GLSL_SAMPLER_DIM_MS, false, base);
+   nir_variable *tex = nir_variable_create(b.shader, nir_var_uniform, ttype, "src");
+   tex->data.descriptor_set = 0;
+   tex->data.binding = 0;
+   nir_deref_instr *deref = nir_build_deref_var(&b, tex);
+   nir_def *coord = nir_f2i32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
+   coord = nir_iadd(&b, coord, nir_load_push_constant(&b, 2, 32, nir_imm_int(&b, 0), .base = 0, .range = 48));
+   unsigned count = variant == 0 ? 4 : 1;
+   nir_def *sum = NULL;
+   for (unsigned i = 0; i < count; i++) {
+      nir_tex_instr *t = nir_tex_instr_create(b.shader, 3);
+      t->op = nir_texop_txf_ms;
+      t->sampler_dim = GLSL_SAMPLER_DIM_MS;
+      t->dest_type = dest;
+      t->coord_components = 2;
+      t->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+      t->src[1] = nir_tex_src_for_ssa(nir_tex_src_ms_index, nir_imm_int(&b, i));
+      t->src[2] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
+      nir_def_init(&t->instr, &t->def, 4, 32);
+      nir_builder_instr_insert(&b, &t->instr);
+      sum = sum ? nir_fadd(&b, sum, &t->def) : &t->def;
+   }
+   if (count > 1)
+      sum = nir_fmul_imm(&b, sum, 1.0 / count);
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+      glsl_vector_type(base, 4), "color");
+   out->data.location = FRAG_RESULT_DATA0;
+   nir_store_var(&b, out, sum, 0xf);
+   return b.shader;
+}
+
+/* An internal pipeline: the clear vertex shader (a rectangle from push
+ * constants) and a fragment shader reading binding 0 of set 0. */
+static struct rd_pipeline *
+rd_meta_pipeline(struct rd_device *device, struct rd_pipeline **slot,
+                 nir_shader *(*make_fs)(struct rd_device *, unsigned), unsigned variant,
+                 VkDescriptorType type)
+{
+   simple_mtx_lock(&device->meta_mutex);
+   if (!*slot) {
+      VkPipelineShaderStageNirCreateInfoMESA nir_info[2] = {
+         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA, .nir = rd_clear_vs(device) },
+         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA, .nir = make_fs(device, variant) },
+      };
+      VkPipelineShaderStageCreateInfo stages[2] = {
+         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &nir_info[0],
+           .stage = VK_SHADER_STAGE_VERTEX_BIT, .pName = "main" },
+         { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &nir_info[1],
+           .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .pName = "main" },
+      };
+      VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+      VkPipelineColorBlendAttachmentState blend = { .colorWriteMask = 0xf };
+      VkPipelineRenderingCreateInfo rendering = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+         .colorAttachmentCount = 1, .pColorAttachmentFormats = &format };
+      VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+      VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+      VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+         .viewportCount = 1, .scissorCount = 1 };
+      VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+         .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
+      VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+      VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+         .attachmentCount = 1, .pAttachments = &blend };
+      const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+      VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+         .dynamicStateCount = ARRAY_SIZE(dynamic), .pDynamicStates = dynamic };
+      VkDescriptorSetLayoutBinding binding = { 0, type, 1,
+                                               VK_SHADER_STAGE_FRAGMENT_BIT };
+      VkDescriptorSetLayoutCreateInfo slci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+         .bindingCount = 1, .pBindings = &binding };
+      VkPushConstantRange range = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48 };
+      VkDevice dev = rd_device_to_handle(device);
+      const struct vk_device_dispatch_table *disp = &device->vk.dispatch_table;
+      VkDescriptorSetLayout set_layout;
+      VkPipelineLayout layout;
+      if (disp->CreateDescriptorSetLayout(dev, &slci, NULL, &set_layout) == VK_SUCCESS) {
+         VkPipelineLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1, .pSetLayouts = &set_layout,
+            .pushConstantRangeCount = 1, .pPushConstantRanges = &range };
+         if (disp->CreatePipelineLayout(dev, &lci, NULL, &layout) == VK_SUCCESS) {
+            VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+               .pNext = &rendering, .stageCount = 2, .pStages = stages, .pVertexInputState = &vi,
+               .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
+               .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &dy,
+               .layout = layout };
+            VkPipeline handle;
+            if (rd_create_graphics_pipeline(device, &info, NULL, &handle) == VK_SUCCESS)
+               *slot = rd_pipeline_from_handle(handle);
+            disp->DestroyPipelineLayout(dev, layout, NULL);
+         }
+         disp->DestroyDescriptorSetLayout(dev, set_layout, NULL);
+      }
+      ralloc_free(nir_info[0].nir);
+      ralloc_free(nir_info[1].nir);
+   }
+   simple_mtx_unlock(&device->meta_mutex);
+   return *slot;
+}
+
+static struct rd_pipeline *
+rd_resolve_pipeline(struct rd_device *device, unsigned variant)
+{
+   return rd_meta_pipeline(device, &device->resolve_pipeline[variant], rd_resolve_fs, variant,
+                           VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+}
+
+/* Resolve src (multisampled) into dst over area; both views of one layer. */
+static VkResult
+rd_resolve_view(struct rd_device *device, struct rd_image_view *src, struct rd_image_view *dst,
+                VkRect2D area, VkResolveModeFlagBits mode, int32_t dx, int32_t dy)
+{
+   enum pipe_format pf = vk_format_to_pipe_format(dst->vk.format);
+   unsigned variant = util_format_is_pure_sint(pf) ? 2 : util_format_is_pure_uint(pf) ? 3 :
+                      mode == VK_RESOLVE_MODE_SAMPLE_ZERO_BIT ? 1 : 0;
+   if (vk_format_is_depth_or_stencil(dst->vk.format))
+      return VK_ERROR_FEATURE_NOT_PRESENT; /* depth/stencil resolve: not in 1.1 core */
+   struct rd_pipeline *pipeline = rd_resolve_pipeline(device, variant);
+   if (!pipeline)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct rd_descriptor descriptor = { .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .image_view = src };
+   struct rd_render render = {
+      .area = area, .layers = 1, .color_count = 1, .samples = 1,
+      .color[0] = { .view = dst, .load = VK_ATTACHMENT_LOAD_OP_LOAD,
+                    .store = VK_ATTACHMENT_STORE_OP_STORE },
+   };
+   util_dynarray_init(&render.draws, NULL);
+   struct rd_draw draw = {
+      .pipeline = pipeline, .vertex_count = 4, .instance_count = 1,
+      .viewport = { area.offset.x, area.offset.y, area.extent.width, area.extent.height, 0, 1 },
+      .scissor = area, .cull = VK_CULL_MODE_NONE, .front = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+      .line_width = 1.0f, .sample_mask = 0xffff,
+   };
+   draw.cb.attachment_count = 1;
+   draw.cb.attachments[0].write_mask = 0xf;
+   float rect_ndc[4] = { -1, -1, 1, 1 };
+   memcpy(&draw.push[4], rect_ndc, sizeof(rect_ndc));
+   draw.push[0] = dx;
+   draw.push[1] = dy;
+   draw.descriptors[1] = &descriptor;
+   util_dynarray_append(&render.draws, draw);
+   VkResult result = rd_execute_render(device, &render);
+   util_dynarray_fini(&render.draws);
+   return result;
+}
+
+static VkResult
+rd_render_resolves(struct rd_device *device, const struct rd_render *render)
+{
+   for (unsigned i = 0; i < render->color_count; i++) {
+      const struct rd_render_attachment *a = &render->color[i];
+      if (!a->view || !a->resolve)
+         continue;
+      VkResult result = rd_resolve_view(device, a->view, a->resolve, render->area, a->resolve_mode,
+                                        0, 0);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+/* --- blits, image resolves, depth/stencil image clears ------------------------ */
+
+/* A view for an internal render or sample: one level, one layer (or the
+ * whole depth of a 3D level for a 3D view, or one slice of it for a 2D view
+ * of a 3D image, addressed by base_array_layer). */
+static void
+rd_internal_view(struct rd_image_view *view, struct rd_image *image, VkImageViewType type,
+                 VkImageAspectFlags aspects, uint32_t level, uint32_t layer)
+{
+   memset(view, 0, sizeof(*view));
+   struct vk_image_view *v = &view->vk;
+   v->image = &image->vk;
+   v->view_type = type;
+   v->format = v->view_format = image->vk.format;
+   v->aspects = aspects;
+   v->base_mip_level = level;
+   v->level_count = 1;
+   v->base_array_layer = layer;
+   v->layer_count = 1;
+   v->extent = vk_image_mip_level_extent(&image->vk, level);
+   if (type != VK_IMAGE_VIEW_TYPE_3D)
+      v->extent.depth = 1;
+   v->swizzle = (VkComponentMapping) { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G,
+                                       VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A };
+}
+
+static VkImageViewType
+rd_internal_view_type(const struct rd_image *image)
+{
+   return image->vk.image_type == VK_IMAGE_TYPE_1D ? VK_IMAGE_VIEW_TYPE_1D :
+          image->vk.image_type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+}
+
+/* Blit fragment shader: textureLod(src, coord, 0) with
+ *    coord.xy = frag_coord.xy * push[0..1] + push[2..3]   (normalized)
+ *    coord.z  = push[9]                                    (3D only)
+ * Variant = dim * 3 + type: dim 0 1D, 1 2D, 2 3D; type 0 float, 1 int, 2 uint. */
+static nir_shader *
+rd_blit_fs(struct rd_device *device, unsigned variant)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      ir3_get_compiler_options(device->compiler), "radish-blit-fs");
+   unsigned dim = variant / 3, type = variant % 3;
+   enum glsl_base_type base = type == 1 ? GLSL_TYPE_INT : type == 2 ? GLSL_TYPE_UINT :
+                              GLSL_TYPE_FLOAT;
+   nir_alu_type dest = type == 1 ? nir_type_int32 : type == 2 ? nir_type_uint32 : nir_type_float32;
+   enum glsl_sampler_dim sdim = dim == 0 ? GLSL_SAMPLER_DIM_1D : dim == 1 ? GLSL_SAMPLER_DIM_2D :
+                                GLSL_SAMPLER_DIM_3D;
+   nir_variable *tex = nir_variable_create(b.shader, nir_var_uniform,
+      glsl_sampler_type(sdim, false, false, base), "src");
+   tex->data.descriptor_set = 0;
+   tex->data.binding = 0;
+   nir_deref_instr *deref = nir_build_deref_var(&b, tex);
+   nir_def *scale_bias = nir_load_push_constant(&b, 4, 32, nir_imm_int(&b, 0), .base = 0, .range = 48);
+   nir_def *frag = nir_load_frag_coord(&b);
+   /* no ffma on a5xx: multiply and add */
+   nir_def *u = nir_fadd(&b, nir_fmul(&b, nir_channel(&b, frag, 0), nir_channel(&b, scale_bias, 0)),
+                         nir_channel(&b, scale_bias, 2));
+   nir_def *v = nir_fadd(&b, nir_fmul(&b, nir_channel(&b, frag, 1), nir_channel(&b, scale_bias, 1)),
+                         nir_channel(&b, scale_bias, 3));
+   nir_def *coord = dim == 0 ? u : dim == 1 ? nir_vec2(&b, u, v) :
+      nir_vec3(&b, u, v, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 36), .base = 0, .range = 48));
+   nir_tex_instr *t = nir_tex_instr_create(b.shader, 4);
+   t->op = nir_texop_txl;
+   t->sampler_dim = sdim;
+   t->dest_type = dest;
+   t->coord_components = dim + 1;
+   t->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   t->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_float(&b, 0));
+   t->src[2] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
+   t->src[3] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref, &deref->def);
+   nir_def_init(&t->instr, &t->def, 4, 32);
+   nir_builder_instr_insert(&b, &t->instr);
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+      glsl_vector_type(base, 4), "color");
+   out->data.location = FRAG_RESULT_DATA0;
+   nir_store_var(&b, out, &t->def, 0xf);
+   return b.shader;
+}
+
+static unsigned
+rd_format_type(VkFormat format)
+{
+   enum pipe_format pf = vk_format_to_pipe_format(format);
+   return util_format_is_pure_sint(pf) ? 1 : util_format_is_pure_uint(pf) ? 2 : 0;
+}
+
+/* One destination layer/slice of a scaled blit. */
+static VkResult
+rd_blit_layer(struct rd_device *device, const struct rd_blit *blit, struct rd_pipeline *pipeline,
+              uint32_t src_layer, uint32_t dst_layer, float src_w)
+{
+   struct rd_image_view src, dst;
+   VkImageViewType src_type = rd_internal_view_type(blit->src);
+   rd_internal_view(&src, blit->src, src_type, VK_IMAGE_ASPECT_COLOR_BIT, blit->src_level,
+                    src_type == VK_IMAGE_VIEW_TYPE_3D ? 0 : src_layer);
+   rd_internal_view(&dst, blit->dst, blit->dst->vk.image_type == VK_IMAGE_TYPE_1D ?
+                    VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_2D,
+                    VK_IMAGE_ASPECT_COLOR_BIT, blit->dst_level, dst_layer);
+   const int32_t (*d)[3] = blit->dst_offsets, (*sr)[3] = blit->src_offsets;
+   int32_t x0 = MIN2(d[0][0], d[1][0]), x1 = MAX2(d[0][0], d[1][0]);
+   int32_t y0 = MIN2(d[0][1], d[1][1]), y1 = MAX2(d[0][1], d[1][1]);
+   if (x0 == x1 || y0 == y1)
+      return VK_SUCCESS;
+   VkRect2D area = { { x0, y0 }, { x1 - x0, y1 - y0 } };
+   VkExtent3D se = src.vk.extent;
+   float scale_bias[4];
+   for (unsigned c = 0; c < 2; c++) {
+      double size = c ? se.height : se.width;
+      double scale = (double)(sr[1][c] - sr[0][c]) / (d[1][c] - d[0][c]);
+      scale_bias[c] = scale / size;
+      scale_bias[c + 2] = (sr[0][c] - d[0][c] * scale) / size;
+   }
+   VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = blit->filter, .minFilter = blit->filter,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE };
+   struct vk_sampler_state state;
+   vk_sampler_state_init(&state, &sci);
+   struct rd_descriptor descriptor = { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                       .image_view = &src, .has_sampler = true };
+   rd_sampler_descriptor(&state, descriptor.sampler);
+   struct rd_render render = {
+      .area = area, .layers = 1, .color_count = 1, .samples = 1,
+      .color[0] = { .view = &dst, .load = VK_ATTACHMENT_LOAD_OP_LOAD,
+                    .store = VK_ATTACHMENT_STORE_OP_STORE },
+   };
+   util_dynarray_init(&render.draws, NULL);
+   struct rd_draw draw = {
+      .pipeline = pipeline, .vertex_count = 4, .instance_count = 1,
+      .viewport = { area.offset.x, area.offset.y, area.extent.width, area.extent.height, 0, 1 },
+      .scissor = area, .cull = VK_CULL_MODE_NONE, .front = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+      .line_width = 1.0f, .sample_mask = 0xffff,
+   };
+   draw.cb.attachment_count = 1;
+   draw.cb.attachments[0].write_mask = 0xf;
+   memcpy(draw.push, scale_bias, sizeof(scale_bias));
+   float rect_ndc[4] = { -1, -1, 1, 1 };
+   memcpy(&draw.push[4], rect_ndc, sizeof(rect_ndc));
+   memcpy(&draw.push[9], &src_w, sizeof(src_w));
+   draw.descriptors[1] = &descriptor;
+   util_dynarray_append(&render.draws, draw);
+   VkResult result = rd_execute_render(device, &render);
+   util_dynarray_fini(&render.draws);
+   return result;
+}
+
+static VkResult
+rd_execute_scaled_blit(struct rd_device *device, const struct rd_blit *blit)
+{
+   if (vk_format_is_depth_or_stencil(blit->src->vk.format) ||
+       vk_format_is_depth_or_stencil(blit->dst->vk.format))
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   unsigned dim = blit->src->vk.image_type == VK_IMAGE_TYPE_1D ? 0 :
+                  blit->src->vk.image_type == VK_IMAGE_TYPE_3D ? 2 : 1;
+   unsigned variant = dim * 3 + rd_format_type(blit->src->vk.format);
+   struct rd_pipeline *pipeline = rd_meta_pipeline(device, &device->blit_pipeline[variant],
+      rd_blit_fs, variant, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+   if (!pipeline)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   const int32_t (*d)[3] = blit->dst_offsets, (*sr)[3] = blit->src_offsets;
+   if (blit->dst->vk.image_type == VK_IMAGE_TYPE_3D || dim == 2) {
+      /* one render per destination slice; the source depth follows the
+       * same mapping as x and y (3D to 3D), or stays at the layer */
+      int32_t z0 = MIN2(d[0][2], d[1][2]), z1 = MAX2(d[0][2], d[1][2]);
+      uint32_t src_depth = vk_image_mip_level_extent(&blit->src->vk, blit->src_level).depth;
+      for (int32_t z = z0; z < z1; z++) {
+         float w = 0;
+         if (dim == 2) {
+            double scale = (double)(sr[1][2] - sr[0][2]) / (d[1][2] - d[0][2]);
+            w = (sr[0][2] + (z + 0.5 - d[0][2]) * scale) / src_depth;
+         }
+         uint32_t dst_layer = blit->dst->vk.image_type == VK_IMAGE_TYPE_3D ? z : blit->dst_layer;
+         VkResult result = rd_blit_layer(device, blit, pipeline, blit->src_layer, dst_layer, w);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+      return VK_SUCCESS;
+   }
+   for (uint32_t i = 0; i < blit->layers; i++) {
+      VkResult result = rd_blit_layer(device, blit, pipeline, blit->src_layer + i,
+                                      blit->dst_layer + i, 0);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+static VkResult
+rd_execute_image_resolve(struct rd_device *device, const struct rd_blit *blit)
+{
+   const int32_t (*sr)[3] = blit->src_offsets, (*d)[3] = blit->dst_offsets;
+   VkRect2D area = { { d[0][0], d[0][1] },
+                     { d[1][0] - d[0][0], d[1][1] - d[0][1] } };
+   for (uint32_t i = 0; i < blit->layers; i++) {
+      struct rd_image_view src, dst;
+      rd_internal_view(&src, blit->src, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
+                       blit->src_level, blit->src_layer + i);
+      rd_internal_view(&dst, blit->dst, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
+                       blit->dst_level, blit->dst_layer + i);
+      VkResult result = rd_resolve_view(device, &src, &dst, area, VK_RESOLVE_MODE_AVERAGE_BIT,
+                                        sr[0][0] - d[0][0], sr[0][1] - d[0][1]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+static VkResult
+rd_execute_clear_ds(struct rd_device *device, const struct rd_blit *blit)
+{
+   struct rd_pipeline *pipeline = rd_clear_pipeline(device);
+   if (!pipeline)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct rd_image *image = blit->dst;
+   for (uint32_t l = 0; l < blit->levels; l++) {
+      VkExtent3D extent = vk_image_mip_level_extent(&image->vk, blit->dst_level + l);
+      for (uint32_t i = 0; i < blit->layers; i++) {
+         struct rd_image_view view;
+         rd_internal_view(&view, image, VK_IMAGE_VIEW_TYPE_2D, vk_format_aspects(image->vk.format),
+                          blit->dst_level + l, blit->dst_layer + i);
+         VkRect2D area = { { 0, 0 }, { extent.width, extent.height } };
+         struct rd_render render = { .area = area, .layers = 1, .samples = image->vk.samples };
+         if (vk_format_has_depth(image->vk.format))
+            render.depth.view = &view;
+         if (vk_format_has_stencil(image->vk.format))
+            render.stencil.view = &view;
+         util_dynarray_init(&render.draws, NULL);
+         VkClearValue value = { .depthStencil = blit->clear };
+         struct rd_draw draw;
+         rd_clear_draw(pipeline, area, -1, blit->aspects, value, &draw);
+         util_dynarray_append(&render.draws, draw);
+         VkResult result = rd_execute_render(device, &render);
+         util_dynarray_fini(&render.draws);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   }
+   return VK_SUCCESS;
+}
+
+VkResult
+rd_execute_blit(struct rd_device *device, const struct rd_blit *blit)
+{
+   if (!blit->dst->memory || (blit->src && !blit->src->memory))
+      return VK_ERROR_UNKNOWN;
+   switch (blit->kind) {
+   case RD_BLIT_SCALED: return rd_execute_scaled_blit(device, blit);
+   case RD_BLIT_RESOLVE: return rd_execute_image_resolve(device, blit);
+   case RD_BLIT_CLEAR_DS: return rd_execute_clear_ds(device, blit);
+   }
+   return VK_ERROR_UNKNOWN;
+}
+
+/* --- recording ---------------------------------------------------------------- */
+
+static void
+rd_offsets(int32_t out[2][3], const VkOffset3D in[2])
+{
+   for (unsigned i = 0; i < 2; i++) {
+      out[i][0] = in[i].x;
+      out[i][1] = in[i].y;
+      out[i][2] = in[i].z;
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdBlitImage2(VkCommandBuffer handle, const VkBlitImageInfo2 *info)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   VK_FROM_HANDLE(rd_image, src, info->srcImage);
+   VK_FROM_HANDLE(rd_image, dst, info->dstImage);
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageBlit2 *r = &info->pRegions[i];
+      struct rd_command *recorded = rd_command_append(command, RD_CMD_BLIT);
+      if (!recorded)
+         return;
+      struct rd_blit *blit = &recorded->blit;
+      blit->kind = RD_BLIT_SCALED;
+      blit->src = src;
+      blit->dst = dst;
+      blit->src_level = r->srcSubresource.mipLevel;
+      blit->dst_level = r->dstSubresource.mipLevel;
+      blit->src_layer = r->srcSubresource.baseArrayLayer;
+      blit->dst_layer = r->dstSubresource.baseArrayLayer;
+      blit->layers = vk_image_subresource_layer_count(&src->vk, &r->srcSubresource);
+      blit->filter = info->filter;
+      blit->aspects = r->srcSubresource.aspectMask;
+      rd_offsets(blit->src_offsets, r->srcOffsets);
+      rd_offsets(blit->dst_offsets, r->dstOffsets);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdResolveImage2(VkCommandBuffer handle, const VkResolveImageInfo2 *info)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   VK_FROM_HANDLE(rd_image, src, info->srcImage);
+   VK_FROM_HANDLE(rd_image, dst, info->dstImage);
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageResolve2 *r = &info->pRegions[i];
+      struct rd_command *recorded = rd_command_append(command, RD_CMD_BLIT);
+      if (!recorded)
+         return;
+      struct rd_blit *blit = &recorded->blit;
+      blit->kind = RD_BLIT_RESOLVE;
+      blit->src = src;
+      blit->dst = dst;
+      blit->src_level = r->srcSubresource.mipLevel;
+      blit->dst_level = r->dstSubresource.mipLevel;
+      blit->src_layer = r->srcSubresource.baseArrayLayer;
+      blit->dst_layer = r->dstSubresource.baseArrayLayer;
+      blit->layers = vk_image_subresource_layer_count(&src->vk, &r->srcSubresource);
+      blit->aspects = r->srcSubresource.aspectMask;
+      VkOffset3D src_offsets[2] = { r->srcOffset, { r->srcOffset.x + r->extent.width,
+         r->srcOffset.y + r->extent.height, r->srcOffset.z + r->extent.depth } };
+      VkOffset3D dst_offsets[2] = { r->dstOffset, { r->dstOffset.x + r->extent.width,
+         r->dstOffset.y + r->extent.height, r->dstOffset.z + r->extent.depth } };
+      rd_offsets(blit->src_offsets, src_offsets);
+      rd_offsets(blit->dst_offsets, dst_offsets);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+rd_CmdClearDepthStencilImage(VkCommandBuffer handle, VkImage image_handle, VkImageLayout layout,
+                             const VkClearDepthStencilValue *value, uint32_t count,
+                             const VkImageSubresourceRange *ranges)
+{
+   VK_FROM_HANDLE(rd_command_buffer, command, handle);
+   VK_FROM_HANDLE(rd_image, image, image_handle);
+   for (uint32_t i = 0; i < count; i++) {
+      struct rd_command *recorded = rd_command_append(command, RD_CMD_BLIT);
+      if (!recorded)
+         return;
+      struct rd_blit *blit = &recorded->blit;
+      blit->kind = RD_BLIT_CLEAR_DS;
+      blit->dst = image;
+      blit->dst_level = ranges[i].baseMipLevel;
+      blit->levels = vk_image_subresource_level_count(&image->vk, &ranges[i]);
+      blit->dst_layer = ranges[i].baseArrayLayer;
+      blit->layers = vk_image_subresource_layer_count(&image->vk, &ranges[i]);
+      blit->aspects = ranges[i].aspectMask;
+      blit->clear = *value;
+   }
+}
+
+/* --- depth/stencil in bypass mode ---------------------------------------------
+ *
+ * In bypass (sysmem) rendering the a5xx depth and stencil units write their
+ * buffers in the TILE5_3 layout (4x4 texel blocks, 2x2-interleaved inside,
+ * with a macro-tile swizzle), whatever the pitch register says; texture
+ * fetch and colour targets with tile mode 3 use the same layout. Depth and
+ * stencil images stay linear, so a render with a depth/stencil attachment
+ * draws into a tiled scratch copy: the render area is converted from the
+ * image into the scratch first when any aspect loads, and back afterwards
+ * for the aspects that store. Both conversions are draws that fetch one
+ * texel and write it, as unsigned integers of the texel's size, so they are
+ * bit exact.
+ */
+struct rd_ds_scratch {
+   struct rd_image image;
+   struct rd_memory memory;
+};
+
+/* The depth/stencil image as a single-sample uint colour image of the same
+ * memory (samples folded into the texel). */
+static VkFormat
+rd_ds_copy_format(VkFormat format, VkSampleCountFlagBits samples)
+{
+   bool ms = samples != VK_SAMPLE_COUNT_1_BIT;
+   switch (format) {
+   case VK_FORMAT_D16_UNORM: return ms ? VK_FORMAT_R16G16B16A16_UINT : VK_FORMAT_R16_UINT;
+   case VK_FORMAT_D32_SFLOAT: return ms ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32_UINT;
+   case VK_FORMAT_X8_D24_UNORM_PACK32:
+   case VK_FORMAT_D24_UNORM_S8_UINT: return ms ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R8G8B8A8_UINT;
+   case VK_FORMAT_S8_UINT: return ms ? VK_FORMAT_R8G8B8A8_UINT : VK_FORMAT_R8_UINT;
+   default: return VK_FORMAT_UNDEFINED;
+   }
+}
+
+static void
+rd_ds_alias(struct rd_image *out, const struct rd_image *image, VkFormat format)
+{
+   *out = *image;
+   out->vk.format = format;
+   out->texel_size = image->texel_size * image->vk.samples;
+   out->vk.samples = VK_SAMPLE_COUNT_1_BIT;
+}
+
+static bool
+rd_ds_scratch_init(struct rd_device *device, struct rd_ds_scratch *scratch,
+                   const struct rd_image *image, VkExtent3D extent)
+{
+   memset(scratch, 0, sizeof(*scratch));
+   struct rd_image *tiled = &scratch->image;
+   tiled->vk.format = image->vk.format;
+   tiled->vk.image_type = VK_IMAGE_TYPE_2D;
+   tiled->vk.samples = image->vk.samples;
+   tiled->vk.extent = (VkExtent3D) { extent.width, extent.height, 1 };
+   tiled->vk.mip_levels = 1;
+   tiled->vk.array_layers = 1;
+   tiled->texel_size = image->texel_size;
+   const struct fdl_image_params params = {
+      .format = vk_format_to_pipe_format(image->vk.format), .nr_samples = image->vk.samples,
+      .width0 = extent.width, .height0 = extent.height, .depth0 = 1, .mip_levels = 1,
+      .array_size = 1, .tile_mode = TILE5_3,
+   };
+   fdl5_layout_image(&tiled->native_layout, &params);
+   tiled->native_layout.mip_levels = 1;
+   struct rd_image_level *level = &tiled->levels[0];
+   level->offset = fdl_surface_offset(&tiled->native_layout, 0, 0);
+   level->row_pitch = fdl_pitch(&tiled->native_layout, 0);
+   level->depth_pitch = tiled->native_layout.slices[0].size0;
+   level->size = level->array_pitch = level->depth_pitch;
+   tiled->size = tiled->native_layout.size;
+   scratch->memory.bo = fd_bo_new(device->fd, align64(tiled->size, 4096), 0, "radish-ds-tiles");
+   tiled->memory = &scratch->memory;
+   return scratch->memory.bo != NULL;
+}
+
+/* Copy-texel fragment shader: texelFetch(src, frag_coord.xy) as uvec4. */
+static nir_shader *
+rd_copy_texel_fs(struct rd_device *device, unsigned variant)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      ir3_get_compiler_options(device->compiler), "radish-copy-texel-fs");
+   nir_variable *tex = nir_variable_create(b.shader, nir_var_uniform,
+      glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT), "src");
+   tex->data.descriptor_set = 0;
+   tex->data.binding = 0;
+   nir_deref_instr *deref = nir_build_deref_var(&b, tex);
+   nir_def *coord = nir_f2i32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
+   nir_tex_instr *t = nir_tex_instr_create(b.shader, 3);
+   t->op = nir_texop_txf;
+   t->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   t->dest_type = nir_type_uint32;
+   t->coord_components = 2;
+   t->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   t->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(&b, 0));
+   t->src[2] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &deref->def);
+   nir_def_init(&t->instr, &t->def, 4, 32);
+   nir_builder_instr_insert(&b, &t->instr);
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out, glsl_uvec4_type(), "color");
+   out->data.location = FRAG_RESULT_DATA0;
+   nir_store_var(&b, out, &t->def, 0xf);
+   return b.shader;
+}
+
+static VkResult
+rd_copy_texels(struct rd_device *device, struct rd_image *src, uint32_t src_level, uint32_t src_layer,
+               struct rd_image *dst, uint32_t dst_level, uint32_t dst_layer, VkRect2D area,
+               uint32_t write_mask)
+{
+   struct rd_pipeline *pipeline = rd_meta_pipeline(device, &device->copy_texel_pipeline,
+      rd_copy_texel_fs, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+   if (!pipeline)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct rd_image_view src_view, dst_view;
+   rd_internal_view(&src_view, src, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, src_level, src_layer);
+   rd_internal_view(&dst_view, dst, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, dst_level, dst_layer);
+   struct rd_descriptor descriptor = { .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .image_view = &src_view };
+   struct rd_render render = {
+      .area = area, .layers = 1, .color_count = 1, .samples = 1,
+      .color[0] = { .view = &dst_view, .load = VK_ATTACHMENT_LOAD_OP_LOAD,
+                    .store = VK_ATTACHMENT_STORE_OP_STORE },
+   };
+   util_dynarray_init(&render.draws, NULL);
+   struct rd_draw draw = {
+      .pipeline = pipeline, .vertex_count = 4, .instance_count = 1,
+      .viewport = { area.offset.x, area.offset.y, area.extent.width, area.extent.height, 0, 1 },
+      .scissor = area, .cull = VK_CULL_MODE_NONE, .front = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+      .line_width = 1.0f, .sample_mask = 0xffff,
+   };
+   draw.cb.attachment_count = 1;
+   draw.cb.attachments[0].write_mask = write_mask;
+   float rect_ndc[4] = { -1, -1, 1, 1 };
+   memcpy(&draw.push[4], rect_ndc, sizeof(rect_ndc));
+   draw.descriptors[1] = &descriptor;
+   util_dynarray_append(&render.draws, draw);
+   VkResult result = rd_execute_render_direct(device, &render);
+   util_dynarray_fini(&render.draws);
+   return result;
+}
+
+static VkResult
+rd_execute_render_tiled_ds(struct rd_device *device, const struct rd_render *render)
+{
+   const struct rd_image_view *view = render->depth.view ? render->depth.view : render->stencil.view;
+   struct rd_image *image = container_of(view->vk.image, struct rd_image, vk);
+   if (!image->memory)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   VkFormat copy_format = rd_ds_copy_format(image->vk.format, image->vk.samples);
+   if (copy_format == VK_FORMAT_UNDEFINED)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   uint32_t level = view->vk.base_mip_level, layer = view->vk.base_array_layer;
+   VkExtent3D extent = vk_image_mip_level_extent(&image->vk, level);
+   /* the part of the render area inside the attachment */
+   VkRect2D area = render->area;
+   int32_t x1 = MIN2((int64_t)area.offset.x + area.extent.width, extent.width);
+   int32_t y1 = MIN2((int64_t)area.offset.y + area.extent.height, extent.height);
+   area.offset.x = MAX2(area.offset.x, 0);
+   area.offset.y = MAX2(area.offset.y, 0);
+   area.extent.width = MAX2(x1 - area.offset.x, 0);
+   area.extent.height = MAX2(y1 - area.offset.y, 0);
+
+   bool has_depth = vk_format_has_depth(image->vk.format), has_stencil = vk_format_has_stencil(image->vk.format);
+   bool depth = has_depth && render->depth.view, stencil = has_stencil && render->stencil.view;
+   bool load = (depth && render->depth.load == VK_ATTACHMENT_LOAD_OP_LOAD) ||
+               (stencil && render->stencil.load == VK_ATTACHMENT_LOAD_OP_LOAD) ||
+               /* an aspect the render does not touch is kept */
+               (has_depth && has_stencil && (!depth || !stencil));
+   bool store_depth = depth && render->depth.store == VK_ATTACHMENT_STORE_OP_STORE;
+   bool store_stencil = stencil && render->stencil.store == VK_ATTACHMENT_STORE_OP_STORE;
+   uint32_t store_mask = 0xf;
+   if (has_depth && has_stencil && image->vk.samples == VK_SAMPLE_COUNT_1_BIT)
+      store_mask = (store_depth ? 0x7 : 0) | (store_stencil ? 0x8 : 0);
+   else if (!store_depth && !store_stencil)
+      store_mask = 0;
+
+   struct rd_ds_scratch scratch;
+   if (!rd_ds_scratch_init(device, &scratch, image, extent))
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct rd_image linear_alias, tiled_alias;
+   rd_ds_alias(&linear_alias, image, copy_format);
+   rd_ds_alias(&tiled_alias, &scratch.image, copy_format);
+   VkResult result = VK_SUCCESS;
+   if (load && area.extent.width && area.extent.height)
+      result = rd_copy_texels(device, &linear_alias, level, layer, &tiled_alias, 0, 0, area, 0xf);
+   if (result == VK_SUCCESS) {
+      struct rd_image_view tiled_view;
+      rd_internal_view(&tiled_view, &scratch.image, VK_IMAGE_VIEW_TYPE_2D, view->vk.aspects, 0, 0);
+      tiled_view.vk.extent = view->vk.extent;
+      struct rd_render tiled_render = *render;
+      if (tiled_render.depth.view)
+         tiled_render.depth.view = &tiled_view;
+      if (tiled_render.stencil.view)
+         tiled_render.stencil.view = &tiled_view;
+      result = rd_execute_render_direct(device, &tiled_render);
+   }
+   if (result == VK_SUCCESS && store_mask && area.extent.width && area.extent.height)
+      result = rd_copy_texels(device, &tiled_alias, 0, 0, &linear_alias, level, layer, area, store_mask);
+   fd_bo_del(scratch.memory.bo);
+   return result;
 }

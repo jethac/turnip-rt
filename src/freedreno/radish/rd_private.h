@@ -25,6 +25,8 @@
 #include "drm/freedreno_drmif.h"
 #include "common/freedreno_dev_info.h"
 #include "common/fd5_hw.h"
+#include "util/u_debug.h"
+#include <stdio.h>
 
 struct fd_ringbuffer;
 struct fd_submit;
@@ -58,6 +60,9 @@ struct rd_device {
    struct rd_trace *trace;
    simple_mtx_t meta_mutex;
    struct rd_pipeline *clear_pipeline;
+   struct rd_pipeline *resolve_pipeline[4];
+   struct rd_pipeline *copy_texel_pipeline;
+   struct rd_pipeline *blit_pipeline[9]; /* [dim 1D/2D/3D][float/int/uint] */
 };
 struct rd_memory {
    struct vk_device_memory vk;
@@ -188,6 +193,8 @@ struct rd_event_command { struct rd_event *event; };
 #define RD_MAX_RTS 8
 struct rd_render_attachment {
    struct rd_image_view *view;
+   struct rd_image_view *resolve;
+   VkResolveModeFlagBits resolve_mode;
    VkAttachmentLoadOp load;
    VkAttachmentStoreOp store;
    VkClearValue clear;
@@ -213,20 +220,32 @@ struct rd_draw {
    struct vk_color_blend_state cb;
    bool bias_enable;
    float bias_constant, bias_clamp, bias_slope, line_width;
+   uint16_t sample_mask;
+   bool alpha_to_coverage;
    struct rd_buffer *vertex_buffers[32];
    VkDeviceSize vertex_offsets[32];
    uint32_t push[32];
    /* descriptors of each stage's resources, copied when recorded */
    struct rd_descriptor *descriptors[2];
+   /* the occlusion query active when the draw was recorded */
+   struct rd_query_pool *occlusion_pool;
+   uint32_t occlusion_query;
+};
+/* vkCmdBeginQuery/vkCmdEndQuery of an occlusion query inside a render */
+struct rd_render_query {
+   struct rd_query_pool *pool;
+   uint32_t query;
+   bool end;
 };
 /* One dynamic-rendering instance: its attachments and its draws. */
 struct rd_render {
    VkRect2D area;
-   uint32_t layers, view_mask, color_count;
+   uint32_t layers, view_mask, color_count, samples;
    struct rd_render_attachment color[RD_MAX_RTS], depth, stencil;
    /* draws of a secondary command buffer recorded inside a render pass */
    bool continued;
    struct util_dynarray draws;
+   struct util_dynarray queries; /* struct rd_render_query */
 };
 struct rd_query_command {
    struct rd_query_pool *pool;
@@ -242,7 +261,19 @@ enum rd_command_type {
    RD_CMD_EVENT_SET, RD_CMD_EVENT_RESET, RD_CMD_EVENT_WAIT,
    RD_CMD_QUERY_RESET, RD_CMD_QUERY_BEGIN, RD_CMD_QUERY_END,
    RD_CMD_QUERY_TIMESTAMP, RD_CMD_QUERY_COPY,
-   RD_CMD_RENDER,
+   RD_CMD_RENDER, RD_CMD_BLIT,
+};
+/* Image operations done as internal renders: one region of vkCmdBlitImage,
+ * vkCmdResolveImage or one range of vkCmdClearDepthStencilImage. */
+enum rd_blit_kind { RD_BLIT_SCALED, RD_BLIT_RESOLVE, RD_BLIT_CLEAR_DS };
+struct rd_blit {
+   enum rd_blit_kind kind;
+   struct rd_image *src, *dst;
+   uint32_t src_level, dst_level, src_layer, dst_layer, layers, levels;
+   int32_t src_offsets[2][3], dst_offsets[2][3];
+   VkFilter filter;
+   VkImageAspectFlags aspects;
+   VkClearDepthStencilValue clear;
 };
 struct rd_transfer {
    struct rd_buffer *src, *dst;
@@ -259,6 +290,7 @@ struct rd_command {
       struct rd_event_command event;
       struct rd_query_command query;
       struct rd_render *render;
+      struct rd_blit blit;
    };
 };
 struct rd_command_buffer {
@@ -267,6 +299,8 @@ struct rd_command_buffer {
    struct rd_pipeline *gfx_pipeline;
    struct rd_render *render;
    bool render_continue;
+   struct rd_query_pool *occlusion_pool;
+   uint32_t occlusion_query;
    /* bound descriptor sets: [0] compute, [1] graphics */
    struct rd_bind_state {
       struct rd_descriptor_set *sets[RD_MAX_SETS];
@@ -312,7 +346,10 @@ bool rd_lower_stage_buffers(struct nir_shader *nir, struct rd_pipeline *stage);
 bool rd_graphics_enabled(void);
 void rd_meta_finish(struct rd_device *device);
 VkResult rd_execute_render(struct rd_device *device, const struct rd_render *render);
+VkResult rd_execute_blit(struct rd_device *device, const struct rd_blit *blit);
 void rd_render_free(struct rd_command_buffer *command, struct rd_render *render);
+bool rd_render_query(struct rd_command_buffer *command, struct rd_query_pool *pool,
+                     uint32_t query, bool end);
 bool rd_render_execute(struct rd_command_buffer *primary, const struct rd_render *render);
 void rd_gfx_pipeline_destroy(struct rd_device *device, struct rd_pipeline *pipeline);
 void rd_sampler_descriptor(const struct vk_sampler_state *state, uint32_t words[4]);
@@ -343,6 +380,15 @@ bool rd_pipeline_cache_restore(struct rd_device *device, struct rd_pipeline *pip
    VkPipelineCache cache, const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags);
 void rd_pipeline_cache_store(struct rd_device *device, struct rd_pipeline *pipeline,
    VkPipelineCache cache, const VkPipelineShaderStageCreateInfo *stage, VkPipelineCreateFlags flags);
+/* vk_command_buffer_set_error with the recording site printed when
+ * RADISH_DEBUG_ERRORS is set (which command made vkEndCommandBuffer fail). */
+#define rd_set_error(command_vk, result)                                        \
+   do {                                                                         \
+      if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))                 \
+         fprintf(stderr, "radish: command error %d at %s:%d (%s)\n", (result),  \
+                 __FILE__, __LINE__, __func__);                                 \
+      vk_command_buffer_set_error((command_vk), (result));                      \
+   } while (0)
 #ifdef __cplusplus
 }
 #endif

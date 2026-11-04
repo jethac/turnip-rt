@@ -201,7 +201,7 @@ rd_record_query(struct rd_command_buffer *command, enum rd_command_type type,
                  struct rd_query_pool *pool, uint32_t first, uint32_t count)
 {
    if (!rd_query_range(pool, first, count)) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return NULL;
    }
    struct rd_command *recorded = rd_command_append(command, type);
@@ -228,8 +228,20 @@ rd_CmdBeginQuery(VkCommandBuffer handle, VkQueryPool pool_handle,
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(rd_query_pool, pool, pool_handle);
+   if (pool && pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION) {
+      if (!rd_query_range(pool, query, 1)) {
+         rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
+         return;
+      }
+      /* counts are exact whether or not PRECISE is asked for */
+      command->occlusion_pool = pool;
+      command->occlusion_query = query;
+      if (!rd_render_query(command, pool, query, false))
+         rd_record_query(command, RD_CMD_QUERY_BEGIN, pool, query, 1);
+      return;
+   }
    if (!pool || pool->vk.query_type != VK_QUERY_TYPE_PIPELINE_STATISTICS || flags) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    rd_record_query(command, RD_CMD_QUERY_BEGIN, pool, query, 1);
@@ -240,8 +252,14 @@ rd_CmdEndQuery(VkCommandBuffer handle, VkQueryPool pool_handle, uint32_t query)
 {
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(rd_query_pool, pool, pool_handle);
+   if (pool && pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION) {
+      command->occlusion_pool = NULL;
+      if (!rd_render_query(command, pool, query, true))
+         rd_record_query(command, RD_CMD_QUERY_END, pool, query, 1);
+      return;
+   }
    if (!pool || pool->vk.query_type != VK_QUERY_TYPE_PIPELINE_STATISTICS) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    rd_record_query(command, RD_CMD_QUERY_END, pool, query, 1);
@@ -254,7 +272,7 @@ rd_CmdWriteTimestamp2(VkCommandBuffer handle, VkPipelineStageFlags2 stage,
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    VK_FROM_HANDLE(rd_query_pool, pool, pool_handle);
    if (!pool || pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    struct rd_query_command *recorded =
@@ -278,7 +296,7 @@ rd_CmdCopyQueryPoolResults(VkCommandBuffer handle, VkQueryPool pool_handle,
        !(buffer->vk.usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) ||
        offset % alignment || !rd_query_layout(pool, count, stride, flags, &bytes) ||
        offset > buffer->vk.size || bytes > buffer->vk.size - offset) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
    struct rd_query_command *recorded =
@@ -364,7 +382,8 @@ rd_execute_query(struct rd_device *device, enum rd_command_type type,
          slot->available = false;
          if (type == RD_CMD_QUERY_BEGIN) {
             slot->active = true;
-            list_addtail(&slot->active_link, &device->active_queries);
+            if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS)
+               list_addtail(&slot->active_link, &device->active_queries);
          }
       }
    }

@@ -89,7 +89,7 @@ rd_record_event(struct rd_command_buffer *command, enum rd_command_type type,
 {
    VK_FROM_HANDLE(rd_event, event, event_handle);
    if (!event) {
-      vk_command_buffer_set_error(&command->vk, VK_ERROR_UNKNOWN);
+      rd_set_error(&command->vk, VK_ERROR_UNKNOWN);
       return;
    }
    struct rd_command *recorded = rd_command_append(command, type);
