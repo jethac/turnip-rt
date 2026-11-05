@@ -232,6 +232,8 @@ struct rd_draw {
    uint32_t occlusion_query;
    /* a pipeline barrier inside the render pass precedes this draw */
    bool barrier;
+   /* clears: the layers they apply to (0 count: layer 0, as draws) */
+   uint32_t layer_first, layer_count;
 };
 /* vkCmdBeginQuery/vkCmdEndQuery of an occlusion query inside a render */
 struct rd_render_query {

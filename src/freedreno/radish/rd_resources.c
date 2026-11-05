@@ -287,7 +287,14 @@ rd_make_resource(const struct rd_descriptor *descriptor, struct rd_resource *out
       out->mip_levels = view->level_count - 1;
       out->image_size_only = descriptor->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
       out->pitchalign = image->native_layout.pitchalign - 6;
+      /* MIN_LAYERSZ is where the layer size stops shrinking; the hardware
+       * applies it from level 0, so it must not exceed any level's size.
+       * fdl over-allocates the last level's rows, which for 2-level 3D
+       * images made it larger than level 0 (2x2x2, 3x3x3 sampled level 1
+       * from the wrong place). */
       out->min_layer_size = image->native_layout.slices[image->vk.mip_levels - 1].size0;
+      for (uint32_t l = 0; l < image->vk.mip_levels; l++)
+         out->min_layer_size = MIN2(out->min_layer_size, image->native_layout.slices[l].size0);
       out->row_pitch = level->row_pitch;
       out->array_pitch = view->view_type == VK_IMAGE_VIEW_TYPE_3D ?
                          level->depth_pitch : level->array_pitch;

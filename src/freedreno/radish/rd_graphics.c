@@ -472,7 +472,7 @@ rd_render_attachment(struct rd_render_attachment *out, const VkRenderingAttachme
 
 static bool rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
                                 VkRect2D rect, int color, VkImageAspectFlags aspects,
-                                VkClearValue value);
+                                VkClearValue value, uint32_t layer_first, uint32_t layer_count);
 
 VKAPI_ATTR void VKAPI_CALL
 rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
@@ -513,7 +513,8 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
    /* load-op clears: internal clear draws at the start of the render */
    for (uint32_t i = 0; i < render->color_count; i++) {
       if (render->color[i].view && render->color[i].load == VK_ATTACHMENT_LOAD_OP_CLEAR)
-         rd_render_add_clear(command, render, render->area, i, 0, render->color[i].clear);
+         rd_render_add_clear(command, render, render->area, i, 0, render->color[i].clear,
+                             0, render->layers);
    }
    VkImageAspectFlags ds_aspects = 0;
    VkClearValue ds_value = {0};
@@ -526,7 +527,7 @@ rd_CmdBeginRendering(VkCommandBuffer handle, const VkRenderingInfo *info)
       ds_value.depthStencil.stencil = render->stencil.clear.depthStencil.stencil;
    }
    if (ds_aspects)
-      rd_render_add_clear(command, render, render->area, -1, ds_aspects, ds_value);
+      rd_render_add_clear(command, render, render->area, -1, ds_aspects, ds_value, 0, render->layers);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2018,9 +2019,67 @@ rd_view_layer(struct rd_image_view *out, const struct rd_image_view *view, uint3
 
 /* Multiview: the render is replayed once per view in the mask, each time
  * on layer <view> of every attachment, with gl_ViewIndex = view. */
+/* Layered rendering (layerCount > 1, no view mask): without geometry
+ * shaders draws write layer 0, while clears (load-op and
+ * vkCmdClearAttachments layer ranges) and resolves apply to their layers.
+ * Layer 0 runs the whole render; each further layer runs on layer <L> of
+ * every attachment with only the clears that cover it. */
+static VkResult
+rd_execute_render_layers(struct rd_device *device, const struct rd_render *render)
+{
+   VkResult result = VK_SUCCESS;
+   for (uint32_t layer = 0; layer < render->layers && result == VK_SUCCESS; layer++) {
+      struct rd_render copy = *render;
+      struct rd_image_view color[RD_MAX_RTS], resolve[RD_MAX_RTS], depth, stencil;
+      for (unsigned i = 0; i < render->color_count; i++) {
+         if (render->color[i].view) {
+            rd_view_layer(&color[i], render->color[i].view, layer);
+            copy.color[i].view = &color[i];
+         }
+         if (render->color[i].resolve) {
+            rd_view_layer(&resolve[i], render->color[i].resolve, layer);
+            copy.color[i].resolve = &resolve[i];
+         }
+      }
+      if (render->depth.view) {
+         rd_view_layer(&depth, render->depth.view, layer);
+         copy.depth.view = &depth;
+      }
+      if (render->stencil.view) {
+         if (render->stencil.view == render->depth.view) {
+            copy.stencil.view = &depth;
+         } else {
+            rd_view_layer(&stencil, render->stencil.view, layer);
+            copy.stencil.view = &stencil;
+         }
+      }
+      copy.layers = 1;
+      struct util_dynarray draws, queries;
+      util_dynarray_init(&draws, NULL);
+      util_dynarray_init(&queries, NULL);
+      util_dynarray_foreach(&render->draws, struct rd_draw, d) {
+         bool keep = d->layer_count ? layer >= d->layer_first &&
+                                      layer < d->layer_first + d->layer_count : layer == 0;
+         if (keep)
+            util_dynarray_append(&draws, *d);
+      }
+      if (layer == 0)
+         util_dynarray_foreach(&render->queries, struct rd_render_query, q)
+            util_dynarray_append(&queries, *q);
+      copy.draws = draws;
+      copy.queries = queries;
+      result = rd_execute_render_view(device, &copy);
+      util_dynarray_fini(&draws);
+      util_dynarray_fini(&queries);
+   }
+   return result;
+}
+
 VkResult
 rd_execute_render(struct rd_device *device, const struct rd_render *render)
 {
+   if (!render->view_mask && render->layers > 1)
+      return rd_execute_render_layers(device, render);
    if (!render->view_mask)
       return rd_execute_render_view(device, render);
    VkResult result = VK_SUCCESS;
@@ -2442,7 +2501,8 @@ rd_clear_draw(struct rd_pipeline *pipeline, VkRect2D rect, int color, VkImageAsp
 
 static bool
 rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
-                    VkRect2D rect, int color, VkImageAspectFlags aspects, VkClearValue value)
+                    VkRect2D rect, int color, VkImageAspectFlags aspects, VkClearValue value,
+                    uint32_t layer_first, uint32_t layer_count)
 {
    struct rd_device *device = container_of(command->vk.base.device, struct rd_device, vk);
    struct rd_pipeline *pipeline = rd_clear_pipeline(device);
@@ -2454,6 +2514,8 @@ rd_render_add_clear(struct rd_command_buffer *command, struct rd_render *render,
       return true;
    struct rd_draw draw;
    rd_clear_draw(pipeline, rect, color, aspects, value, &draw);
+   draw.layer_first = layer_first;
+   draw.layer_count = layer_count;
    util_dynarray_append(&render->draws, draw);
    return true;
 }
@@ -2475,17 +2537,15 @@ rd_CmdClearAttachments(VkCommandBuffer handle, uint32_t count, const VkClearAtta
       return;
    }
    for (uint32_t r = 0; r < rect_count; r++) {
-      if (rects[r].baseArrayLayer || rects[r].layerCount != 1) {
-         /* layered clears come with layered rendering */
-         rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
-      }
+      uint32_t first = rects[r].baseArrayLayer, layers = rects[r].layerCount;
       for (uint32_t i = 0; i < count; i++) {
          const VkClearAttachment *a = &attachments[i];
          if (a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
-            rd_render_add_clear(command, render, rects[r].rect, a->colorAttachment, 0, a->clearValue);
+            rd_render_add_clear(command, render, rects[r].rect, a->colorAttachment, 0, a->clearValue,
+                                first, layers);
          else
-            rd_render_add_clear(command, render, rects[r].rect, -1, a->aspectMask, a->clearValue);
+            rd_render_add_clear(command, render, rects[r].rect, -1, a->aspectMask, a->clearValue,
+                                first, layers);
       }
    }
 }
