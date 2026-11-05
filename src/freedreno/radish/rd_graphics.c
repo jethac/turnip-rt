@@ -192,6 +192,24 @@ rd_lower_fine_derivatives(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* gl_PointCoord: a VARYING_SLOT_PNTC input, which the VPC fills with the
+ * point-sprite coordinate (VPC_VARYING_PS_REPL_MODE). */
+static bool
+rd_lower_point_coord(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_point_coord)
+      return false;
+   nir_variable **var = data;
+   if (!*var) {
+      *var = nir_variable_create(b->shader, nir_var_shader_in, glsl_vec_type(2), "radish_point_coord");
+      (*var)->data.location = VARYING_SLOT_PNTC;
+      (*var)->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_load_var(b, *var));
+   return true;
+}
+
 /* gl_ViewIndex: the driver constant the multiview replay sets per view */
 static bool
 rd_lower_view_index(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -256,6 +274,11 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    }
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, rd_lower_view_index, nir_metadata_control_flow, NULL);
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      nir_variable *point_coord = NULL;
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, rd_lower_point_coord,
+               nir_metadata_control_flow, &point_coord);
+   }
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, rd_lower_fine_derivatives, nir_metadata_all, NULL);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo | nir_var_mem_ubo,
             nir_address_format_32bit_index_offset);
