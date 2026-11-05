@@ -910,12 +910,18 @@ static bool
 rd_image_range(const struct rd_image *image, const VkImageSubresourceRange *range)
 {
    if (!image || !range->aspectMask || (range->aspectMask & ~vk_format_aspects(image->vk.format)) ||
-       range->baseMipLevel >= image->vk.mip_levels || range->baseArrayLayer >= image->vk.array_layers)
+       range->baseMipLevel >= image->vk.mip_levels)
+      return false;
+   /* a 3D image's slices may be named as layers (2D views of slices) */
+   uint32_t max_layers = image->vk.image_type == VK_IMAGE_TYPE_3D ?
+      MAX2(image->vk.array_layers, image->vk.extent.depth) : image->vk.array_layers;
+   if (range->baseArrayLayer >= max_layers)
       return false;
    uint32_t levels = vk_image_subresource_level_count(&image->vk, range);
-   uint32_t layers = vk_image_subresource_layer_count(&image->vk, range);
+   uint32_t layers = range->layerCount == VK_REMAINING_ARRAY_LAYERS ?
+      max_layers - range->baseArrayLayer : range->layerCount;
    return levels && levels <= image->vk.mip_levels - range->baseMipLevel &&
-          layers && layers <= image->vk.array_layers - range->baseArrayLayer;
+          layers && layers <= max_layers - range->baseArrayLayer;
 }
 
 bool
@@ -1155,7 +1161,10 @@ rd_CmdClearColorImage(VkCommandBuffer handle, VkImage image_handle, VkImageLayou
    uint8_t clear[16] = {0};
    util_format_pack_rgba(vk_format_to_pipe_format(image->vk.format), clear, color, 1);
    for (uint32_t i = 0; i < count; i++) {
-      if (!rd_image_command_valid(command, rd_image_range(image, &ranges[i])))
+      if (!rd_image_command_valid(command, rd_image_range(image, &ranges[i]) &&
+          ranges[i].baseArrayLayer < image->vk.array_layers &&
+          vk_image_subresource_layer_count(&image->vk, &ranges[i]) <=
+             image->vk.array_layers - ranges[i].baseArrayLayer))
          return;
       uint32_t levels = vk_image_subresource_level_count(&image->vk, &ranges[i]);
       uint32_t layers = vk_image_subresource_layer_count(&image->vk, &ranges[i]);

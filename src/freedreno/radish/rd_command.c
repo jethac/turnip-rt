@@ -1,5 +1,6 @@
 #include "rd_private.h"
 #include "vk_util.h"
+#include "vk_format.h"
 
 static void
 rd_command_reset(struct vk_command_buffer *base, VkCommandBufferResetFlags flags)
@@ -336,6 +337,16 @@ rd_CmdPipelineBarrier2(VkCommandBuffer handle, const VkDependencyInfo *info)
    VK_FROM_HANDLE(rd_command_buffer, command, handle);
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
       if (!rd_image_barrier_valid(&info->pImageMemoryBarriers[i])) {
+         if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false)) {
+            const VkImageMemoryBarrier2 *bar = &info->pImageMemoryBarriers[i];
+            const struct rd_image *img = rd_image_from_handle(bar->image);
+            fprintf(stderr, "radish: barrier refused: aspects %x/%x levels %u+%u/%u layers %u+%u/%u type %d\n",
+                    bar->subresourceRange.aspectMask, img ? vk_format_aspects(img->vk.format) : 0,
+                    bar->subresourceRange.baseMipLevel, bar->subresourceRange.levelCount,
+                    img ? img->vk.mip_levels : 0, bar->subresourceRange.baseArrayLayer,
+                    bar->subresourceRange.layerCount, img ? img->vk.array_layers : 0,
+                    img ? img->vk.image_type : -1);
+         }
          rd_set_error(&command->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
