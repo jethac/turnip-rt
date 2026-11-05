@@ -281,6 +281,7 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
    NIR_PASS(_, nir, nir_opt_constant_folding);
+   lower.buffer_count = shader->res->buffer_count;
    nir_shader_intrinsics_pass(nir, rd_gfx_lower_buffer, nir_metadata_control_flow, &lower);
    if (lower.failed) {
       if (debug_get_bool_option("RADISH_DEBUG_ERRORS", false))
