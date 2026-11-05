@@ -2863,12 +2863,16 @@ rd_execute_image_resolve(struct rd_device *device, const struct rd_blit *blit)
    const int32_t (*sr)[3] = blit->src_offsets, (*d)[3] = blit->dst_offsets;
    VkRect2D area = { { d[0][0], d[0][1] },
                      { d[1][0] - d[0][0], d[1][1] - d[0][1] } };
-   for (uint32_t i = 0; i < blit->layers; i++) {
+   /* a 3D destination takes the source layers as slices from dstOffset.z */
+   bool dst3d = blit->dst->vk.image_type == VK_IMAGE_TYPE_3D;
+   uint32_t dst_first = dst3d ? (uint32_t)d[0][2] : blit->dst_layer;
+   uint32_t layers = dst3d ? MAX2(blit->layers, (uint32_t)(d[1][2] - d[0][2])) : blit->layers;
+   for (uint32_t i = 0; i < layers; i++) {
       struct rd_image_view src, dst;
       rd_internal_view(&src, blit->src, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
                        blit->src_level, blit->src_layer + i);
       rd_internal_view(&dst, blit->dst, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
-                       blit->dst_level, blit->dst_layer + i);
+                       blit->dst_level, dst_first + i);
       VkResult result = rd_resolve_view(device, &src, &dst, area, VK_RESOLVE_MODE_AVERAGE_BIT,
                                         sr[0][0] - d[0][0], sr[0][1] - d[0][1]);
       if (result != VK_SUCCESS)
