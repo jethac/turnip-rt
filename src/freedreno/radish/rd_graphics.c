@@ -233,6 +233,21 @@ rd_gfx_compile(struct rd_device *device, struct rd_pipeline *pipeline,
    }
    shader->res->layout = pipeline->layout;
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      /* A vertex shader that never writes gl_Position (positions are then
+       * undefined) hung the GPU (hangcheck in
+       * pipeline.monolithic.no_position.explicit_declarations.basic.multiview.v0):
+       * give it one, (0, 0, 0, 1). */
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+      if (!(nir->info.outputs_written & VARYING_BIT_POS)) {
+         nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
+         nir_variable *pos = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(),
+                                                 "radish_default_position");
+         pos->data.location = VARYING_SLOT_POS;
+         nir_store_var(&b, pos, nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 1.0f), 0xf);
+         nir->info.outputs_written |= VARYING_BIT_POS;
+      }
+   }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       /* subpassLoad: a texel fetch of the input attachment's view at the
        * fragment's position */
